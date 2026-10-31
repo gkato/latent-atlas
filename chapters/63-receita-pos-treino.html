@@ -1,0 +1,628 @@
+<p class="la-lead">Por 50 capítulos (0 a 49) você serviu modelos treinados por outras pessoas. Os capítulos 50 a 62 abriram a caixa do outro lado: <a data-ch="sft">SFT</a>, <a data-ch="dpo">DPO</a>, <a data-ch="grpo-rlvr">GRPO</a> e <a data-ch="avaliacao-pos-treino">avaliação</a>. Este capítulo fecha o ciclo com uma receita completa. Você vai transformar um modelo aberto num <b>tutor de engenharia de inferência em português</b>, o assistente que responde “quanto KV ocupa um token no <code>fp8_ds_mla</code>?” com o número certo, e devolvê-lo ao mesmo vLLM, à mesma quantização e ao mesmo par de <span class="la-term" data-term="dgx-spark">DGX Spark</span> do Módulo 1. São duas trilhas. A <b>trilha A</b> roda num Mac M4 de 24 GB com MLX e um modelo de 4 bilhões de parâmetros. A <b>trilha B</b> roda em dois Sparks: SFT e DPO num Qwen3.8-27B, merge, re-quantização para NVFP4 e serviço no vLLM, mais um GRPO num modelo de 9B. Um aviso honesto: a pesquisa que embasa o capítulo conferiu versões, flags e código em 1º de outubro de 2026, mas <b>não executou nenhum treino em GPU</b>. Todo tempo e toda memória de treino vêm com a fórmula ao lado e o selo <b>[estimativa]</b>. Planeje com eles e meça no seu kit.</p>
+
+<section class="la-sec">
+  <h2>O mapa: dez fases, um portão em cada</h2>
+  <p>A <a data-ch="receita-do-zero">receita do zero</a> do capítulo 46 ensinou um método com um <b>critério de saída</b> em cada passo. Aqui vale a mesma disciplina, com uma diferença: lá o checkpoint vinha pronto, aqui é <i>você</i> que o produz. Cada fase deixa um artefato verificável que a seguinte consome.</p>
+  <table>
+    <thead><tr><th>Fase</th><th>O que sai</th><th>Onde roda</th></tr></thead>
+    <tbody>
+      <tr><td><b>F0</b> linha de base congelada</td><td>conjuntos de avaliação e os números do modelo base</td><td>Spark (vLLM) ou Mac (<code>mlx_lm.server</code>)</td></tr>
+      <tr><td><b>F1</b> dados</td><td><code>sft.jsonl</code>, <code>pref.jsonl</code>, <code>kto.jsonl</code>, <code>grpo.jsonl</code> descontaminados</td><td>Sparks servindo as receitas do Módulo 1</td></tr>
+      <tr><td><b>F2</b> SFT (LoRA/QLoRA)</td><td>adapter SFT</td><td>Mac ou 2× Spark em DDP</td></tr>
+      <tr><td><b>F3</b> preferências (DPO e variantes)</td><td>adapter DPO</td><td>Mac ou 2× Spark</td></tr>
+      <tr><td><b>F4</b> RL verificável (GRPO)</td><td>adapter GRPO</td><td>Mac (modelo pequeno) ou Spark A treina + Spark B gera</td></tr>
+      <tr><td><b>F5</b> avaliação e portões</td><td>relatório com intervalos de confiança e uma decisão</td><td>Spark ou Mac</td></tr>
+      <tr><td><b>F6</b> merge</td><td>modelo fundido em BF16</td><td>Spark ou Mac</td></tr>
+      <tr><td><b>F7</b> re-quantização</td><td>NVFP4, EXL3, W4A16 ou MLX 4-bit</td><td>Spark ou Mac</td></tr>
+      <tr><td><b>F8</b> KLD e regressão pós-quantização</td><td>relatório</td><td>Spark</td></tr>
+      <tr><td><b>F9</b> serviço</td><td>endpoint compatível com a API OpenAI</td><td>vLLM 0.30.0 ou <code>mlx_lm.server</code></td></tr>
+    </tbody>
+  </table>
+  <figure class="la-fig wide" id="fig-mapa" data-title="O trilho do pós-treino: dez estações">
+    <div class="la-fig-stage" style="height:390px"><canvas></canvas></div>
+    <figcaption>O modelo (o personagem menta) anda de estação em estação. Cada estação mostra onde a fase roda: <b>Mac</b> (lavanda), <b>Spark</b> (menta) ou ambos. A sacola de baixo acumula os artefatos com os tamanhos da trilha B, todos das fontes ou da conta do Apêndice A da pesquisa. O texto de cada passo traz o portão que libera a fase seguinte.</figcaption>
+  </figure>
+  <h3>Por que não pós-treinar os modelos do Módulo 1?</h3>
+  <p>Por memória. Em BF16, só os pesos já passam muito do que dois Sparks têm:</p>
+  <table>
+    <thead><tr><th>Modelo</th><th>Parâmetros</th><th>BF16 só de pesos</th><th>Em 2× Spark (≈ 2 × 121,7 GiB)</th></tr></thead>
+    <tbody>
+      <tr><td><span class="la-rb glm"></span> GLM-5.3-Flash</td><td>321,3 B (18 B ativos)</td><td>≈ 643 GB</td><td>não cabe nem em LoRA BF16; em QLoRA seriam ≈ 160+ GB só de pesos, sem ferramenta pronta para KDA, mHC e DSA</td></tr>
+      <tr><td><span class="la-rb ds"></span> DeepSeek-V4-Flash</td><td>284 B (13 B ativos)</td><td>≈ 568 GB</td><td>idem, e o vLLM não tem LoRA para <code>DeepseekV4ForCausalLM</code></td></tr>
+      <tr><td><span class="la-rb qwen"></span> Qwen3.8-Flash-Next</td><td>125 B no principal (~6 B ativos) + PLE</td><td>&gt; 250 GB</td><td>idem</td></tr>
+    </tbody>
+  </table>
+  <p>Para esses gigantes, o caminho realista é treinar adapters numa infraestrutura maior, fazer o merge e re-quantizar com as ferramentas do Módulo 1 (exllamav3 com <code>-ngb</code> para a PLE; llm-compressor ou ModelOpt para NVFP4, e o llm-compressor já publica <code>RedHatAI/GLM-5.3-Flash-NVFP4</code> e <code>RedHatAI/Qwen3.8-Flash-Next-NVFP4</code>). O laboratório escolhe o <b><code>Qwen/Qwen3.8-27B</code></b>, da mesma família do Qwen3.8-Flash-Next: <code>model_type: qwen3_5</code>, híbrido 3:1 de <span class="la-term" data-term="gdn">Gated DeltaNet</span> e atenção com saída gated, <code>head_dim</code> 256. Cada etapa (merge, calibração, NVFP4, KV FP8, MTP, vLLM) é a mesma das receitas, numa escala que cabe.</p>
+  <dl class="la-kv">
+    <dt>Qwen3.8-27B</dt><dd>27.781.427.952 parâmetros BF16 (<b>55,56 GB</b>); <code>Qwen3_5ForConditionalGeneration</code>, um VLM com torre de visão de 27 blocos; 64 camadas = <b>48 GDN + 16 de atenção completa</b>; hidden 5120; 24 cabeças Q e 4 KV de 256; FFN 17.408; vocabulário 248.320; <b>1 camada MTP</b>; pensa por padrão; Apache-2.0.</dd>
+    <dt>Qwen3.5-9B</dt><dd>9.653.104.368 parâmetros, mesma <code>model_type</code>, 24 GDN + 8 de atenção. É o aluno do GRPO, porque RL é dominado por <i>geração</i>, e gerar com um 27B BF16 num <span class="la-term" data-term="gb10">GB10</span> é lento demais para um laboratório.</dd>
+    <dt>Qwen3-4B-Instruct-2507</dt><dd>4.022.468.096 parâmetros, 36 camadas, hidden 2560, vocabulário 151.936, <b>sem modo de pensamento</b>. É o aluno da trilha A.</dd>
+  </dl>
+  <h3>As versões: fixe tudo</h3>
+  <p>O ecossistema muda toda semana. O <span class="la-term" data-term="trl">TRL</span> virou 1.0 em março e depois removeu o <code>PPOTrainer</code> (v1.13.0) e seis trainers experimentais (v1.14.0); o <code>mlx-lm</code> 0.32.0 saiu no dia da pesquisa. Sem pinos de versão, a receita não se reproduz no mês seguinte.</p>
+  <table class="la-params">
+    <thead><tr><th>Pacote</th><th>Versão</th><th>Observação</th></tr></thead>
+    <tbody>
+      <tr><td><code>trl</code></td><td>1.14.1</td><td>suporta vLLM de 0.20.1 a 0.30.0</td></tr>
+      <tr><td><code>peft</code> · <code>transformers</code> · <code>accelerate</code></td><td>0.21.2 · 5.18.0 · 1.15.0</td><td>o TRL carrega em FP32 se você não passar <code>dtype</code></td></tr>
+      <tr><td><code>vllm</code></td><td>0.30.0</td><td>a mesma imagem da lane v0.30 do Qwen no Módulo 1</td></tr>
+      <tr><td><code>llmcompressor</code> · <code>nvidia-modelopt</code></td><td>0.14.0 · 0.47.0</td><td>o llm-compressor tem exemplo oficial do Qwen3.8-27B; a receita do ModelOpt foi conferida no <i>main</i> (o card cita v0.48.0): confira com <code>git ls-tree</code> antes de fixar a versão; caminho <code>examples/hf_ptq</code> no main, <code>examples/llm_ptq</code> no playbook</td></tr>
+      <tr><td><code>exllamav3</code></td><td>v1.5.3</td><td>aqui serve para o painel de KLD</td></tr>
+      <tr><td><code>mlx-lm</code> · <code>mlx-lm-lora</code></td><td>0.32.0 · 3.1.3</td><td>o <span class="la-term" data-term="mlx-lm-lora">mlx-lm-lora</span> faz DPO, ORPO e GRPO, mas não KTO</td></tr>
+      <tr><td><code>openrlhf</code> · <code>verl</code> · <code>lm-eval</code></td><td>0.11.2 · 0.9.1 · 0.4.13</td><td>RL em 2 nós (não testados no GB10) e avaliação por API</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="la-sec">
+  <h2>Dados: o Módulo 1 vira professor e banca</h2>
+  <p>Antes de virarem máquinas de treino, os Sparks servem os modelos do Módulo 1, todos com API OpenAI na porta <b>8888</b> (<code>GLM-5.3-Flash-EXL3</code>, <code>qwen3.8-flash-next</code>, <code>deepseek-v4-flash-vision-exp</code>). Como cada receita ocupa os dois nós, roda-se uma de cada vez. Elas fazem dois papéis: o <span class="la-term" data-term="modelo-professor">professor</span> escreve as respostas, e uma banca de juízes (<span class="la-term" data-term="llm-as-judge">LLM como juiz</span>) decide quais são boas.</p>
+  <div class="la-callout warn"><b class="t">Licença primeiro</b><p>Antes de publicar qualquer coisa derivada, confira se os termos do modelo-professor permitem usar as saídas dele para treinar outro modelo.</p></div>
+  <ol class="la-steps">
+    <li><b>Sementes da própria plataforma.</b> Os glossários dos 50 capítulos do Módulo 1 (0 a 49) somam ~1.170 termos únicos (a pesquisa, feita quando eram 48, contou 1.079), e o <code>docs/APANHADO.md</code> lista 1.484 parâmetros das receitas. Cada termo vira de 2 a 4 perguntas.</li>
+    <li><b>Respostas do professor.</b> O GLM responde cada pergunta <b>4 vezes</b> (<code>n=4</code>, temperatura 0,9), o que permite montar pares depois. Custo <b>[estimativa]</b>: 3.000 perguntas × 4 × ~400 tokens ≈ 4,8 M tokens; a ~100–150 tok/s agregados, <b>9 a 13 horas</b> de professor.</li>
+    <li><b>Julgamento pareado, com troca de posição, por um juiz de outra família</b>, com rubrica: correção técnica, resposta ao que foi perguntado, números e unidades, concisão; ignore comprimento e formatação.</li>
+    <li><b>Limpeza e descontaminação</b>, e só então o split.</li>
+  </ol>
+  <h3>Por que o DeepSeek é o juiz</h3>
+  <p>Dois vieses decidem a banca. O <span class="la-term" data-term="vies-de-posicao">viés de posição</span> é forte: com o ChatGPT como juiz, só reordenando as respostas, o Vicuna-13B “venceu” em 66 de 80 consultas (Wang et al., 2023). A <span class="la-term" data-term="autopreferencia">autopreferência</span> faz o avaliador favorecer as próprias saídas, com força proporcional à capacidade de <i>se reconhecer</i> (Panickssery et al., 2024). O professor é o GLM e o aluno é o Qwen3.8-27B, parente do Qwen3.8-Flash-Next. Excluindo as duas famílias, sobra um único juiz isento: o <span class="la-rb ds"></span> DeepSeek. GLM e Qwen entram, no máximo, como juízes secundários de um painel no estilo PoLL (Verga et al., 2024), com a concordância reportada à parte.</p>
+  <p>O script roda um torneio por pergunta. Cada um dos \(\binom{4}{2} = 6\) pares é julgado <b>duas vezes</b>, como (A, B) e como (B, A), e só conta vitória quando o juiz concorda consigo mesmo nas duas ordens:</p>
+  <div class="la-eq">
+    \[ s(i,j)=\begin{cases}+1 & v(i,j)=\text{A}\ \text{e}\ v(j,i)=\text{B}\\ -1 & v(i,j)=\text{B}\ \text{e}\ v(j,i)=\text{A}\\ 0 & \text{caso contrário}\end{cases}\qquad S_i=\sum_{j\neq i} s(i,j) \]
+    <ul class="la-eq-legend">
+      <li>\(v(i,j)\): veredito do juiz com a resposta \(i\) na posição A e \(j\) na posição B</li>
+      <li>\(S_i\): saldo da resposta \(i\) no torneio (de −3 a +3 com 4 respostas)</li>
+      <li><code>sft.jsonl</code> recebe a melhor resposta se \(S_{\text{melhor}} \ge 1\)</li>
+      <li><code>pref.jsonl</code> recebe (melhor, pior) se \(S_{\text{melhor}} - S_{\text{pior}} \ge 2\): a margem mínima descarta pares ambíguos. Repare que os saldos somam zero, então basta <b>um</b> veredito consistente para a margem chegar a 2: o limiar 2 só descarta as perguntas em que tudo empatou; 3 ou 4 filtram de verdade <b>[conta própria]</b></li>
+      <li><code>kto.jsonl</code> recebe a melhor com <code>label: true</code> e a pior com <code>label: false</code></li>
+    </ul>
+  </div>
+  <figure class="la-fig" id="fig-torneio" data-title="O torneio do juiz: troca de posição e margem mínima">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Quatro respostas do professor, cada uma com uma qualidade “real” escondida (as estrelinhas, que o juiz não vê). O robô julga os 6 pares nas duas ordens. Vereditos que mudam com a ordem viram empate. Embaixo, uma simulação de 2.000 perguntas mostra a fração de perguntas que geram um <b>par</b> (o rendimento) e a <b>pureza</b> (fração de pares em que a escolhida é mesmo melhor), com e sem troca, para a margem mínima escolhida. Simulação <b>ilustrativa</b>: o juiz escolhe a posição A com a probabilidade do viés e, no resto das vezes, compara as qualidades com ruído.</figcaption>
+  </figure>
+  <p>Suba o viés para 0,4. Sem troca, a resposta que aparece mais vezes na posição A ganha pontos de graça, e a pureza cai para perto de 80% no modelo da figura: um par em cada cinco ensina o modelo a preferir a resposta pior. Com troca, o viés vira empate e os pares que sobram continuam limpos (93%). Agora suba a margem mínima para 3. A troca passa a custar pares de verdade: o rendimento cai de 85% (sem troca) para 67% (com troca), e a pureza com troca sobe para 95%, contra 83% sem troca. É a troca entre quantidade e limpeza que o limiar controla; com 4 respostas e margem 2, como na receita, quase toda pergunta gera par.</p>
+  <h3>Limpeza, descontaminação e split por termo</h3>
+  <p>Normalize, deduplique (MinHash ou n-gramas) e remova do treino todo item que compartilhe um 13-grama normalizado com <b>qualquer</b> conjunto de avaliação. O limiar de 13 segue a prática do relatório do GPT-3, número que a própria pesquisa marca como “de memória; conferir”. A <span class="la-term" data-term="descontaminacao">descontaminação</span> importa em dobro aqui: o professor pode ter memorizado o GSM8K, e “gere problemas parecidos com estes” produz quase-cópias.</p>
+  <p>Depois, separe <code>train</code>, <code>valid</code> e <code>test_dominio</code> <b>por termo do glossário</b>, nunca por linha: se o mesmo termo aparece no treino e no teste, o teste mede memorização. Tamanhos sugeridos: SFT 3.000–6.000 exemplos, DPO 1.500–3.000 pares, KTO 3.000–6.000 rótulos e um teste de <b>300–500 perguntas</b> de termos nunca vistos (IC de ±4–6 pontos no win rate). Remova a coluna <code>term</code> depois do split.</p>
+  <h3>Os formatos: um JSONL por algoritmo</h3>
+  <p>Cada trainer procura chaves específicas, e a chave errada não costuma dar erro: costuma treinar a coisa errada. Os quatro formatos mais usados:</p>
+  <pre data-lang="json"><code># (a) SFT conversacional — TRL SFTTrainer, mlx_lm.lora (formato "chat"), mlx_lm_lora --train-mode sft
+{"messages": [{"role": "system", "content": "Você é um engenheiro de inferência. Responda em PT-BR, com números e unidades."}, {"role": "user", "content": "Quanto ocupa o KV de um token no fp8_ds_mla do GLM?"}, {"role": "assistant", "content": "656 bytes por token por camada DSA: 512 B do latente NoPE em FP8, 16 B de escalas e 128 B de RoPE (64 valores BF16)."}]}
+
+# (d) par de preferência — TRL DPOTrainer / RewardTrainer (prompt explícito, recomendado)
+{"prompt": [{"role": "user", "content": "Por que o GLM não usa NVFP4 nos experts?"}], "chosen": [{"role": "assistant", "content": "Porque o KLD medido do NVFP4 (0,0605 nats) foi 2,5× o do EXL3 4 bpw (0,0246)…"}], "rejected": [{"role": "assistant", "content": "Porque o GB10 não suporta FP4."}], "chat_template_kwargs": {"enable_thinking": false}}
+
+# (f) KTO — sinal binário, não pareado — TRL KTOTrainer
+{"prompt": [{"role": "user", "content": "Qual o padrão de --max-loras?"}], "completion": [{"role": "assistant", "content": "1."}], "label": true}
+{"prompt": [{"role": "user", "content": "Qual o padrão de --max-loras?"}], "completion": [{"role": "assistant", "content": "Ilimitado; o vLLM carrega todos os adapters que couberem."}], "label": false}
+
+# (g) GRPO / RLVR — TRL GRPOTrainer: "prompt" obrigatório; accuracy_reward lê a coluna "solution"
+{"prompt": [{"role": "user", "content": "Natalia vendeu presilhas para 48 amigas em abril e metade disso em maio. Quantas no total? Ponha a resposta final em \\boxed{}."}], "solution": "72"}</code></pre>
+  <table class="la-params">
+    <thead><tr><th>Trainer</th><th>Chaves</th><th>Pegadinha</th></tr></thead>
+    <tbody>
+      <tr><td><code>mlx_lm_lora.train --train-mode dpo|cpo|orpo</code></td><td><code>system</code>, <code>prompt</code>, <code>chosen</code>, <code>rejected</code> em <b>texto puro</b></td><td>não é o formato conversacional do TRL</td></tr>
+      <tr><td><code>mlx_lm_lora.train --train-mode grpo</code></td><td><code>prompt</code>, <code>answer</code>, <code>system</code></td><td><code>answer</code> no singular (o TRL usa <code>solution</code>)</td></tr>
+      <tr><td><code>mlx_lm.lora</code> com <code>--mask-prompt</code></td><td><code>chat</code>, <code>tools</code>, <code>completions</code>, <code>text</code></td><td>em <code>chat</code>, só a <b>última</b> mensagem conta: multi-turno treina só o último turno</td></tr>
+      <tr><td>TRL <code>KTOTrainer</code></td><td><code>prompt</code>, <code>completion</code>, <code>label</code></td><td>se receber pares, converte <code>chosen</code>→<code>True</code> e <code>rejected</code>→<code>False</code></td></tr>
+    </tbody>
+  </table>
+  <h3>O template de chat faz parte do dado</h3>
+  <p>O <span class="la-term" data-term="chat-template">chat template</span> do capítulo 5 é a causa número um de fine-tunes quebrados no Qwen3.x. Quatro decisões, conferidas no template do Qwen3.8-27B e no código do TRL:</p>
+  <ol class="la-steps">
+    <li><b>Raciocínio vai em <span class="la-term" data-term="reasoning-content"><code>reasoning_content</code></span>, nunca dentro de <code>content</code>.</b> O template renderiza o assistente como <code>&lt;think&gt;\n{reasoning_content}\n&lt;/think&gt;\n\n{content}</code> e não procura <code>&lt;think&gt;</code> em <code>content</code>: raciocínio inline gera <b>dois</b> blocos de pensamento.</li>
+    <li><b><span class="la-term" data-term="assistant-only-loss"><code>assistant_only_loss=True</code></span> troca o template</b> pelo <code>qwen3_8_training.jinja</code>, que sempre emite o bloco de pensamento e marca a saída com <code>{% generation %}…{% endgeneration %}</code>. Exemplos sem <code>reasoning_content</code> viram <code>&lt;think&gt;\n\n&lt;/think&gt;\n\n{content}</code>: o modelo aprende a responder <b>sem pensar</b>.</li>
+    <li><b><code>enable_thinking</code> mexe no system prompt:</b> indefinido ou verdadeiro, o template injeta “Reasoning effort is set to xhigh…”; com <code>false</code>, não. Treine, avalie e sirva com o <b>mesmo</b> <span class="la-term" data-term="chat-template-kwargs"><code>chat_template_kwargs</code></span>.</li>
+    <li><b>O <code>eos_token</code> é <code>&lt;|im_end|&gt;</code>.</b> Está certo para chat; não mude.</li>
+  </ol>
+  <figure class="la-fig" id="fig-template" data-title="Do JSONL aos tokens: template e máscara de perda">
+    <div class="la-fig-stage" style="height:420px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Em cima, o registro JSONL. Embaixo, o que o modelo de fato vê depois do template do Qwen3.8 (a segmentação em blocos é <b>ilustrativa</b>; os tokens reais são menores). Com a máscara ligada, só os blocos com a faixa rosa entram na perda; a fronteira exata é definida pelas tags <code>{% generation %}</code> do template de treino. No modo com <code>&lt;think&gt;</code> no content aparece o erro clássico: dois blocos de pensamento.</figcaption>
+  </figure>
+  <p>O bloco vazio <code>&lt;think&gt;\n\n&lt;/think&gt;</code> do modo “sem raciocínio” não é enfeite: com <code>enable_thinking=false</code>, o prompt de geração já termina nele. Treinar assim e servir sem pensar é coerente; treinar assim e servir pensando produz um modelo que esqueceu como pensar. Para preservar o raciocínio, grave-o em <code>reasoning_content</code> e misture uma fração desses exemplos.</p>
+</section>
+
+<section class="la-sec">
+  <h2>Trilha A: um tutor no Mac M4 de 24 GB</h2>
+  <p>O Mac é o laboratório de bolso: lento, mas sempre ligado, com a mesma <span class="la-term" data-term="memoria-unificada">memória unificada</span> do capítulo 27. O Python do sistema é 3.9.6 e o MLX exige ≥ 3.10, então o ambiente sai do <code>uv</code>:</p>
+  <pre data-lang="bash"><code>uv venv --python 3.12 ~/.venvs/mlxft &amp;&amp; source ~/.venvs/mlxft/bin/activate
+uv pip install "mlx-lm[train]==0.32.0" "mlx-lm-lora==3.1.3" "lm-eval[api]==0.4.13" openai datasets</code></pre>
+  <p>Dois números mandam no Mac: <b>19,07 GB</b> de working set recomendado (~74% de 24 GB) e um <b>buffer máximo de 14,3 GB</b>, que nenhum tensor sozinho pode passar (<code>sudo sysctl iogpu.wired_limit_mb=N</code> sobe o teto até o boot seguinte). O aluno é o <code>mlx-community/Qwen3-4B-Instruct-2507-4bit</code>, um arquivo de <b>2,26 GB</b>. Como ele é quantizado, o <code>mlx_lm.lora</code> faz <span class="la-term" data-term="qlora">QLoRA</span> automaticamente: a base fica congelada em 4 bits e só os adapters treinam.</p>
+  <h3>Duas escalas de LoRA: não copie a LR entre frameworks</h3>
+  <p>O <a data-ch="treino-memoria-lora">capítulo 51</a> apresentou o <span class="la-term" data-term="lora">LoRA</span>. O detalhe que derruba receitas é que MLX e PEFT escalam o termo de baixo posto de jeitos diferentes:</p>
+  <div class="la-eq">
+    \[ y = W_0x + s\cdot B\,A\,x,\qquad s_{\text{PEFT}} = \frac{\alpha}{r},\qquad s_{\text{MLX}} = \texttt{scale}\ (\text{20 no } \texttt{mlx\_lm.lora},\ \text{10 no } \texttt{mlx-lm-lora}),\qquad \eta_{\text{PEFT}}\cdot s_{\text{PEFT}} \approx \eta_{\text{MLX}}\cdot s_{\text{MLX}} \]
+    <ul class="la-eq-legend">
+      <li>\(W_0\): peso congelado; \(A\in\mathbb R^{r\times d_{in}}\) (aleatória: \(U(\pm 1/\sqrt{d_{in}})\) no MLX) e \(B\in\mathbb R^{d_{out}\times r}\) (começa em zero)</li>
+      <li>\(r\): posto; \(\alpha\): o <code>lora_alpha</code> do PEFT (padrão \(r=8,\ \alpha=8 \Rightarrow s=1\))</li>
+      <li>\(\eta\): taxa de aprendizado. Com Adam, o passo efetivo do produto \(sBA\) escala com \(s\times\eta\) <b>[inferência da pesquisa]</b></li>
+      <li>exemplo: o padrão do <code>mlx_lm.lora</code> (LR 1e-5 × scale 20) equivale a PEFT com LR 2e-4 e \(\alpha/r=1\)</li>
+    </ul>
+  </div>
+  <p>Pela mesma conta, o padrão do <code>mlx-lm-lora</code> (1e-5 × 10) equivale a ~1e-4 em escala PEFT, alto demais para DPO, em que o TRL sugere ~1e-5 para adapters. Por isso o DPO do Mac usa 1e-6. Outra diferença: o <code>mlx_lm.lora</code> treina as últimas <b>16</b> camadas, e o <code>mlx_lm_lora.train</code> treina <b>todas</b> e funde o adapter ao final por padrão.</p>
+  <h3>Linha de base e SFT</h3>
+  <p>A linha de base sobe o <span class="la-term" data-term="mlx-lm-server"><code>mlx_lm.server</code></span> e roda o lm-eval contra ele. Mande o <b>mesmo</b> id de modelo carregado (outro id faz o servidor trocar de modelo e até baixar do Hub) e use <code>num_concurrent=1</code>, porque o servidor processa as requisições essencialmente em sequência.</p>
+  <pre data-lang="bash"><code>mlx_lm.server --model mlx-community/Qwen3-4B-Instruct-2507-4bit --port 8080
+lm_eval --model local-chat-completions \
+  --model_args model=mlx-community/Qwen3-4B-Instruct-2507-4bit,base_url=http://127.0.0.1:8080/v1/chat/completions,num_concurrent=1,max_retries=3,tokenized_requests=False \
+  --apply_chat_template --tasks ifeval,gsm8k_cot_zeroshot --limit 250 \
+  --output_path results/mac/base --log_samples</code></pre>
+  <p>O SFT vai num YAML, porque <code>lr_schedule</code> e <code>lora_parameters</code> <b>só</b> existem no arquivo. Omitir <code>keys</code> aplica LoRA a todas as lineares das camadas treinadas, como recomenda o <i>LoRA Without Regret</i> (Thinking Machines, 2025): LoRA só na atenção com posto 256 perde para LoRA só no MLP com posto 128.</p>
+  <pre data-lang="yaml"><code>model: mlx-community/Qwen3-4B-Instruct-2507-4bit   # quantizado =&gt; QLoRA automaticamente
+train: true
+data: data/mlx_sft                                 # train.jsonl / valid.jsonl, formato "chat"
+fine_tune_type: lora
+num_layers: 16
+batch_size: 4
+grad_accumulation_steps: 2                         # lote efetivo 8
+iters: 600
+learning_rate: 1.0e-5                              # com scale 20
+lr_schedule:
+  name: cosine_decay
+  warmup: 30
+  arguments: [1.0e-5, 600, 1.0e-6]
+max_seq_length: 1024
+mask_prompt: true                                  # perda só na última mensagem (assistente)
+grad_checkpoint: true
+lora_parameters:
+  rank: 16
+  scale: 20.0
+  dropout: 0.0
+steps_per_report: 10
+steps_per_eval: 100
+adapter_path: adapters/mac_sft
+seed: 0</code></pre>
+  <p>A memória de treino tem quatro parcelas: pesos congelados, estado dos adapters, ativações e <span class="la-term" data-term="logits">logits</span>. A conta da pesquisa usa a fórmula de ativações de Korthikanti et al. (cerca de \(34\,s\,b\,h\) bytes por camada com FlashAttention):</p>
+  <div class="la-eq">
+    \[ M \approx \underbrace{M_W}_{\text{pesos}} + \underbrace{16\,P_{\text{LoRA}}}_{\text{peso+grad+Adam FP32}} + \underbrace{\big(2\,s\,b\,h\,L_t + 34\,s\,b\,h\big)}_{\text{ativações com checkpointing}} + \underbrace{2\cdot 4\,b\,s\,V}_{\text{logits FP32 + gradiente}},\qquad P_{\text{LoRA}} = r\,L_t\sum_{\text{lineares}}(d_{in}+d_{out}) \]
+    <ul class="la-eq-legend">
+      <li>\(M_W\): 2,26 GB no 4-bit (no DPO, duas cópias de 8 bits de ≈ 4,3 GB cada)</li>
+      <li>\(L_t\): camadas treinadas (16); \(h\) = 2560; \(V\) = 151.936; \(s\): sequência; \(b\): micro-lote</li>
+      <li>no Qwen3-4B, \(\sum(d_{in}+d_{out})\) = 57.344 por camada (q, k, v, o, gate, up, down) → \(r=16,\ L_t=16\): <b>14,7 M</b> parâmetros, ≈ 0,24 GB de estado</li>
+      <li>sem <span class="la-term" data-term="gradient-checkpointing">gradient checkpointing</span>, as ativações viram \(34\,s\,b\,h\,L_t\): 11,4 GB a \(s=2048,\ b=4\)</li>
+    </ul>
+  </div>
+  <figure class="la-fig" id="fig-mac" data-title="O tanque do Mac: a memória de um fine-tune em 24 GB">
+    <div class="la-fig-stage" style="height:420px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>O tanque enche com as quatro parcelas da equação acima. A linha tracejada é o working set de 19,07 GB; a âmbar marca o <b>buffer máximo de 14,3 GB</b>, que o tensor de logits sozinho não pode passar. Os tempos usam 1–2 TFLOPS efetivos (36–72% dos 2,78 TFLOPS de matmul BF16 medidos num M4 por terceiros, número <b>não verificado</b>). Tudo <b>[estimativa]</b>: rode 20 iterações e leia o <code>Peak mem</code> que o <code>mlx_lm.lora</code> imprime.</figcaption>
+  </figure>
+  <p>O termo que mais cresce não é o modelo, são os logits: \(4 \times 1024 \times 151.936 \times 4\) B ≈ 2,5 GB, mais o gradiente. Com o padrão do YAML o total fica em <b>≈ 7–10 GB</b>. Faça o teste na figura: ponha lote 8 e sequência 4096. Só o tensor de logits vira 19,9 GB, passa do buffer de 14,3 GB, e o tanque transborda (≈ 48 GB no total); nenhum posto ou número de camadas salva essa configuração. Volte ao padrão e desligue o <code>grad_checkpoint</code>: as ativações saltam de 0,7 para 5,7 GB. Se estourar, use lote 2 com acumulação 4 (mesmo lote efetivo), sequência 768 ou, no <code>mlx-lm-lora</code>, <code>--sft-loss-type chunked_nll</code>. Tempo <b>[estimativa]</b>: ≈ 15 GFLOP por token (forward de 8,0 GFLOP + backward das camadas treinadas e do <code>lm_head</code> + recomputação), ou 65–130 tok/s; os ~1,2 M tokens de 600 iterações levam <b>2,5 a 5 horas</b>.</p>
+  <h3>DPO no Mac: funda o SFT em 8 bits antes</h3>
+  <p>A referência do DPO é o modelo <b>depois</b> do SFT. Funda o SFT num checkpoint próprio, e em <b>8 bits</b>, não em 4: o delta do LoRA é pequeno perto do degrau da grade de 4 bits, e parte dele sumiria (a seção do merge mostra isso célula por célula). O <code>mlx_lm_lora.train</code> carrega a referência como uma <b>segunda cópia completa</b>, e duas cópias de 8 bits cabem.</p>
+  <pre data-lang="bash"><code># 1) funde o SFT sobre o base BF16 e quantiza para 8 bits
+mlx_lm.fuse --model mlx-community/Qwen3-4B-Instruct-2507-bf16 --adapter-path adapters/mac_sft --save-path models/sft_bf16 --dequantize
+mlx_lm.convert --hf-path models/sft_bf16 --mlx-path models/sft_8bit -q --q-bits 8 --q-group-size 64
+# 2) DPO: QLoRA sobre o 8-bit; referência = o mesmo 8-bit congelado
+mlx_lm_lora.train --model models/sft_8bit --train --train-mode dpo \
+  --data data/mlx_dpo --beta 0.1 --dpo-cpo-loss-type sigmoid \
+  --reference-model-path models/sft_8bit \
+  --num-layers 16 --batch-size 1 --gradient-accumulation-steps 8 \
+  --learning-rate 1e-6 --lora-parameters '{"rank": 16, "dropout": 0.0, "scale": 10.0}' \
+  --max-seq-length 1024 --grad-checkpoint --epochs 1 \
+  --steps-per-eval 50 --save-every 100 --adapter-path adapters/mac_dpo</code></pre>
+  <div class="la-callout warn"><b class="t">O fuse automático do mlx-lm-lora</b><p>Ao final, o <code>mlx_lm_lora.train</code> funde por padrão e grava o modelo fundido (dequantizado do 8-bit) no <code>--adapter-path</code>. Para manter só o adapter, passe um YAML com <code>fuse: false</code> (<code>-c cfg/mac_dpo.yaml</code>). Se deixou o padrão, <code>adapters/mac_dpo</code> já é o modelo fundido: use-o como <code>models/final_bf16</code> e pule o <code>mlx_lm.fuse</code> do bloco final, mais abaixo (a base, aí, é o 8-bit dequantizado, não o <code>sft_bf16</code>: diferença pequena).</p></div>
+  <p>O <code>--dpo-cpo-loss-type</code> aceita <code>sigmoid</code>, <code>hinge</code>, <code>ipo</code> e <code>dpop</code>, e o <code>--train-mode</code> vai de <code>sft</code> a <code>ppo</code>, mas não há <span class="la-term" data-term="kto">KTO</span> nem SimPO. Para KTO no Mac, converta os rótulos em pares (melhor positiva × pior negativa) e use DPO. O ORPO dispensa a referência: tira uma das duas cópias de 8 bits (−4,3 GB; na figura, de ≈ 11,7 para ≈ 7,4 GB). Memória do DPO <b>[estimativa]</b>: <b>11–14 GB</b>. Tempo: ≈ 2 sequências × (15 + 8 GFLOP/token, contando o forward da referência) × ~700 tokens ≈ 32 TFLOP, ou <b>16–32 s por par</b>. Comece com 300–500 pares.</p>
+  <h3>Um GRPO pequeno, e o fim da trilha</h3>
+  <p>RL no Mac só com modelo pequeno, porque cada passo gera texto. Com o <code>Qwen3-1.7B-4bit</code>, grupos de 4, recompensas de acerto e formato no GSM8K, <code>--grpo-loss-type dr_grpo</code> e <code>--beta 0.0</code> (a referência nem é avaliada), cada passo leva <b>~0,5–1 min</b> <b>[estimativa]</b>. Cuidado com o <code>epsilon</code> (largura do clip) do <code>mlx-lm-lora</code>: <b>1e-4</b>, bem menor que o 0,2 clássico.</p>
+  <p>No fim, funda o adapter sobre o BF16 do ponto de partida da etapa e re-quantize com um método calibrado. O <span class="la-term" data-term="dwq">DWQ</span> (<code>mlx_lm.dwq</code>) destila do BF16 para 4 bits ajustando escalas e biases com os <i>seus</i> dados:</p>
+  <pre data-lang="bash"><code>mlx_lm.fuse --model models/sft_bf16 --adapter-path adapters/mac_dpo --save-path models/final_bf16 --dequantize
+mlx_lm.dwq --model models/final_bf16 --bits 4 --group-size 64 --data-path data/mlx_sft \
+  --num-samples 512 --max-seq-length 1025 --batch-size 2 --grad-checkpoint --mlx-path models/final_4bit_dwq
+python kl_mlx.py models/final_bf16 models/final_4bit_dwq data/kl_texts.jsonl   # erro de quantização vs o merge
+mlx_lm.server --model models/final_4bit_dwq --port 8080                         # o copiloto do Latent Atlas, preset MLX</code></pre>
+  <p>O <code>kl_mlx.py</code> da pesquisa calcula \(\mathrm{KL}(P\|Q)\) médio por token e a concordância de top-1. Compare modelos na mesma precisão para não misturar quantização com deriva. Uma alternativa a “treinar e depois quantizar” é o <span class="la-term" data-term="qat">QAT</span> do <code>mlx-lm-lora</code> (<code>--qat-enable --qat-bits 4</code>), que projeta os pesos treináveis na grade quantizada a cada passo.</p>
+</section>
+
+<section class="la-sec">
+  <h2>Trilha B: um 27B em dois Sparks</h2>
+  <p>A trilha B reaproveita a rede do Módulo 1: em cada Spark, as variáveis de NCCL do <a data-ch="nccl-rdma">capítulo 39</a> e um <code>drop_caches</code> antes de carregar 55 GB, porque na memória unificada o page cache conta como memória usada. O contêiner de treino é o NGC <code>pytorch:26.08-py3</code>, com o torch da imagem travado por <code>PIP_CONSTRAINT</code>:</p>
+  <pre data-lang="bash"><code>python -c "import torch; print(f'torch=={torch.__version__}')" &gt; /work/constraints.txt
+export PIP_CONSTRAINT=/work/constraints.txt
+pip install "trl==1.14.1" "peft==0.21.2" "transformers==5.18.0" "accelerate==1.15.0" datasets \
+            "bitsandbytes==0.50.2" "liger-kernel==0.8.4" math-verify hf_transfer openai "lm-eval[api]==0.4.13"
+# caminho rápido do Gated DeltaNet: sem ele o GDN cai em PyTorch puro
+pip install "flash-linear-attention==0.5.2"
+TORCH_CUDA_ARCH_LIST=12.1 pip install --no-build-isolation "causal-conv1d==1.7.0"
+python -c "import fla, causal_conv1d; print('GDN fast path OK')"</code></pre>
+  <p>As duas últimas linhas valem horas. O transformers 5.x carrega os kernels do GDN com <i>fallback</i> silencioso para PyTorch puro. Num repositório de terceiros (não verificado), só instalar o <span class="la-term" data-term="caminho-rapido-gdn">caminho rápido</span> levou o LoRA do Qwen3.5-2B de <b>505 para 3.076 tok/s</b> num GB10. Por isso o pré-voo mede 10 passos de SFT: o alvo <b>[estimativa]</b> para o 27B é 185–370 tok/s por Spark, e abaixo de 100 o caminho rápido não está ativo. Essas versões não foram testadas juntas no sm_121; o plano B são os pinos mais velhos da referência pública (NGC 26.03, transformers 5.5.0, TRL 0.24.0).</p>
+  <h3>DDP, não FSDP: quando o modelo cabe, não o fatie</h3>
+  <p>O reflexo seria usar FSDP, como no playbook multi-nó da NVIDIA. Mas o 27B em BF16 ocupa 55,6 GB, e cada Spark enxerga 121,7 GiB: ele <b>cabe inteiro em cada nó</b>. Então a escolha é <span class="la-term" data-term="ddp">DDP</span> simétrico: cada Spark guarda o modelo, processa metade dos dados e, a cada passo de otimizador, só os gradientes do LoRA atravessam o <span class="la-term" data-term="roce">RoCE</span> (217,6 M parâmetros em r=32, ou 0,87 GB em FP32). Com <span class="la-term" data-term="fsdp">FSDP</span>, cada forward, backward e recomputação faria all-gather dos pesos. Com 2 ranks, cada nó recebe a metade que não tem: ≈ 3 all-gathers × 27,8 GB por direção <b>por micro-lote</b>. Com acumulação de 16, são ~1,3 TB por passo de otimizador, ≈ 67 s a 20 GB/s, tanto quanto o próprio compute (39–78 s) <b>[estimativa]</b>. Com DDP, a razão entre compute e comunicação por passo é enorme, ao contrário do decode do <a data-ch="paralelismos">capítulo 38</a>; com FSDP, o cabo vira gargalo sem necessidade.</p>
+  <figure class="la-fig wide" id="fig-cabo" data-title="Dois Sparks, um cabo: DDP, FSDP e GRPO assimétrico">
+    <div class="la-fig-stage" style="height:410px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Em cada Spark, a faixa de camadas mostra o forward e o backward varrendo o modelo (ou a geração, no Spark B do GRPO), e a barra embaixo é a memória: o limite visível (121,7 GiB ≈ 130,7 GB) e o teto prático do capítulo 51 (~105 GiB ≈ 113 GB). Os pacotes no cabo têm área proporcional aos bytes por passo. A régua inferior é a linha do tempo de um passo. Números das tabelas da pesquisa, todos <b>[estimativa]</b>; o cabo usa ~20 GB/s efetivos como hipótese, dos 25 GB/s teóricos de 200 Gb/s.</figcaption>
+  </figure>
+  <p>Troque para FSDP e veja o cabo virar gargalo: a barra rosa do all-gather fica do tamanho da do compute, e os pesos por nó caem à metade sem que ninguém precisasse disso. Depois passe para o GRPO e repare no ritmo oposto: os dois nós se revezam, um gerando enquanto o outro espera, e o cabo só leva texto num sentido e ~19 GB de pesos no outro.</p>
+  <table class="la-params">
+    <thead><tr><th>Trabalho (por Spark)</th><th>Pesos</th><th>LoRA + grad + Adam</th><th>Ativações</th><th>Logits</th><th>Total [estimativa]</th></tr></thead>
+    <tbody>
+      <tr><td>SFT LoRA BF16, 27B, r=32, seq 4096, micro-lote 1</td><td>55,6 GB</td><td>3,5 GB</td><td>~2,7 GB + 1–2 GB de pico</td><td>4096 × 248.320 × 4 B ≈ 4,1 GB (+ gradiente): com PEFT, e num VLM como o <code>Qwen3_5ForConditionalGeneration</code>, o <code>chunked_nll</code> padrão não se aplica (<a data-ch="treino-memoria-lora">capítulos 51</a> e <a data-ch="sft">52</a>); confira no log a perda escolhida ou ligue <code>use_liger_kernel=True</code></td><td><b>≈ 70–80 GB</b></td></tr>
+      <tr><td>DPO LoRA BF16, 27B, <code>max_length</code> 2048</td><td>55,6 GB (referência = adapter desligado: 0 GB extra)</td><td>3,5 GB</td><td>~2,7 GB + pico</td><td>2 × 2048 × 248.320 × 4 B ≈ 4,1 GB (+ gradiente)</td><td><b>≈ 70–80 GB</b></td></tr>
+      <tr><td>QLoRA NF4, 27B (alternativa em 1 nó)</td><td>≈ 19–20 GB (embedding e <code>lm_head</code> ficam BF16: 5,1 GB)</td><td>3,5 GB</td><td>igual</td><td>igual</td><td><b>≈ 30–40 GB</b></td></tr>
+      <tr><td>GRPO 9B, Spark A (treino)</td><td>19,3 GB</td><td>~0,6–1,3 GB</td><td>~1–2 GB</td><td>≈ 3,6 GB</td><td><b>≈ 30–40 GB</b></td></tr>
+      <tr><td>GRPO 9B, Spark B (vLLM, <code>--gpu-memory-utilization 0.55</code>)</td><td>19,3 GB</td><td>—</td><td>—</td><td>—</td><td>≈ 67 GiB reservados, ~45 GiB de KV + estados GDN</td></tr>
+    </tbody>
+  </table>
+  <h3>SFT: o script</h3>
+  <p>O alvo do LoRA é uma regex que casa só a parte de linguagem: exclui a torre <code>model.visual.*</code>, o <code>lm_head</code> e as projeções minúsculas <code>in_proj_a</code>/<code>in_proj_b</code> do GDN. Duas linhas evitam os erros mais caros: <code>model_init_kwargs={"dtype": torch.bfloat16}</code> (sem isso o TRL carrega em <b>FP32</b> e os pesos dobram) e o <code>max_length</code>, cujo padrão de 1024 trunca a <i>resposta</i>.</p>
+  <pre data-lang="python"><code># train_sft.py — Qwen3.8-27B, LoRA BF16, DDP em 2 Sparks (TRL 1.14.1)
+TARGETS = r".*language_model\.layers\.\d+\.(self_attn\.(q_proj|k_proj|v_proj|o_proj)|linear_attn\.(in_proj_qkv|in_proj_z|out_proj)|mlp\.(gate_proj|up_proj|down_proj))"
+peft_config = LoraConfig(r=32, lora_alpha=32, lora_dropout=0.0, target_modules=TARGETS, task_type="CAUSAL_LM")
+args = SFTConfig(
+    output_dir="ckpt/q38-sft",
+    model_init_kwargs={"dtype": torch.bfloat16},   # sem isto: FLOAT32
+    max_length=4096, packing=False, assistant_only_loss=True,
+    per_device_train_batch_size=1, gradient_accumulation_steps=16,   # lote efetivo = 1 × 16 × 2 nós = 32
+    num_train_epochs=2, learning_rate=1e-4,        # LoRA ≈ 10× a LR de full FT
+    lr_scheduler_type="cosine",
+    warmup_steps=0.03,                             # float &lt; 1 = fração dos passos [inferência]: confira no log
+    gradient_checkpointing=True, gradient_checkpointing_kwargs={"use_reentrant": False},
+    bf16=True, logging_steps=5, eval_strategy="steps", eval_steps=100,
+    save_steps=200, save_total_limit=3, ddp_find_unused_parameters=False, seed=42,
+)
+trainer = SFTTrainer(model="Qwen/Qwen3.8-27B", args=args, train_dataset=ds["train"],
+                     eval_dataset=ds["validation"], peft_config=peft_config)
+trainer.train(); trainer.save_model("adapters/q38-sft")
+
+# Spark A:  accelerate launch --config_file cfg/accel_ddp_2nodes.yaml --machine_rank 0 train_sft.py
+# Spark B:  accelerate launch --config_file cfg/accel_ddp_2nodes.yaml --machine_rank 1 train_sft.py</code></pre>
+  <p>O YAML do Accelerate declara <code>distributed_type: MULTI_GPU</code>, duas máquinas com um processo cada, <code>rdzv_backend: static</code> e o IP da porta CX-7 do Spark A. O <code>packing</code> fica desligado porque concatenar sequências exige reset do estado recorrente do GDN em cada fronteira, o que não foi verificado no transformers 5.18. A conta de parâmetros é \(r(d_{in}+d_{out})\) por matriz-alvo: <code>q_proj</code> 5120 → 12.288 (saída gated) nas 16 atenções, <code>in_proj_qkv</code> 5120 → 10.240 nas 48 GDN, <code>gate</code>/<code>up</code> 5120 → 17.408 nas 64 MLPs. Somando tudo, 6.799.360 por unidade de posto: <b>217,6 M em r=32</b>, um adapter BF16 de ~435 MB. Um número diferente em <code>model.print_trainable_parameters()</code> quer dizer regex errada.</p>
+  <p>Os outros números do config também têm motivo. Com <code>lora_alpha</code> = <code>r</code>, a escala é \(s = \alpha/r = 1\), e a LR de 1e-4 (a dica do TRL para LoRA, ~10× a de full FT) vale sem conversão. O posto 32 dobra a capacidade do 16 por 1,7 GB a mais de estado de treino e um adapter de 435 MB: pouco perto dos 55,6 GB do modelo <b>[interpretação]</b>. Duas épocas sobre ~4.000 exemplos já pedem vigilância de sobreajuste, e é para isso que a <code>eval_loss</code> roda a cada 100 passos (o painel da próxima seção mostra a assinatura). O <code>warmup_steps=0.03</code> aposta na assinatura <code>float</code> do transformers 5.x, em que um valor abaixo de 1 vira fração dos passos; a pesquisa marca isso como inferência, então confira no log quantos passos de aquecimento saíram.</p>
+  <div class="la-eq">
+    \[ C_{\text{token}} \approx 6N,\qquad t \approx \frac{T\cdot 6N}{F_{\text{ef}}\cdot n_{\text{nós}}} = \frac{7{,}2\times10^{6}\cdot 1{,}62\times10^{11}}{(30\ \text{a}\ 60)\times10^{12}\cdot 2} \approx 2{,}7\ \text{a}\ 5{,}4\ \text{h} \]
+    <ul class="la-eq-legend">
+      <li>\(6N\): forward (\(2N\)) + gradiente de ativações (\(2N\)) + recomputação do checkpointing (\(2N\)); os gradientes de peso do LoRA são desprezíveis</li>
+      <li>\(N\) ≈ 27 bilhões; \(T\) = 4.000 exemplos × ~900 tokens × 2 épocas = 7,2 M tokens</li>
+      <li>\(F_{\text{ef}}\): 30–60 TFLOPS efetivos por GB10; os 60 batem com a medição pública de 370 tok/s para LoRA no Qwen3.5-27B <b>[não verificado]</b></li>
+    </ul>
+  </div>
+  <div class="la-callout danger"><b class="t">Não planeje com os “picos” de fine-tuning da NVIDIA</b><p>O blog da NVIDIA de 2025-10-24 publica 53.657 tok/s para o Llama 3.1 8B em LoRA no Spark. Faça a conta: 53.657 × 6 × 8e9 ≈ 2,6 PFLOP/s, mais de dez vezes os ~125 TFLOPS BF16 densos do GB10. A métrica deles não é “tokens de treino por segundo” no sentido usual, e a definição não foi publicada. Use FLOPs e meça.</p></div>
+  <p>Para liberar um Spark, há a alternativa <b>QLoRA num nó só</b>: o <code>SFTTrainer</code> aceita <code>quantization_config</code> direto (NF4, quantização dupla, como no script de 70B do playbook). Fica mais lento, e o adapter se acostuma ao NF4, o que cobra um preço no merge.</p>
+  <h3>DPO: funda o SFT, depois treine sobre ele</h3>
+  <p>A avaliação intermediária do SFT não exige merge: o vLLM serve base e adapter no mesmo processo (<code>--enable-lora --lora-modules q38-sft=/work/adapters/q38-sft</code>), e o campo <code>"model"</code> escolhe entre os dois. Para o DPO, o merge é obrigatório. Com PEFT, a referência do DPO é o <b>próprio modelo com o adapter desligado</b>; se o SFT continuasse como adapter, desligá-lo devolveria o <i>base</i>. Funda o SFT em <code>models/q38-sft-bf16</code> e treine o DPO como um novo LoRA sobre ele:</p>
+  <pre data-lang="python"><code>args = DPOConfig(output_dir="ckpt/q38-dpo", model_init_kwargs={"dtype": torch.bfloat16},
+    loss_type=["sigmoid"],   # DPO clássico (Bradley–Terry)
+    beta=0.1,                # padrão; ↑beta = fica mais perto da referência
+    max_length=2048,         # padrão 1024
+    per_device_train_batch_size=1, gradient_accumulation_steps=16, num_train_epochs=1,
+    learning_rate=5e-6,      # dica do TRL para adapters em DPO: ~1e-5; comece abaixo
+    lr_scheduler_type="cosine", warmup_steps=0.05, gradient_checkpointing=True,
+    eval_strategy="steps", eval_steps=50, save_steps=100, seed=42)
+trainer = DPOTrainer(model="models/q38-sft-bf16", args=args, train_dataset=ds["train"],
+                     eval_dataset=ds["validation"], peft_config=LoraConfig(r=32, lora_alpha=32, target_modules=TARGETS, task_type="CAUSAL_LM"))</code></pre>
+  <p>Trocar de método é trocar uma linha: <code>loss_type=["ipo"]</code> (IPO); <code>["sigmoid_norm"]</code> (normalizado por comprimento, do Tülu 3, contra a verbosidade); <code>["robust"]</code> com <code>label_smoothing=0.1</code> para rótulos ruidosos do juiz. SimPO fica no <code>trl.experimental.cpo</code>. KTO usa o <code>KTOTrainer</code> com lote por dispositivo ≥ 4, porque o termo de KL é estimado pareando cada prompt com uma completion de <b>outro</b> exemplo do lote. Tempo <b>[estimativa]</b>: 2.500 pares a 8N por token (6N da política + 2N da referência) equivalem a 6,0 M tokens de SFT, ou <b>2,3–4,5 h</b>.</p>
+  <h3>GRPO: um Spark gera, o outro aprende</h3>
+  <p>No RL os papéis ficam <b>assimétricos</b>. O Spark B roda um <code>vllm serve</code> que só gera; o Spark A roda o <code>GRPOTrainer</code> e empurra os pesos atualizados pelo NCCL a cada passo (o modo <code>"server"</code> do TRL; o <code>"colocate"</code> dividiria a memória unificada entre treino e vLLM). O Spark B sobe assim:</p>
+  <pre data-lang="bash"><code># Spark B — gerador vLLM com transferência de pesos (flags exigidas pelo TRL)
+docker run -d --name gen --gpus all --network host --ipc host --shm-size 16g \
+  --device /dev/infiniband --cap-add IPC_LOCK --ulimit memlock=-1 \
+  -e VLLM_SERVER_DEV_MODE=1 -e NCCL_SOCKET_IFNAME -e GLOO_SOCKET_IFNAME -e NCCL_IB_HCA -e NCCL_IB_GID_INDEX \
+  -v $HOME/.cache/huggingface:/root/.cache/huggingface vllm/vllm-openai:v0.30.0 \
+  Qwen/Qwen3.5-9B --host 0.0.0.0 --port 8000 --tensor-parallel-size 1 \
+  --max-model-len 4096 --gpu-memory-utilization 0.55 --enable-prefix-caching \
+  --weight-transfer-config '{"backend": "nccl"}' --logprobs-mode processed_logprobs --max-logprobs -1</code></pre>
+  <p>Três linhas pedem cuidado. <code>VLLM_SERVER_DEV_MODE=1</code> expõe os endpoints de atualização de pesos e outros de desenvolvimento: mantenha o servidor na rede privada do cabo CX-7. <code>--logprobs-mode processed_logprobs</code> devolve os logprobs depois da temperatura e dos processadores, que é o que a correção de importance sampling do TRL espera. E <code>--device /dev/infiniband</code> com <code>IPC_LOCK</code> dá ao NCCL o caminho RDMA do capítulo 39. Não acrescente o <code>--language-model-only</code> do servidor de produção: o treinador sincroniza os pesos do modelo inteiro que o TRL carregou, torre de visão incluída <b>[inferência da pesquisa]</b>.</p>
+  <div class="la-callout warn"><b class="t">O treinador também precisa do vLLM</b><p>O cliente de transferência de pesos do TRL importa o próprio pacote <code>vllm</code>, então o NGC PyTorch da SFT não basta no Spark A. Rode os dois nós na imagem <code>vllm/vllm-openai:v0.30.0</code> e, no Spark A, instale nela <code>pip install "trl==1.14.1" "peft==0.21.2" math-verify</code>.</p></div>
+  <pre data-lang="python"><code># train_grpo.py (trecho) — Spark A; o GSM8K vira "prompt" + "solution", a coluna que o accuracy_reward lê
+def to_rl(ex):
+    sol = ex["answer"].split("####")[-1].strip().replace(",", "")
+    return {"prompt": [{"role": "user", "content": ex["question"] + "\nResolva e escreva a resposta final em \\boxed{}."}], "solution": sol}
+train = load_dataset("openai/gsm8k", "main", split="train").map(to_rl, remove_columns=["question", "answer"])
+
+args = GRPOConfig(output_dir="ckpt/q35-9b-grpo", model_init_kwargs={"dtype": torch.bfloat16},
+    use_vllm=True, vllm_mode="server", vllm_server_host="10.10.10.2", vllm_server_port=8000,  # IP CX-7 do Spark B
+    chat_template_kwargs={"enable_thinking": False},
+    num_generations=8,                       # G: tamanho do grupo
+    per_device_train_batch_size=4, gradient_accumulation_steps=32,   # 128 completions = 16 prompts × 8
+    max_completion_length=768, temperature=1.0, top_p=0.95, top_k=20,
+    loss_type="dapo", epsilon=0.2, epsilon_high=0.28,   # clip-higher do DAPO
+    mask_truncated_completions=True,         # "overlong filtering" do DAPO
+    beta=0.001,     # β pequeno: o KL entra na perda com peso mínimo e passa a ser logado;
+                    # custa um forward extra da referência (adapter desligado)
+    learning_rate=1e-5, lr_scheduler_type="constant_with_warmup", warmup_steps=5,
+    max_steps=150, log_completions=True, gradient_checkpointing=True, seed=42)
+trainer = GRPOTrainer(model="Qwen/Qwen3.5-9B",
+    reward_funcs=[accuracy_reward, get_soft_overlong_punishment(max_completion_len=768, soft_punish_cache=128)],
+    args=args, train_dataset=train, peft_config=LoraConfig(r=16, lora_alpha=16, target_modules=TARGETS, task_type="CAUSAL_LM"))
+trainer.train(); trainer.save_model("adapters/q35-9b-grpo")
+
+# Spark A:  accelerate launch --num_processes 1 train_grpo.py      (um processo; o Spark B só gera)</code></pre>
+  <p>Sem o <code>to_rl</code>, o dataset chega com <code>question</code>/<code>answer</code> e o <code>accuracy_reward</code> não encontra a coluna <code>solution</code>. Cada parâmetro do config responde a uma pergunta do <a data-ch="grpo-rlvr">capítulo 56</a>:</p>
+  <table class="la-params">
+    <thead><tr><th>Parâmetro</th><th>Valor</th><th>Por que importa</th></tr></thead>
+    <tbody>
+      <tr><td><code>num_generations</code> (G)</td><td>8 (padrão)</td><td>a vantagem usa a média e o desvio do grupo, estimados com G amostras. Com acerto \(p\) num prompt, o grupo não ensina nada com probabilidade \(p^G + (1-p)^G\): para \(p = 0{,}8\), 0,41 com G = 4 e 0,17 com G = 8. G maior derruba o <code>frac_reward_zero_std</code>, ao custo de mais geração por passo</td></tr>
+      <tr><td><code>per_device_train_batch_size</code> × <code>gradient_accumulation_steps</code></td><td>4 × 32</td><td>128 completions por passo de otimizador = 16 prompts × 8</td></tr>
+      <tr><td><code>epsilon</code> · <code>epsilon_high</code></td><td>0,2 · 0,28</td><td><i>clip-higher</i> do DAPO: um token com \(\pi_{\text{old}} = 0{,}01\) e vantagem positiva pode subir até 0,0128, e não só até 0,012. Tokens raros de exploração crescem, o que combate o colapso de entropia</td></tr>
+      <tr><td><code>mask_truncated_completions</code></td><td>True</td><td>uma completion cortada em 768 tokens não tem resposta final verificável; sem a máscara, ela entra como erro e pune o raciocínio longo em si, um sinal errado</td></tr>
+      <tr><td><code>get_soft_overlong_punishment</code></td><td>768, 128</td><td>penalidade linear nos últimos 128 tokens: zero até 640, \((640 - |y|)/128\) entre 640 e 768, −1 além. Avisa que o limite está perto antes do corte</td></tr>
+      <tr><td><code>temperature</code> · <code>top_p</code> · <code>top_k</code></td><td>1,0 · 0,95 · 20</td><td>temperatura 1 para explorar; <code>top_p</code> e o <code>top_k</code> 20 do card do Qwen só aparam a cauda de tokens improváveis <b>[recomendação da pesquisa]</b></td></tr>
+      <tr><td><code>beta</code></td><td>0,001</td><td>o padrão é 0 (sem referência). Um β mínimo liga o termo de KL e a métrica <code>kl</code>; com PEFT, a referência é o mesmo modelo com o adapter desligado: zero memória extra, mas um forward a mais (2N FLOPs por token)</td></tr>
+      <tr><td><code>learning_rate</code></td><td>1e-5</td><td>o padrão 1e-6 é de full FT; LoRA pede ~10× (<i>LoRA Without Regret</i>)</td></tr>
+    </tbody>
+  </table>
+  <p>Com PEFT, a cada sincronização o TRL funde o adapter, transmite os pesos fundidos (≈ 19,3 GB) e desfaz a fusão: 1–2 s por passo a ~10–20 GB/s. Com 128 completions de ~400 tokens (45–85 s de geração) e o treino de ~67 mil tokens a 8N por token (6N da política + 2N do forward da referência que o β &gt; 0 exige: 87–173 s), dá <b>2,2 a 4,3 min por passo</b>, e 150 passos levam 5,5–11 h <b>[estimativa]</b>. Com <code>beta=0.0</code> o passo volta a 2–3,6 min, mas o KL deixa de ser logado. A <span class="la-term" data-term="vantagem-de-grupo">vantagem de grupo</span> do capítulo 56 explica a métrica mais importante deste treino:</p>
+  <div class="la-eq">
+    \[ \hat A_i = \frac{r_i - \text{média}(r_1,\dots,r_G)}{\text{desvio}(r_1,\dots,r_G)},\qquad \texttt{frac\_reward\_zero\_std} = \Pr\big[\text{desvio}(r_{1..G}) = 0\big] \]
+    <ul class="la-eq-legend">
+      <li>\(r_i\): recompensa da completion \(i\) do grupo (0 ou 1 no <code>accuracy_reward</code>, verificado com <code>math_verify</code>)</li>
+      <li>\(G\) = 8 completions por prompt; <code>scale_rewards="group"</code> é o padrão</li>
+      <li>se as 8 acertam (ou as 8 erram), o desvio é zero e o grupo não ensina nada: <span class="la-term" data-term="frac-reward-zero-std"><code>frac_reward_zero_std</code></span> → 1 indica dataset fácil ou difícil demais</li>
+    </ul>
+  </div>
+  <p>Uma variante de domínio ótima para ensinar <i>reward hacking</i>: problemas gerados por código com resposta exata (GB de pesos por formato, KiB de KV por token) e uma recompensa que exige <b>exatamente uma</b> caixa <code>\boxed{}</code>. Uma recompensa que só confere “o número aparece na resposta” é burlada listando vários números.</p>
+</section>
+
+<section class="la-sec">
+  <h2>Vigiar o treino e decidir com portões</h2>
+  <p>Um treino de horas pode dar errado de formas que a loss não mostra. Cada algoritmo tem a sua assinatura de problema, nas métricas que o TRL loga:</p>
+  <table class="la-params">
+    <thead><tr><th>Algoritmo</th><th>Métrica</th><th>Normal</th><th>Suspeito</th><th>Leitura e correção</th></tr></thead>
+    <tbody>
+      <tr><td>SFT</td><td><code>loss</code> vs <code>eval_loss</code></td><td>ambos caem</td><td>treino ↓, eval ↑</td><td>sobreajuste: menos épocas ou menor LR</td></tr>
+      <tr><td>SFT</td><td><code>mean_token_accuracy</code></td><td>sobe devagar</td><td>~1,0 cedo</td><td>memorização ou dados duplicados</td></tr>
+      <tr><td>DPO</td><td><code>rewards/accuracies</code></td><td>0,6–0,8</td><td>→ 1,0 rápido</td><td>pares fáceis demais ou viés de comprimento explorado</td></tr>
+      <tr><td>DPO</td><td><code>rewards/margins</code> e <code>logps/chosen</code></td><td>margem sobe</td><td>margem sobe enquanto <code>logps/chosen</code> despenca</td><td><span class="la-term" data-term="likelihood-displacement">likelihood displacement</span>: ↑β, <code>loss_type=["sigmoid","sft"]</code> ou <code>apo_zero</code></td></tr>
+      <tr><td>GRPO</td><td><code>reward</code> e <code>completions/mean_length</code></td><td>recompensa sobe</td><td>sobe com o comprimento explodindo</td><td>hacking de comprimento ou formato: ler amostras, endurecer o verificador</td></tr>
+      <tr><td>GRPO</td><td><code>entropy</code></td><td>cai devagar</td><td>colapsa cedo</td><td>colapso de entropia: o clip-higher do DAPO existe para isso</td></tr>
+      <tr><td>GRPO + vLLM</td><td><code>sampling/sampling_logp_difference/mean</code></td><td>~0</td><td>grande</td><td>descompasso treino × inferência (dtype, kernels)</td></tr>
+    </tbody>
+  </table>
+  <p>O <i>likelihood displacement</i> merece explicação. O DPO não otimiza a probabilidade da resposta escolhida, otimiza a <b>diferença</b> entre as recompensas implícitas das duas respostas:</p>
+  <div class="la-eq">
+    \[ \hat r_\theta(x,y) = \beta\,\log\frac{\pi_\theta(y\mid x)}{\pi_{\text{ref}}(y\mid x)},\qquad \texttt{rewards/margins} = \hat r_\theta(x,y_w) - \hat r_\theta(x,y_l) \]
+    <ul class="la-eq-legend">
+      <li>\(\hat r_\theta\): <span class="la-term" data-term="recompensa-implicita">recompensa implícita</span> do DPO (é o que o TRL loga em <code>rewards/*</code>)</li>
+      <li>\(y_w\), \(y_l\): resposta escolhida e rejeitada; \(\beta\): força da âncora na referência</li>
+      <li><code>logps/chosen</code> = \(\log\pi_\theta(y_w\mid x)\): pode <b>cair</b> enquanto a margem sobe, se \(\log\pi_\theta(y_l)\) cair ainda mais rápido</li>
+    </ul>
+  </div>
+  <p>Se as duas probabilidades caem, a massa vai para algum lugar, às vezes para respostas de sentido oposto. No exemplo do artigo que nomeou o fenômeno (arXiv 2410.08847), treinar para recusar <b>reduziu</b> a taxa de recusa do Llama-3-8B-Instruct de 74,4% para 33,4%. Ancorar a escolhida com uma NLL (<code>loss_type=["sigmoid","sft"]</code>), subir β ou filtrar pares muito parecidos (o escore CHES do artigo) atenua o problema.</p>
+  <figure class="la-fig" id="fig-painel" data-title="O painel de bordo do treino: três algoritmos, três doenças">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Quatro métricas por algoritmo, com os nomes que o TRL loga (o comprimento do DPO vem das amostras), desenhadas enquanto o treino “roda”. As lâmpadas acendem quando a regra da tabela dispara, e a caixa de diagnóstico traz a correção. As curvas são <b>ilustrativas</b>: as formas seguem as assinaturas descritas na pesquisa, os valores não são de um treino real.</figcaption>
+  </figure>
+  <p>Escolha DPO e o cenário “problema”, e olhe a ordem em que as lâmpadas acendem: a de <code>logps/chosen</code> fica âmbar e depois vermelha bem antes da de <code>rewards/accuracies</code>. A queda da log-prob da escolhida é o aviso precoce; quando a acurácia de recompensa encosta em 1,0, o estrago já está feito. No GRPO, o mesmo papel é do comprimento médio, que dispara antes da entropia colapsar.</p>
+  <h3>Portões pré-registrados</h3>
+  <p>O <a data-ch="avaliacao-pos-treino">capítulo 62</a> discutiu a avaliação em profundidade. Na receita, ela vira uma lista de <span class="la-term" data-term="portao-de-decisao">portões</span> escritos <b>antes</b> de olhar os números, para não escolher o checkpoint que, por acaso, foi melhor no último benchmark olhado.</p>
+  <table class="la-params">
+    <thead><tr><th>Eixo</th><th>Medida</th><th>Portão sugerido [recomendação]</th></tr></thead>
+    <tbody>
+      <tr><td>Alvo</td><td><span class="la-term" data-term="win-rate">WR</span> e <span class="la-term" data-term="wr-lc">WR-LC</span> contra o base no <code>test_dominio</code> (juiz de outra família, duas ordens), IC95% por bootstrap</td><td>limite inferior do IC do WR-LC &gt; 50% e WR-LC ≥ 60%</td></tr>
+      <tr><td>Alvo</td><td>acerto numérico com tolerância de 1%</td><td>sobe contra o base, IC sem cruzar zero</td></tr>
+      <tr><td>Regressão</td><td>IFEval (<code>prompt_level_strict_acc</code>), GSM8K Platinum, AIME 2025 (2 sementes), pensando e sem pensar</td><td>Δ ≥ −2 pp (IFEval, GSM8K); Δ AIME dentro do IC</td></tr>
+      <tr><td>Segurança</td><td>XSTest (recusa nos 250 prompts seguros); StrongREJECT (subconjunto)</td><td>recusa nos seguros não sobe mais que 2 pp; escore StrongREJECT não sobe</td></tr>
+      <tr><td>Deriva</td><td>KL(base‖candidato) por token em texto genérico e no domínio</td><td>reporte; investigue se o KL genérico for muito maior que o do SFT</td></tr>
+      <tr><td>Velocidade</td><td>aceitação do MTP por posição, base vs candidato</td><td>reporte: afeta o custo de serviço</td></tr>
+    </tbody>
+  </table>
+  <div class="la-eq">
+    \[ \widehat{\mathrm{WR}} = \frac{W + \tfrac12 T}{n},\qquad \text{meia-largura do IC95\%} \approx 1{,}96\sqrt{\frac{p(1-p)}{n}} \;\xrightarrow{\ p\,=\,0{,}5\ }\; \pm 9{,}8\ \text{pp}\ (n=100),\ \ \pm 4{,}9\ \text{pp}\ (n=400) \]
+    <ul class="la-eq-legend">
+      <li>\(W, T\): vitórias e empates do candidato em \(n\) prompts (empate vale meio ponto)</li>
+      <li>na prática, use <b>bootstrap por prompt</b> (B = 2.000 reamostragens, percentis 2,5% e 97,5%); para comparar dois candidatos, reamostre os pares</li>
+      <li>daí os 300–500 prompts de domínio: diferenças menores que a meia-largura são ruído</li>
+    </ul>
+  </div>
+  <p>A logística pega quem não planejou: os juízes ocupam os dois Sparks, e os candidatos também. A ordem é servir os candidatos e <b>gravar</b> todas as respostas, rodar as tarefas verificáveis, derrubar tudo, subir a receita-juiz e julgar as respostas gravadas. E lembre que o DPO é um adapter sobre o <b>SFT fundido</b>: sirva-o sobre <code>models/q38-sft-bf16</code>, nunca sobre o Qwen3.8-27B original, porque um adapter só vale sobre o base em que foi treinado.</p>
+</section>
+
+<section class="la-sec">
+  <h2>Merge: devolver o adapter aos pesos</h2>
+  <p>Passados os portões, o adapter volta para dentro da matriz. O <span class="la-term" data-term="merge-de-adaptador">merge</span> é a conta \(W' = W_0 + s\,B\,A\): depois dele, a inferência não paga nada pelo LoRA. Mas a conta só é exata se \(W_0\) for o peso que o adapter viu, numa precisão capaz de representar \(s\,BA\). Daí três regras:</p>
+  <ol class="la-steps">
+    <li><b>Carregue o base em BF16, nunca o 4-bit do treino QLoRA.</b> O <code>merge_and_unload</code> sobre pesos 4-bit dequantiza, soma e re-quantiza, perdendo parte do delta.</li>
+    <li><b>No MLX, use <code>--dequantize</code>.</b> Sem ele, sobre um base quantizado, o <code>mlx_lm.fuse</code> dequantiza a camada, soma o delta e <b>re-quantiza com os mesmos bits, grupo e modo</b>, recalculando escalas e biases a partir do peso fundido (<span class="la-term" data-term="rtn">RTN</span>, sem calibração).</li>
+    <li><b>Salve tudo o que não é peso:</b> tokenizer, <code>chat_template.jinja</code>, <code>preprocessor_config.json</code> (é um VLM) e <code>generation_config.json</code>.</li>
+  </ol>
+  <p>A regra 2 tem uma conta simples. O <code>fuse</code> recalcula a escala do grupo a partir do peso fundido (\(\Delta' \approx \Delta\), porque \(\Delta W\) mexe pouco no mínimo e no máximo do grupo) e re-arredonda tudo. Deltas abaixo de ~\(\Delta/2\) se perdem e, como os valores já estavam na grade antiga e agora caem numa grade levemente deslocada, o re-arredondamento ainda soma ruído novo. A desigualdade continua sendo a regra de bolso:</p>
+  <div class="la-eq">
+    \[ \begin{gathered} \hat w' = \Delta'\,\text{round}\!\Big(\frac{\hat w + \Delta W - m'}{\Delta'}\Big) + m',\qquad \Delta = \frac{\max W_g - \min W_g}{2^{b}-1} \\ |\Delta W| \lesssim \tfrac{\Delta}{2}\ \Rightarrow\ \text{o delta se perde no arredondamento} \end{gathered} \]
+    <ul class="la-eq-legend">
+      <li>\(\hat w = q\,\Delta + m\): o peso dequantizado antes do merge, com \(q\) inteiro de 0 a \(2^b - 1\) e \(m\) o mínimo do grupo (o <i>bias</i> do modo afim do MLX); \(W_g\): os 64 pesos do grupo</li>
+      <li>\(\Delta', m'\): escala e mínimo recalculados no peso fundido; \(\Delta' \approx \Delta\), mas a grade se desloca, e \(\hat w\) já não cai exatamente num nível</li>
+      <li>\(b\) = 4 bits → 15 degraus por grupo, o degrau é 1/15 da faixa; com 8 bits são 255 degraus, ~17× menores</li>
+      <li>numa simulação com grupos de 64 e pesos \(N(0;\,0{,}02)\), \(|\Delta W|\) de 2% do desvio dá “preservado” −0,60 em 4 bits (o merge soma mais ruído que delta) e +0,93 em 8 bits <b>[simulação ilustrativa]</b></li>
+      <li>daí o “funda o SFT em 8 bits” da trilha A: o delta que some na grade de 4 bits sobrevive na de 8</li>
+    </ul>
+  </div>
+  <figure class="la-fig" id="fig-merge" data-title="LoRA por dentro: B·A, o merge e a grade que engole o delta">
+    <div class="la-fig-stage" style="height:470px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Uma matriz 6×6 de verdade, com pesos sintéticos na escala típica (desvio 0,02; valores exibidos ×100). \(B\) começa em zero e cresce no “treino”; o produto \(s\,BA\) tem posto \(r\). Embaixo, os códigos inteiros (uma linha = um grupo, RTN afim como no MLX: escala e mínimo por grupo, \(2^b - 1\) degraus) antes e depois do merge sem <code>--dequantize</code>: o <code>mlx_lm.fuse</code> dequantiza, soma \(\Delta W\) e re-quantiza com os mesmos bits, <b>recalculando escala e mínimo</b> a partir do peso fundido. Os anéis rosa marcam os códigos que mudaram; o contorno tracejado, os valores que se mexeram só porque a grade andou. “ΔW preservado” compara o delta que de fato entrou com o \(\Delta W\) pretendido; abaixo de zero, o merge somou mais ruído do que delta. O brinquedo tem só 6 pesos por grupo, então o degrau é menor que num grupo real de 64: leia a razão \(|\Delta W|\)/meio degrau, não a porcentagem. O modo “abliteração” troca o LoRA pela edição de posto 1 do capítulo 19. Aritmética real; matriz e magnitudes <b>ilustrativas</b>.</figcaption>
+  </figure>
+  <p>Brinque com a magnitude do delta e com a grade. Leve \(|\Delta W|\) a 2% do desvio em 4 bits: nenhum código muda, mas os 36 valores se mexem, porque a grade foi recalculada, e o “preservado” fica negativo. O merge piorou o peso em vez de aplicar o delta. Suba a magnitude e os códigos começam a saltar degraus inteiros: o delta aplicado vira uma caricatura do pretendido. Em 8 bits o degrau é ~17× menor e o re-arredondamento custa pouco; em BF16, quase tudo passa. Isso <i>não</i> impede servir um fine-tune em 4 bits. Um método calibrado (GPTQ, AWQ, DWQ) escolhe escalas e arredondamentos olhando o <b>modelo fundido</b>, que já contém o delta, e distribui o erro para preservar a saída. O que falha é o atalho: somar o delta numa grade de 4 bits congelada.</p>
+  <div class="la-callout deep"><b class="t">O problema específico do QLoRA</b><p>Um adapter QLoRA aprendeu a corrigir \(\mathrm{deq}(W_{\text{NF4}})\), não \(W_{\text{BF16}}\). Fundir em \(W_{\text{BF16}}\) dá \(W_{\text{BF16}} + BA \neq \mathrm{deq}(W_{\text{NF4}}) + BA\), e a diferença é o erro de quantização que o adapter talvez compensasse. Fundir em \(\mathrm{deq}(W_{\text{NF4}})\) preserva a função treinada, mas “assa” o erro NF4 no modelo. Nos dois casos, meça o KLD contra o modelo treinado. Na trilha A, o descasamento de fundir sobre o BF16 é pequeno e aceitável.</p></div>
+  <h3>A MTP que o transformers joga fora</h3>
+  <p>Ao carregar o Qwen3.5/3.8, o transformers <b>descarta</b> os tensores <code>mtp.*</code> (<code>_keys_to_ignore_on_load_unexpected = [r"^mtp.*"]</code>). Salvar o fundido sem eles quebra o <code>--speculative-config '{"method":"mtp",…}'</code> do <a data-ch="mtp-eagle-vocab">capítulo 36</a>. O <code>RedHatAI/Qwen3.8-27B-NVFP4</code> resolve com 15 tensores <code>mtp.*</code> num shard separado e o índice reescrito, a mesma técnica do <code>tools/dense_overlay.py</code> da receita <span class="la-rb glm"></span>.</p>
+  <pre data-lang="python"><code># merge.py (trecho) — funde em BF16 e preserva MTP, processor e template
+model = Qwen3_5ForConditionalGeneration.from_pretrained(src, dtype=torch.bfloat16, device_map="cuda")   # BF16, nunca NF4
+model = PeftModel.from_pretrained(model, a.adapter).merge_and_unload()
+model.save_pretrained(a.out, max_shard_size="5GB")
+AutoProcessor.from_pretrained(src).save_pretrained(a.out)
+for f in ("chat_template.jinja", "generation_config.json", "preprocessor_config.json", "video_preprocessor_config.json"):
+    if os.path.exists(os.path.join(src, f)):
+        shutil.copy(os.path.join(src, f), a.out)
+wm = json.load(open(os.path.join(src, "model.safetensors.index.json")))["weight_map"]
+mtp = {}
+for k, shard in wm.items():
+    if k.startswith("mtp."):
+        with safe_open(os.path.join(src, shard), "pt") as f:
+            mtp[k] = f.get_tensor(k)
+if mtp:   # a MTP continua sendo a do base: espere aceitação menor
+    save_file(mtp, os.path.join(a.out, "model_mtp.safetensors"), metadata={"format": "pt"})
+    idx = json.load(open(p := os.path.join(a.out, "model.safetensors.index.json")))
+    idx["weight_map"].update({k: "model_mtp.safetensors" for k in mtp}); json.dump(idx, open(p, "w"), indent=2)
+
+# uso: python merge.py --base models/q38-sft-bf16 --adapter adapters/q38-dpo --out models/q38-final-bf16</code></pre>
+  <p>O <code>--base</code> é o SFT fundido, porque o DPO foi treinado sobre ele. Antes de quantizar, <b>verifique o merge</b>: logits de alguns prompts com base + adapter via PEFT e com o fundido, um de cada vez (dois 27B não cabem juntos num Spark). A pesquisa recomenda max |Δlogit| da ordem do arredondamento BF16 e top-1 idêntico em ≥ 99,9% das posições. Confira também os nomes das chaves salvas contra o índice original: o transformers 5.x aplica mapeamentos de conversão no load e no save. Tempo <b>[estimativa]</b>: ~111 GB de E/S a ~4,9 GB/s de NVMe, mais carga e merge, <b>5 a 15 minutos</b>.</p>
+</section>
+
+<section class="la-sec">
+  <h2>Re-quantizar: calibrar de novo, no modelo que você treinou</h2>
+  <p>A <span class="la-term" data-term="calibracao">calibração</span> do <a data-ch="quantizacao-fundamentos">capítulo 20</a> mede as ativações para escolher escalas e arredondamentos. Depois do fine-tune, essa medição envelheceu. Quatro princípios valem para qualquer formato:</p>
+  <ol class="la-steps">
+    <li><b>Nada do base quantizado é reaproveitável.</b> Escalas por grupo, Hessianos (<span class="la-term" data-term="gptq">GPTQ</span>, EXL3), escalas de ativação (<span class="la-term" data-term="awq">AWQ</span>), escalas globais NVFP4 e escalas estáticas de KV foram estimadas no <b>base</b>. Refaça tudo a partir do fundido em BF16.</li>
+    <li><b>Dados de calibração = distribuição de uso.</b> Misture amostras do seu SFT/DPO, no template real, com chat genérico. Só domínio sobreajusta a quantização ao domínio; só genérico subestima as ativações do domínio.</li>
+    <li><b>Mantenha em alta precisão o que o original mantinha:</b> embeddings, <code>lm_head</code>, <code>in_proj_a</code>/<code>in_proj_b</code> do GDN, torre de visão e a cabeça MTP, que não foi treinada.</li>
+    <li><b>Meça contra o merge BF16</b>, não contra o base original (próxima seção).</li>
+  </ol>
+  <p>O princípio 2 é um compromisso. Um método calibrado escolhe a escala que minimiza o erro <i>na distribuição de calibração</i>. Se o domínio tem ativações maiores (unidades, números, flags que o texto genérico quase não tem), calibrar só com genérico corta essas ativações, e calibrar só com domínio estica a escala e desperdiça resolução no resto.</p>
+  <p>Cada método da receita usa o lote de calibração de um jeito. O <span class="la-term" data-term="gptq">GPTQ</span> do <a data-ch="quantizacao-fundamentos">capítulo 20</a> escolhe os pesos quantizados que melhor preservam a <b>saída</b> da camada nas ativações de calibração:</p>
+  <div class="la-eq">
+    \[ \min_{\hat W}\ \big\|W X - \hat W X\big\|_F^2,\qquad H = 2\,X X^\top \]
+    <ul class="la-eq-legend">
+      <li>\(X\): as ativações de entrada da camada no <b>seu</b> lote de calibração (uma coluna por token); \(\hat W\): o peso quantizado</li>
+      <li>\(H\): o Hessiano dessa perda; o GPTQ quantiza coluna a coluna e usa \(H^{-1}\) para empurrar o erro para as colunas que ainda não foram quantizadas</li>
+      <li>domínio e genérico produzem \(X\) diferentes, logo \(H\) diferentes, e mudam onde o GPTQ gasta precisão</li>
+    </ul>
+  </div>
+  <p>O <span class="la-term" data-term="awq">AWQ</span> procura escalas por canal a partir da magnitude média de cada canal de entrada medida em \(X\), protegendo os canais que mais carregam ativação. No NVFP4, as ativações recebem escalas dinâmicas por bloco de 16 a cada token, e a calibração só fixa a escala global estática (o <code>input_scale</code> do checkpoint). O brinquedo da figura abaixo é um corte por tensor, o mesmo tipo de escala estática do KV FP8 <code>static_minmax</code> da receita.</p>
+  <figure class="la-fig wide" id="fig-calib" data-title="Onde cada formato mora, e o que a mistura de calibração decide">
+    <div class="la-fig-stage" style="height:470px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Em cima, as 64 camadas do Qwen3.8-27B com o formato da receita NVFP4 do llm-compressor: atenção e GDN em FP8 dinâmico, MLPs em NVFP4, as <b>8 últimas MLPs (56–63) em FP8</b>, e <code>lm_head</code>, MTP, visão e <code>in_proj_a/b</code> fora da quantização; passe o mouse (ou toque) numa camada. O lote de calibração atravessa as camadas com a mistura do controle. Embaixo, um modelo de brinquedo com aritmética real: o corte de uma grade de 4 bits <b>por tensor</b> (uma escala estática, como a do KV FP8 <code>static_minmax</code> da receita) é escolhido para minimizar o erro na mistura de calibração, e as curvas mostram o erro resultante em texto genérico e de domínio. As ativações são <b>ilustrativas</b> (o domínio tem 8% de valores ~4× maiores).</figcaption>
+  </figure>
+  <p>Arraste a fração para 0%: o corte se ajusta só ao genérico (2,5σ) e o erro do domínio vai de 5% para quase 19%, quase quatro vezes mais. Leve a 100% e o genérico paga: o corte estica para 6,7σ e o erro dele sobe de 1,3% para 7,4%. O ótimo fica no meio, e é por isso que o <code>quant_nvfp4.py</code> da pesquisa usa <b>256 amostras próprias + 256 do UltraChat</b>, com sequência 4096. A receita parte do exemplo oficial do llm-compressor para o Qwen3.8-27B e muda três coisas: os dados de calibração (no lugar do <code>perfectblend</code>), <code>lm_head</code> e <code>re:^mtp.*</code> no <code>ignore</code> (como no checkpoint publicado pelo RedHatAI) e nada de <code>moe_calibrate_all_experts</code>, porque o 27B não é MoE:</p>
+  <pre data-lang="python"><code>recipe = [
+    AWQModifier(duo_scaling="both"),
+    GPTQModifier(
+        config_groups={
+            "attention": QuantizationScheme(targets=[
+                r"re:.*self_attn\.(q|k|v|o)_proj$",
+                r"re:.*linear_attn\.(in_proj_qkv|in_proj_z|out_proj)$",
+                r"re:.*layers\.(56|57|58|59|60|61|62|63)\.mlp\..*(gate|up|down)_proj$"], **FP8_DYNAMIC),
+            "mlp": QuantizationScheme(targets=[r"re:.*mlp\..*(gate|up|down)_proj$"], **NVFP4),
+        },
+        ignore=["re:visual.*", "re:model.visual.*", "lm_head", "re:^mtp.*"],
+        kv_cache_scheme={"num_bits": 8, "type": "float", "symmetric": True, "strategy": "tensor",
+                         "dynamic": False, "observer": "static_minmax"},
+    ),
+]
+oneshot(model=model, processor=proc, recipe=recipe, dataset=ds, max_seq_length=4096, num_calibration_samples=len(ds))
+# depois: copie chat_template.jinja / *preprocessor_config.json e re-adicione model_mtp.safetensors</code></pre>
+  <p>Tempo <b>[estimativa grosseira]</b>: um forward nos ~2,1 M tokens de calibração custa ≈ 1,2e17 FLOP (30–60 min), e AWQ e GPTQ resolvem camada a camada, então o total são <b>várias horas</b>. Teste antes com 128 amostras × 2.048 tokens, ≈ 1/8 do custo. O tamanho esperado é comparável aos <b>24,69 GB</b> do <code>RedHatAI/Qwen3.8-27B-NVFP4</code>.</p>
+  <table class="la-params">
+    <thead><tr><th>Formato</th><th>Ferramenta</th><th>Quando usar</th></tr></thead>
+    <tbody>
+      <tr><td><span class="la-term" data-term="nvfp4">NVFP4</span> W4A4 (MLP) + FP8 (atenção/GDN) + KV FP8</td><td><span class="la-term" data-term="llm-compressor">llm-compressor</span> 0.14.0, sua mistura, 512 × 4096</td><td>produção no vLLM (recomendado)</td></tr>
+      <tr><td>NVFP4 (receita da NVIDIA)</td><td><span class="la-term" data-term="modelopt">ModelOpt</span> do <i>main</i> (o card cita v0.48.0), <code>hf_ptq.py --recipe …/nvfp4_w4a4_mlp_fp8_attn_local_hessian --dataset seu.jsonl,cnn_dailymail --calib_size 512,512 --calib_seq 4096</code></td><td>reproduzir o <code>nvidia/Qwen3.8-27B-NVFP4</code>; antes, <code>git ls-tree -r --name-only HEAD modelopt_recipes/models/Qwen/Qwen3.8-27B/</code> confirma que a receita existe na versão que você fixou</td></tr>
+      <tr><td>W4A16 INT4 (GPTQ + AWQ)</td><td>llm-compressor</td><td>quando NVFP4 não é opção</td></tr>
+      <tr><td><span class="la-term" data-term="exl3">EXL3</span></td><td>exllamav3 v1.5.3, <code>convert.py -b 4.0 -hb 6</code></td><td>o painel de KLD exato; o vLLM upstream <b>não</b> carrega EXL3</td></tr>
+      <tr><td>FP8 dinâmico</td><td>llm-compressor, sem calibração</td><td>linha de base barata: separa “o fine-tune piorou” de “o 4-bit piorou”</td></tr>
+      <tr><td>MLX 4-bit</td><td><code>mlx_lm.dwq</code>, <code>awq</code> ou <code>gptq</code></td><td>trilha A</td></tr>
+    </tbody>
+  </table>
+  <p>Para calibrar a expectativa, o card do <code>nvidia/Qwen3.8-27B-NVFP4</code> (2.048 amostras do Nemotron-Post-Training-Dataset-v3, algoritmo <i>local Hessian</i>) reporta, de BF16 para NVFP4: GPQA Diamond 88,92 → 88,01; Terminal-Bench 75,56 → 74,02; IFBench 80,07 → 78,93; AA-LCR 72,63 → 73,38. Quedas de ~1 ponto, às vezes ganhos dentro do ruído: é o patamar a buscar.</p>
+</section>
+
+<section class="la-sec">
+  <h2>Medir o estrago: duas KLDs que não se confundem</h2>
+  <p>O <a data-ch="medindo-qualidade">capítulo 25</a> mediu quantização com uma pergunta só: “o modelo servido ainda é o mesmo?”. No pós-treino há <b>duas</b> perguntas, cada uma com a sua referência, e trocá-las é o erro mais comum desta fase:</p>
+  <table class="la-params">
+    <thead><tr><th>Pergunta</th><th>P (referência)</th><th>Q (candidato)</th><th>Esperado</th></tr></thead>
+    <tbody>
+      <tr><td>O que o pós-treino mudou?</td><td>base original BF16</td><td>ajustado BF16 (merge ou base + adapter)</td><td>pequeno em texto genérico; grande no domínio, que é o efeito pretendido</td></tr>
+      <tr><td>Quanto a quantização estragou?</td><td><b>ajustado BF16 (merge)</b></td><td>ajustado quantizado</td><td>da ordem do que o mesmo formato causa no base</td></tr>
+      <tr><td>O adapter sobre base quantizado funciona?</td><td>base BF16 + LoRA</td><td>base quantizado + LoRA</td><td>≈ a KLD do base quantizado sozinho</td></tr>
+    </tbody>
+  </table>
+  <div class="la-eq">
+    \[ \mathrm{KL}(P\,\|\,Q) = \frac{1}{|\mathcal T|}\sum_{t\in\mathcal T}\ \sum_{v} p_t(v)\,\big(\log p_t(v) - \log q_t(v)\big)\quad[\text{nats}] \]
+    <ul class="la-eq-legend">
+      <li>\(p_t, q_t\): distribuições do próximo token na posição \(t\), com o mesmo texto forçado nos dois modelos (teacher-forced)</li>
+      <li>\(\mathcal T\): posições avaliadas (texto genérico, do domínio e respostas do próprio modelo)</li>
+      <li>reporte também mediana e p90 por token, a perplexidade de P e de Q e a concordância de top-1</li>
+    </ul>
+  </div>
+  <p>Se você mede a quantização contra o <i>base</i>, a <span class="la-term" data-term="kl-de-deriva">deriva</span> do pós-treino entra na conta, e no domínio ela é enorme por definição. O número sai alto, você culpa o NVFP4, e o problema não era ele.</p>
+  <figure class="la-fig" id="fig-kld" data-title="Duas perguntas, duas referências: deriva e estrago">
+    <div class="la-fig-stage" style="height:450px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>As barras são as distribuições do próximo token numa posição: base (lavanda), ajustado BF16 (menta) e ajustado NVFP4 (âmbar). Os medidores calculam o KL de verdade sobre essas barras. A régua de baixo (escala log) traz as âncoras <b>medidas</b> no GLM-5.3-Flash pelo protocolo da receita (51.175 posições): EXL3 K6 0,013723, EXL3 4 bpw 0,024555, FP8 oficial na mesma stack 0,024629 (empata com o EXL3 4 bpw, por isso os dois dividem um rótulo) e NVFP4 0,060535 nats. As distribuições são <b>ilustrativas</b>.</figcaption>
+  </figure>
+  <p>Troque a referência para o base no texto de domínio. O medidor do estrago salta de 0,013 para 1,04 nats, umas 80 vezes, e passa longe de todas as âncoras da régua: parece que o NVFP4 destruiu o modelo. No texto genérico, a mesma troca quase não muda nada (0,008 → 0,013 nats). É por isso que o erro passa despercebido quando se mede só em texto genérico.</p>
+  <p>Três ferramentas, em ordem de exatidão. <b>(1)</b> O <span class="la-term" data-term="model-diff"><code>eval/model_diff.py</code></span> do exllamav3 compara um EXL3 com o BF16 fundido usando pesos e kernels reais (<code>-r 100 -l 2048</code>). Nele, <b>B é a referência</b>, por isso o BF16 vai em <code>-mb</code>; os dois cabem num Spark (≈ 72 GB). <b>(2)</b> Para NVFP4 e W4A16, um script HF em dois passes grava os top-64 log-probs de P e calcula o KL truncado mais um termo de cauda: uma <span class="la-term" data-term="kl-top-k">cota inferior</span> do KL verdadeiro, que dequantiza os pesos e não usa os kernels W4A4. <b>(3)</b> In situ, com os kernels de produção: dois servidores vLLM e <code>POST /v1/completions</code> com <code>"max_tokens": 1</code> e <span class="la-term" data-term="prompt-logprobs"><code>"prompt_logprobs": 20</code></span>; saem ΔNLL e top-1 exatos e um KL “no topo comum” que é proxy, e deve ser reportado como tal.</p>
+  <p>Falta o chão. Rode P contra P (outro boot, outro <code>max-num-seqs</code>) e trate o valor como o <span class="la-term" data-term="piso-de-ruido">piso de ruído</span>, como a receita <span class="la-rb glm"></span> faz. Repita o protocolo na referência pública (<code>Qwen/Qwen3.8-27B</code> contra os NVFP4 da NVIDIA e do RedHatAI). O critério: KL(final_BF16‖final_NVFP4) da mesma ordem de KL(base_BF16‖NVFP4 de referência), medido pelo mesmo script, e os portões repetidos <b>no quantizado</b>. O RedHatAI publica <i>recovery</i> entre 98,27% e 100,88% para o NVFP4 do base.</p>
+</section>
+
+<section class="la-sec">
+  <h2>Servir: multi-LoRA, fundido, e o rascunhador que ficou para trás</h2>
+  <p>Há três caminhos até o servidor:</p>
+  <div class="la-compare">
+    <div><h4>(A) Adapter em runtime</h4><p>O vLLM carrega o base e um ou mais adapters, e o campo <code>"model"</code> da requisição escolhe o adapter. Zero custo de merge e A/B trivial; custa kernels LoRA por token e memória por slot.</p></div>
+    <div><h4>(B) Merge → BF16</h4><p>Idêntico ao treinado, sem overhead, mas ocupa 55,6 GB e lê tudo isso por passo de decode. É a <b>referência</b> do KLD e o servidor de avaliação.</p></div>
+    <div><h4>(C) Merge → re-quantizar</h4><p>Velocidade e memória de produção, o que o Módulo 1 inteiro otimiza. Exige calibração nova e erro medido contra (B). É o destino natural num GB10.</p></div>
+  </div>
+  <p>Quem decide é o <span class="la-term" data-term="teto-de-banda">teto de banda</span> do decode. Com ~230 GB/s efetivos, um 27B em BF16 dá ≈ 4 passos por segundo por stream; os NVFP4 de referência (21,92 e 24,69 GB) dão <b>≈ 9–10 tok/s</b> sem especulação.</p>
+  <h3>LoRA no vLLM 0.30.0</h3>
+  <table class="la-params">
+    <thead><tr><th>Flag</th><th>Padrão</th><th>O que faz e o cuidado</th></tr></thead>
+    <tbody>
+      <tr><td><code>--enable-lora</code> · <code>--lora-modules</code></td><td><code>False</code> · —</td><td>liga o subsistema; registra adapters como <code>nome=caminho</code> ou JSON com <code>base_model_name</code></td></tr>
+      <tr><td><span class="la-term" data-term="max-loras"><code>--max-loras</code></span></td><td><b>1</b></td><td>quantos adapters <b>distintos</b> podem estar ativos no mesmo batch (slots na GPU)</td></tr>
+      <tr><td><span class="la-term" data-term="max-lora-rank"><code>--max-lora-rank</code></span></td><td><b>16</b></td><td>1, 8, 16, 32, 64, 128, 256, 320 ou 512; dimensiona os buffers. Use o maior posto <b>real</b>, não 256 “por garantia”</td></tr>
+      <tr><td><code>--max-cpu-loras</code></td><td>= <code>max_loras</code></td><td>cache LRU em RAM de CPU, que no GB10 é a mesma memória unificada: cada adapter em cache compete com KV e pesos</td></tr>
+      <tr><td><code>--fully-sharded-loras</code></td><td><code>False</code></td><td>por padrão só metade da computação LoRA é fragmentada no TP</td></tr>
+      <tr><td><code>--enable-mixed-moe-lora-format</code></td><td><code>False</code></td><td>exige declarar <code>is_3d_lora_weight</code> por adapter, sem conferência: declaração errada “silently produce garbage outputs”</td></tr>
+    </tbody>
+  </table>
+  <p>Como um único forward serve um batch em que cada sequência pede um adapter diferente? A parte cara, \(W x\), é igual para todas: o vLLM faz <b>uma</b> GEMM do base para o batch inteiro, como faria sem LoRA. O termo de baixo posto entra por cima, token a token, escolhido por um índice de slot:</p>
+  <div class="la-eq">
+    \[ y_t = W x_t + s\,B_{\sigma(t)}\big(A_{\sigma(t)}\,x_t\big),\qquad \sigma(t)\in\{-1,\ 0,\ \dots,\ \texttt{max\_loras}-1\} \]
+    <ul class="la-eq-legend">
+      <li>\(x_t\): a ativação de entrada do token \(t\) (5120 valores no Qwen3.8-27B); \(W\): o peso do base, o mesmo para o batch inteiro</li>
+      <li>\(\sigma(t)\): o slot do adapter da requisição a que o token pertence; \(-1\) quer dizer “só o base”</li>
+      <li>\(A_k\), \(B_k\): as matrizes do adapter que ocupa o slot \(k\), lidas de buffers pré-alocados; \(s\): a escala \(\alpha/r\) desse adapter</li>
+    </ul>
+  </div>
+  <p>Os buffers são tensores com uma dimensão de slot. Por módulo-alvo, \(A\) mora num <code>[max_loras × r_max × d_in]</code> e \(B\) num <code>[max_loras × d_out × r_max]</code> (os <code>lora_a_stacked</code> e <code>lora_b_stacked</code> do código do vLLM). Quando um adapter ganha um slot, seus pesos são copiados para a fatia \(k\), e as linhas que sobram até \(r_{\max}\) ficam em zero. O resto são dois kernels em lote, herdeiros dos SGMV/BGMV do Punica, os “kernels LoRA por token” do caminho (A). O <b><span class="la-term" data-term="shrink-expand">shrink</span></b> calcula \(v_t = A_{\sigma(t)}x_t\), com \(r_{\max}\) saídas por token, buscando a fatia certa pelo índice. O <b>expand</b> soma \(s\,B_{\sigma(t)}v_t\) a \(y_t\). Os dois pulam os tokens com \(\sigma = -1\), e um batch sem nenhum LoRA usa outro CUDA graph (<code>has_lora</code>) <b>[leitura do código do vLLM; a pesquisa só nomeia os kernels]</b>.</p>
+  <p>Daí o porquê de cada flag. <code>--max-loras</code> é o número de fatias empilhadas: um adapter sem fatia livre não tem de onde o shrink ler os pesos dele, e a requisição espera no scheduler até um slot vagar. <code>--max-lora-rank</code> fixa a largura de todas as fatias: um adapter de r = 8 num buffer de \(r_{\max}\) = 64 ocupa 1/8 da fatia, e o resto são zeros que gastam memória e entram no shrink e no expand do mesmo jeito. No decode, que é limitado por banda, cada slot ativo ainda obriga a ler as fatias inteiras a cada passo <b>[inferência]</b>. A memória dessas fatias é a conta da pesquisa:</p>
+  <div class="la-eq">
+    \[ M_{\text{slots}} = \texttt{max\_loras}\times r_{\max}\sum_{\text{módulos}}(d_{in}+d_{out})\times 2\ \text{B}\qquad\xrightarrow{\ \text{27B},\ 4\ \text{slots},\ r_{\max}=32\ }\ 4\times 217{,}6\,\text{M}\times 2\,\text{B}\approx 1{,}7\ \text{GB} \]
+    <ul class="la-eq-legend">
+      <li>o vLLM pré-aloca, por módulo-alvo, buffers de \(A\) e \(B\) para cada slot, no posto máximo <b>[estimativa da pesquisa]</b></li>
+      <li>no Qwen3.8-27B com LoRA em todas as lineares de texto: 108,8 M parâmetros por slot em r=16, 217,6 M em r=32, 435,2 M em r=64</li>
+      <li>pouco perto de 55,6 GB de pesos, mas não desprezível no orçamento de KV de um GB10</li>
+    </ul>
+  </div>
+  <p>Duas interações com o Módulo 1: o hash de bloco do <a data-ch="prefix-caching">prefix cache</a> inclui o ID do LoRA (o mesmo prompt em dois adapters não compartilha cache, porque K e V diferem), e o despachante de CUDA graphs tem <code>has_lora</code> na chave (batches com e sem LoRA usam grafos diferentes). A carga dinâmica (<code>POST /v1/load_lora_adapter</code>) existe, mas a documentação desaconselha em produção fora de ambientes isolados e confiáveis.</p>
+  <figure class="la-fig" id="fig-servir" data-title="O ônibus multi-LoRA: slots, fila e o caminho fundido">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Modo A: as requisições chegam com o nome do adapter no campo <code>model</code>. O scheduler só embarca uma requisição se o adapter dela já tem slot no batch, ou se ainda há slot livre (<code>--max-loras</code>); as outras esperam. As requisições ao base não precisam de slot. Embaixo, os blocos de prefixo em cache ficam separados por adapter. Modo “por dentro do batch”: uma camada (<code>q_proj</code>, 5120 → 12.288) num passo com 6 tokens. \(Wx\) é uma GEMM só; cada token busca, pelo índice \(\sigma(t)\), a sua fatia de \(A^\top\) <code>[5120 × r_max]</code> (shrink) e de \(B^\top\) <code>[r_max × 12.288]</code> (expand), e a parte hachurada é o preenchimento com zeros até \(r_{\max}\). Modo C: o modelo fundido não tem slots, e o que manda é o teto de banda. Tráfego e batch <b>ilustrativos</b>; memória dos slots pela fórmula acima.</figcaption>
+  </figure>
+  <p>Dois testes na figura. Ponha <code>--max-loras</code> em 1 com 3 adapters no tráfego: o batch só aceita um adapter por vez, e o contador âmbar de requisições esperando slot dispara. Depois vá ao modo “por dentro do batch”, em que os adapters têm r = 16, e troque <code>--max-lora-rank</code> de 32 para 64: a memória dos slots dobra, o shrink e o expand passam a fazer o dobro da conta, e a parte hachurada das fatias vai de metade para três quartos, sem ganho nenhum.</p>
+  <p>Suporte por arquitetura: <code>Qwen3_5ForConditionalGeneration</code> tem LoRA, com o <code>packed_modules_mapping</code> cobrindo as projeções fundidas do GDN (<code>in_proj_qkvz</code>, <code>in_proj_ba</code>). <code>GlmMoeDsaForCausalLM</code> também tem, mas o GLM-5.3-Flash do Módulo 1 roda numa classe de overlay sem suporte verificado: assuma que não há. <code>DeepseekV4ForCausalLM</code> não tem. LoRA sobre bases NVFP4 ou EXL3 no sm_121 não foi verificado.</p>
+  <h3>O servidor de produção</h3>
+  <pre data-lang="bash"><code># produção: NVFP4 fundido, TP=1, um servidor por Spark (2 réplicas atrás de um balanceador simples)
+docker run -d --name tutor --gpus all --network host --ipc host --shm-size 16g --ulimit memlock=-1 \
+  -v /data/work/models:/models vllm/vllm-openai:v0.30.0 \
+  /models/q38-final-nvfp4 --served-model-name tutor-q38 --host 0.0.0.0 --port 8000 \
+  --tensor-parallel-size 1 --max-model-len 65536 --gpu-memory-utilization 0.80 \
+  --kv-cache-dtype fp8_e4m3 --max-num-seqs 16 --enable-prefix-caching \
+  --reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser qwen3_xml --language-model-only \
+  --default-chat-template-kwargs '{"enable_thinking": false}' \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":2}'
+vllm bench serve --model tutor-q38 --dataset-name random --random-input-len 1024 --random-output-len 256 \
+  --num-prompts 64 --request-rate inf      # repita A/B/A como no capítulo 45</code></pre>
+  <p>Cada flag tem uma história no Módulo 1: KV FP8 (capítulo 23), prefix caching (33), parsers de raciocínio e tools (34), e o <code>--default-chat-template-kwargs</code> que garante o mesmo <code>enable_thinking</code> dos dados. A especulação pede atenção. O card do RedHatAI usa MTP com 3 tokens, e existe um DSpark de 7 tokens treinado para o base; os dois foram treinados na distribuição do <b>base</b>, e depois do fine-tune a <span class="la-term" data-term="taxa-de-aceitacao">aceitação</span> tende a cair com a deriva (magnitude não medida pela pesquisa). Por isso o servidor começa com 2. Meça a aceitação por posição com <code>--per-request-spec-decode-metrics</code> e, se cair muito, re-treine o rascunhador nos logs do modelo novo. Foi o que a Xiaomi fez no MiMo-V2.6: com um DFlash de bloco 6 treinado na política SFT e ajustado em rollouts do começo do RL, o comprimento aceito médio ficou <b>31,3% maior</b> que o do MTP-3 herdado do SFT.</p>
+  <p>Expectativa <b>[não verificado]</b>: num fórum da NVIDIA (vLLM 0.27.1, 16 requisições concorrentes), o Qwen3.8-27B NVFP4 fez 87,91–134,41 tok/s de saída agregada, contra 65,58–104,44 em FP8. Com 1 stream e MTP aceitando bem, estime ~1,5–2× o teto de 9–10 tok/s. TP=2 entre os Sparks só se a latência de um usuário importar mais que a vazão: o 27B NVFP4 cabe folgado num nó, e TP=2 pagaria all-reduces por camada no RoCE.</p>
+  <h3>Nas receitas, e a abliteração vista de cá</h3>
+  <div class="la-inrecipe" data-recipe="glm"><div class="la-inrecipe-h"><span class="la-rb glm"></span><span class="k">Ideia</span><code>ABLIT_METHOD=transplant</code></div><div class="la-inrecipe-b"><p>O transplante do GLM <b>é um merge parcial servido na carga</b>: troca byte a byte os <code>o_proj</code> das camadas 15–45 pelos de um checkpoint doador (~2,7 GB, 2.560 MiB) e acerta 32 de 32 casos de teste, contra 9 de 32 da projeção de posto 1. Funciona porque o <code>o_proj</code> é BF16 nativo no doador NVFP4 e no EXL3 servido; se o seu fine-tune mexer em matrizes quantizadas, é preciso re-quantizar. O protocolo de KLD da receita (5 execuções, 25 janelas, piso stock-vs-stock) é o modelo da seção anterior, e a lógica do canário de boot, que reprova o DFlash aceitando ~0, serve de detector barato de modelo quebrado depois do merge <b>[inferência]</b>.</p></div></div>
+  <div class="la-inrecipe" data-recipe="qwen"><div class="la-inrecipe-h"><span class="la-rb qwen"></span><span class="k">Família</span><code>model_type: qwen3_5</code></div><div class="la-inrecipe-b"><p>O laboratório foi desenhado em torno da família do Qwen3.8-Flash-Next: mesmo híbrido GDN e atenção, mesma MTP que o transformers descarta, mesmo template, mesma imagem <code>vllm/vllm-openai:v0.30.0</code>. Quem fez a trilha B fez, em escala menor, cada passo que um fine-tune do Flash-Next exigiria, incluindo o <code>-ngb</code> do exllamav3 para a PLE.</p></div></div>
+  <div class="la-inrecipe" data-recipe="ds"><div class="la-inrecipe-h"><span class="la-rb ds"></span><span class="k">Papel</span><code>deepseek-v4-flash-vision-exp</code> como juiz</div><div class="la-inrecipe-b"><p>No laboratório, o DeepSeek é o único juiz isento. E, sem LoRA para <code>DeepseekV4ForCausalLM</code> no vLLM, qualquer fine-tune dele só chega ao servidor pelo caminho (C): merge e re-quantização.</p></div></div>
+  <p>Vista do Módulo 2, a <a data-ch="abliteracao">abliteração</a> é a vizinha sem gradiente do pós-treino: uma edição fechada de <b>posto 1</b> (\(W' = W - \alpha\,\hat r\,(\hat r^\top W)\)), estimada com centenas de prompts em minutos, contra uma atualização de posto \(r\) aprendida em horas. A figura do merge a mostra como um “LoRA de posto 1 que ninguém treinou”. Três consequências. <b>A ordem importa</b>: abliterar e depois fazer SFT pode reintroduzir recusas, e até SFT benigno corrói recusas: Qi et al. furaram as salvaguardas do GPT-3.5 Turbo com 10 exemplos adversariais por menos de US$ 0,20 e mostraram que dados benignos também degradam a segurança, em menor grau; abliterar <i>depois</i> exige re-estimar a direção. <b>A direção vira sonda</b>: projetar as ativações na <span class="la-term" data-term="direcao-de-recusa">direção de recusa</span> estimada no base, antes e depois do fine-tune, antecipa uma regressão de segurança. E <b>abliteração não substitui avaliação</b>: a receita GLM registra “KLD não medido com ablit”, e remover recusas sem governança é decisão de política, não de engenharia.</p>
+  <h3>O checklist que fecha o ciclo</h3>
+  <ol class="la-steps">
+    <li><b>Antes de treinar:</b> NCCL em <code>NET/IB</code>; torch travado; caminho rápido do GDN medido; <code>dtype</code> BF16 em <b>todos</b> os configs; ~217,6 M parâmetros treináveis em r=32; o mesmo <code>chat_template_kwargs</code> em dados, avaliação e servidor; linha de base gravada; dados descontaminados e separados por termo; disco ≥ 4 × 56 GB.</li>
+    <li><b>Durante:</b> <code>eval_loss</code> caindo; no DPO, <code>rewards/accuracies</code> abaixo de ~0,95 e <code>logps/chosen</code> estável; no GRPO, <code>frac_reward_zero_std</code> abaixo de ~0,5, entropia sem colapso e amostras lidas; checkpoints a cada 100–200 passos.</li>
+    <li><b>Depois:</b> portões com IC e decisão registrada <b>antes</b> de quantizar; merge verificado e MTP re-adicionada; calibração com domínio + genérico; KLD contra o merge comparável à do NVFP4 de referência; portões repetidos no quantizado; aceitação de MTP medida; <code>vllm bench serve</code> A/B/A; versões e hashes registrados; e um plano de rollback.</li>
+  </ol>
+  <p>Com isso o Módulo 2 fecha o círculo que o Módulo 1 abriu. A <a data-ch="receita-do-zero">receita do zero</a> começava de um checkpoint que alguém tinha pós-treinado (o MOPD do MiMo era, ele mesmo, uma etapa de pós-treino). Agora você sabe produzir esse checkpoint, medir o que mudou, medir o que a quantização tirou e servi-lo com a engenharia dos capítulos anteriores. Fecha-se aqui o Módulo 2: o ciclo servir → pós-treinar → re-quantizar → servir está completo. O que fica abaixo da pilha, o pré-treino e os dados do modelo base que todo este módulo assumiu prontos, é o próximo território a explorar.</p>
+</section>

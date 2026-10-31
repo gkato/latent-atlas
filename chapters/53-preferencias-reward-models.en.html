@@ -1,0 +1,408 @@
+<p class="la-lead">After <a data-ch="sft">SFT</a>, the model knows how to imitate demonstrations. But for a lot of things, it is easier to <i>recognize</i> a better answer than to <i>write</i> it. Almost nobody drafts the perfect summary of a paper, yet any attentive reader can point out which of two summaries is more faithful. Preference-based post-training exploits this asymmetry in two stages. First, people (or other models) compare responses. Then a <span class="la-term" data-term="modelo-de-recompensa">reward model</span> (RM) learns to turn those comparisons into a number \(r(x,y)\) that an optimizer can push up. This chapter builds that number from scratch: why compare instead of score, how to collect preferences and measure annotator agreement, where the Bradley–Terry model comes from, what the RM loss is and how its gradient behaves, what the architecture looks like inside, how to calibrate, and what happens when the reward starts lying (length bias, <i>reward hacking</i>, and over-optimization). At the end come process rewards, AI judges, and RLAIF. This is the raw material for everything that follows: PPO, GRPO, and DPO.</p>
+
+<section class="la-sec">
+  <h2>Why compare instead of score</h2>
+  <p>Training with preferences requires a function \(r(x,y)\): it takes a prompt \(x\) and a response \(y\) and returns a scalar that says how good the response is. Nobody writes this function by hand. It is learned from human judgments, and the first design decision is <b>what kind of judgment to ask for</b>. The answer from the literature, ever since the first RLHF, has been the same: ask for <b>comparisons</b>.</p>
+  <ul>
+    <li><b>Christiano et al. 2017</b>, the work that kicked off RL from human preferences, showed the annotator two 1–2 s clips of an agent and asked which one was better. The rationale is explicit: the authors found it much easier to get consistent <i>comparisons</i> than consistent <i>absolute scores</i>. In continuous control, predicting comparisons worked much better than predicting scores. Each query took 3–5 s, and humans gave feedback on less than 1% of the agent's interactions.</li>
+    <li><b>Ziegler et al. 2019</b>, the first RLHF on a language model (GPT-2), reports that annotators struggled to make fine, consistent quantitative distinctions when asked for an absolute number. <b>Stiennon et al. 2020</b> (summarization) sticks with comparisons.</li>
+    <li><b>The counterpoint:</b> <span class="la-term" data-term="helpsteer">HelpSteer</span> (Wang et al. 2023) rated each response <i>independently</i>, on a 0–4 <span class="la-term" data-term="escala-likert">Likert</span> scale, because the number of comparisons grows quadratically with the number of responses per prompt. Absolute scores scale better.</li>
+  </ul>
+  <p>The intuition (our interpretation, supported by these reports): every annotator carries a <b>personal ruler</b>. One is generous and gives a 6 to almost everything, another is strict and rarely goes above 4, and a third uses only the middle of the scale. An absolute score mixes the quality of the response with the ruler of whoever rated it. A comparison cancels the ruler: if the generous one gives 6 and 5 and the strict one gives 4 and 3, both agree that A is better. The figure simulates exactly that.</p>
+  <figure class="la-fig" id="fig-regua" data-title="Personal ruler vs. comparison">
+    <div class="la-fig-stage" style="height:430px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Five annotators rate pairs of responses \(A\) (mint) and \(B\) (pink). Each one has a personal ruler, with its own offset and scale, plus a bit of noise. In “score” mode, they mark a 1–7 Likert score on their own ruler; in “comparison” mode, each annotator's balance tips toward the preferred response. The bars at the bottom accumulate the agreement across the 10 pairs of annotators: “same score” and “same direction”. <b>Illustrative</b> simulation: widen the gap between the rulers and see which of the two agreements collapses.</figcaption>
+  </figure>
+  <p>Look at the numbers, keeping in mind that the two bars do not start from the same baseline. With identical rulers, score agreement is already lower (~65%: hitting the same number out of 7 is harder than hitting the direction) and direction agreement sits near 85%. As the rulers drift apart, score agreement plummets (~16% at 1.0) and direction agreement barely moves (~82%). Comparison is not “more precise”. It throws away the absolute level, which is exactly the part annotators do not share, and keeps the difference, which is the part they do share. The price is losing <b>magnitude</b>: a pair where A is “a little better” becomes the same bit as a pair where A is “much better”. That is why modern datasets combine both. HelpSteer2 has per-attribute Likert scores and HelpSteer2-Preference adds preferences with strength; UltraFeedback gives 1–5 scores that are later converted into pairs.</p>
+  <h3>Annotation formats</h3>
+  <p>Each format carries a different amount of information and calls for a different statistical model. The table summarizes the ones seen in practice; the models in the last column are the subject of the next sections.</p>
+  <table>
+    <thead><tr><th>Format</th><th>Real example</th><th>Information per annotation</th><th>Natural model / loss</th></tr></thead>
+    <tbody>
+      <tr><td>Binary pair \((x, y_w, y_l)\)</td><td>Stiennon 2020 (TL;DR); HH-RLHF</td><td>1 bit of direction</td><td>Bradley–Terry, \(-\log\sigma(\Delta)\)</td></tr>
+      <tr><td>Pair with tie or “incomparable”</td><td>Christiano 2017: a tie becomes a ½–½ label; incomparable is discarded</td><td>direction or “equal”</td><td>BT with <span class="la-term" data-term="rotulo-suave">soft label</span></td></tr>
+      <tr><td>Pair with strength</td><td>Llama 2: 4 levels (from <i>significantly better</i> to <i>negligibly better/unsure</i>); HelpSteer2-Preference and HelpSteer3: −3…+3</td><td>direction + magnitude</td><td>BT with margin or scaled BT</td></tr>
+      <tr><td>Ranking of \(K\) responses</td><td>InstructGPT: \(K=4\) to \(9\) per prompt</td><td>total order</td><td>\(\binom{K}{2}\) pairs, or Plackett–Luce</td></tr>
+      <tr><td>Best of \(K\)</td><td>Ziegler 2019: pick the best of 4</td><td>index of the winner</td><td>top-1 softmax</td></tr>
+      <tr><td>Multi-attribute Likert</td><td>HelpSteer: <i>helpfulness, correctness, coherence, complexity, verbosity</i> on 0–4</td><td>one score per attribute</td><td>regression (MSE)</td></tr>
+      <tr><td>Per-aspect scores from an AI</td><td>UltraFeedback: GPT-4 gives 1–5 on 4 aspects, with a rationale and a critique</td><td>4 scores + text</td><td>binarize into pairs → BT</td></tr>
+      <tr><td>Good/bad, no pair</td><td>(KTO chapter)</td><td>1 absolute bit</td><td>KTO and friends</td></tr>
+      <tr><td>Per-step label</td><td>PRM800K: each step of a math solution</td><td>1 label per step</td><td>PRM (section 8)</td></tr>
+    </tbody>
+  </table>
+  <div class="la-callout analogy"><b class="t">Analogy: the blind tasting</b><p>Ask ten people to rate a wine from 0 to 10 and you will get ten scattered numbers, because each person has their own “7”. Serve two wines side by side and ask which is better: each person compares within their own ruler, and the answers tend to converge much more. It is the same bet RLHF makes.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Collecting preferences: prompts, policies, and annotators</h2>
+  <p>A preference pair has three ingredients: a prompt, two (or more) responses, and a judgment. Each one hides decisions that change the final RM.</p>
+  <ul>
+    <li><b>Prompts.</b> InstructGPT used real API prompts (filtered for personal data, deduplicated, at most 200 per user, with the train and validation splits made by user) plus prompts written by the labelers themselves to bootstrap the process. In the API, 45.6% were generation, 12.4% open QA, and 11.2% brainstorming. Anthropic's HH-RLHF used open-ended dialogues with the model; in the <i>harmlessness</i> set, the annotator picked the <b>more harmful</b> response (red teaming), a choice the authors themselves consider probably not ideal for teaching good behavior.</li>
+    <li><b>Responses.</b> To cover the space well, responses come from varied sources. Llama 2 sampled both from different model variants, at different temperatures. UltraFeedback drew 4 from a pool of 17 models and also injected different “principles” into the prompt. HelpSteer2 generated only 2 per prompt, to reduce the annotator's cognitive load.</li>
+    <li><b>Which policy the samples come from.</b> In InstructGPT, most pairs came from the supervised policies, with a share coming from the PPO policies. Anthropic collected in three waves, the last of them <span class="la-term" data-term="coleta-on-policy">online</span>: RMs and RLHF policies were updated on a roughly weekly cadence. Llama 2 says that accumulating new RM data in parallel with model improvements is crucial to keep the RM <i>on-distribution</i>. The reason is simple: after RL, the policy produces text the RM has never seen, and the RM is only reliable where it was trained (section 7).</li>
+    <li><b>Which pairs to ask about.</b> Christiano 2017 sampled many pairs and sent humans the ones on which the members of an RM ensemble disagreed most. On some tasks this made results worse. Lightman 2023 actively sought out “convincing but wrong” solutions and gained 2.6× data efficiency in its process RM.</li>
+  </ul>
+  <h3>Guidelines and annotator management</h3>
+  <p>Agreement numbers depend as much on the people as on the wording of the guideline. InstructGPT hired ~40 labelers, selected through a screening test with a “soft” cutoff of 75% agreement with the researchers. The criteria were <i>helpful, truthful, harmless</i>, but with an important asymmetry: during training, helpfulness was prioritized; in the final evaluation, truthfulness and harmlessness. Llama 2 wrote <b>separate</b> guidelines for helpfulness and safety, because the two criteria contradict each other. In HH-RLHF, ~20 workers produced ~80% of the data. In HelpSteer2, each response had at least 3 annotators (average of 3.41; two more were brought in when helpfulness scores diverged by more than 2), and about 50% of the annotations were discarded in quality control.</p>
+  <h3>Inter-annotator agreement: the RM's ceiling</h3>
+  <p>If two humans disagree on 1 in every 4 pairs, no RM trained on those labels will get 100% on a human validation set. <span class="la-term" data-term="concordancia-entre-anotadores">Inter-annotator agreement</span> is, in practice, the ceiling on RM accuracy:</p>
+  <table>
+    <thead><tr><th>Source</th><th>Measure</th><th>Value</th></tr></thead>
+    <tbody>
+      <tr><td>InstructGPT</td><td>between training labelers / between held-out labelers</td><td>72.6 ± 1.5% / 77.3 ± 1.3%</td></tr>
+      <tr><td>Stiennon 2020</td><td>labeler–researcher / researcher–researcher</td><td>77 ± 2% / 73 ± 4%</td></tr>
+      <tr><td>Stiennon 2020</td><td>between labelers on CNN/DM (the 6.7B RM reaches 66.5%)</td><td>66.9%</td></tr>
+      <tr><td>HH-RLHF</td><td>Anthropic researchers vs crowdworkers</td><td>≈63%</td></tr>
+      <tr><td>HelpSteer2</td><td>quadratic weighted Cohen's κ (helpfulness)</td><td>0.465 → 0.791 after post-processing</td></tr>
+      <tr><td>MT-bench (Zheng 2023)</td><td>human–human vs GPT-4–human, no ties</td><td>81% vs 85%</td></tr>
+      <tr><td>RewardBench</td><td>accuracy ceiling on the HH and Summarize validation sets</td><td>“between 60 and 70%”</td></tr>
+    </tbody>
+  </table>
+  <p>Percent agreement is misleading, because part of it happens by chance. If both annotators choose “A better” 90% of the time, they will agree on ~82% of the items even when picking at random. <span class="la-term" data-term="kappa-de-cohen">Cohen's κ</span> discounts that chance:</p>
+  <div class="la-eq">
+    \[ \kappa = \frac{p_o - p_e}{1 - p_e}, \qquad p_e = \sum_k p^{(A)}_k\, p^{(B)}_k \]
+    <ul class="la-eq-legend">
+      <li>\(p_o\): observed agreement (fraction of items with the same label)</li>
+      <li>\(p_e\): agreement expected by chance, given each annotator's marginals</li>
+      <li>\(p^{(A)}_k\): fraction of the items that annotator A labeled as class \(k\)</li>
+      <li>\(\kappa = 1\): perfect agreement; \(\kappa = 0\): nothing beyond chance</li>
+    </ul>
+  </div>
+  <p>For ordinal scales (Likert, −3…+3), disagreeing between 0 and 4 is much worse than disagreeing between 0 and 1. The <span class="la-term" data-term="kappa-ponderado">quadratic weighted κ</span> takes that into account:</p>
+  <div class="la-eq">
+    \[ \kappa_w = 1 - \frac{\sum_{i,j} w_{ij}\, O_{ij}}{\sum_{i,j} w_{ij}\, E_{ij}}, \qquad w_{ij} = \frac{(i-j)^2}{(k-1)^2} \]
+    <ul class="la-eq-legend">
+      <li>\(O_{ij}\): proportion of items labeled \(i\) by annotator A and \(j\) by B</li>
+      <li>\(E_{ij}\): what would be expected by chance (product of the marginals)</li>
+      <li>\(w_{ij}\): disagreement weight; 0 on the diagonal, 1 in the opposite corner</li>
+      <li>\(k\): number of levels in the scale</li>
+    </ul>
+  </div>
+  <p>That is why HelpSteer2 chose the quadratic κ. With ~1,000 annotators, the same two rarely share samples, which rules out Fleiss' κ and Krippendorff's α. Play with the math in the figure: the binary example has 75% raw agreement, but a κ of only 0.50.</p>
+  <figure class="la-fig" id="fig-kappa" data-title="Cohen's kappa: how much of the agreement is chance">
+    <div class="la-fig-stage" style="height:420px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>On the left (top on mobile), the observed count matrix (rows: annotator A; columns: annotator B), with the 100 items dropping into the cells. On the right (bottom on mobile), what chance would produce with the same marginals (\(E_{ij}\)). Below, \(p_o\), \(p_e\), and κ. In “explore” mode, unbalance the marginals and watch κ drop even with a high \(p_o\). In ordinal mode, turn on quadratic weighting: “neighboring” disagreements weigh little (κ = 0.6949 → 0.8064). <b>Illustrative</b> counts.</figcaption>
+  </figure>
+  <p>Human noise can also be built into the model. Christiano 2017 assumed that 10% of the time the human answers at random. The predicted probability becomes \(\hat P = 0.9\,\sigma(\Delta) + 0.05\), which stays between 5% and 95%: a wrong label costs at most \(-\ln 0.05 \approx 3.0\), and its gradient vanishes when the RM is confident in the opposite direction (the model attributes the error to chance).</p>
+  <div class="la-callout why"><b class="t">Why this matters</b><p>An RM with 65–70% accuracy on HH or TL;DR <b>is not</b> necessarily bad: humans themselves agree only ~63–77% of the time. Stiennon's 6.7B RM reaches 66.5% on CNN/DM, almost equal to the 66.9% between labelers. The quality test for an RM is not “did it get 95%?”, but “did it get close to human agreement, and does it generalize to where the policy is going?”.</p></div>
+  <h3>Preference datasets</h3>
+  <p>The numbers below come from the papers and the dataset cards. The same collection sometimes appears with different counts in different sources, because of filtering and splits; that is why each number cites its source.</p>
+  <table>
+    <thead><tr><th>Dataset</th><th>Who annotated</th><th>Size</th><th>Format</th></tr></thead>
+    <tbody>
+      <tr><td><span class="la-term" data-term="hh-rlhf">Anthropic HH-RLHF</span></td><td>crowdworkers (helpfulness and red teaming)</td><td>169,352 rows (≈161k train, 8.55k test) according to the card</td><td><code>chosen</code>/<code>rejected</code>, full dialogues; MIT license</td></tr>
+      <tr><td>OpenAI <code>summarize_from_feedback</code></td><td>contracted labelers</td><td>Stiennon: 64,832 comparisons on TL;DR; the “N+ details” reproduction trains on 92,858 pairs</td><td>pair + confidence 1–9</td></tr>
+      <tr><td><span class="la-term" data-term="ultrafeedback">UltraFeedback</span></td><td><b>AI</b> (GPT-4): 1–5 scores on 4 aspects + critique</td><td>63,967 instructions × 4 responses; 340,025 pairs; binarized version with 61,135 train pairs and 2,000 test pairs</td><td>scores → pairs (<i>chosen</i> = highest score, <i>rejected</i> = one of the other 3 at random)</td></tr>
+      <tr><td>HelpSteer / HelpSteer2</td><td>~200 annotators / ≥3 per response</td><td>37,120 samples / 21,362 (10,681 prompts × 2)</td><td>Likert 0–4 on 5 attributes; CC-BY-4.0</td></tr>
+      <tr><td>HelpSteer3</td><td>3–5 annotators, the 3 most in agreement are released</td><td>40,476 preferences (General, STEM, Code, Multilingual)</td><td>−3…+3; CC-BY-4.0</td></tr>
+      <tr><td>Stanford SHP</td><td>Reddit votes</td><td>≈386k rows, 18 subreddits</td><td>pair</td></tr>
+      <tr><td>PRM800K</td><td>humans, step by step</td><td>800K step labels on 75K solutions to 12K MATH problems</td><td>positive/negative/neutral per step</td></tr>
+      <tr><td>Chatbot Arena / MT-bench</td><td>users and experts</td><td>3K expert votes + 30K conversations</td><td>A/B/tie</td></tr>
+      <tr><td>Skywork SynPref-40M</td><td>human + AI pipeline</td><td>40M pairs (26M curated), the basis of the Skywork-Reward-V2 models from 0.6B to 8B</td><td>pair</td></tr>
+    </tbody>
+  </table>
+  <p>All of them carry biases. The most famous is <b>length</b>: the data contain the correlation “longer = better”, and the RM learns it (section 7). When the labeler is an AI, <b>position bias</b> (preferring the first or the second response) and <b>self-preference</b> come in as well. And there is the bias of <i>who</i> labels: the hired “average labeler” is not the real user, and the InstructGPT paper explicitly discusses whom the model is being aligned to.</p>
+</section>
+
+<section class="la-sec">
+  <h2>Bradley–Terry: from comparisons to a scale</h2>
+  <p>We have pairs “\(y_w\) beat \(y_l\)”. We want one number \(r(x,y)\) per response. The bridge is a probabilistic model that says what \(P(y_w \succ y_l)\) should be given \(r\). The classic construction assumes each response has a noisy <b>latent utility</b>, and the human picks the one with the highest utility at that moment:</p>
+  <div class="la-eq">
+    \[ u(x,y) = r(x,y) + \epsilon_y, \qquad y_1 \succ y_2 \iff u_1 > u_2 \iff \epsilon_2 - \epsilon_1 < r_1 - r_2 \]
+    <ul class="la-eq-legend">
+      <li>\(r(x,y)\): the “true quality” the RM wants to learn</li>
+      <li>\(\epsilon_y\): i.i.d. judgment noise (mood, attention, interpretation)</li>
+      <li>\(y_1 \succ y_2\): “\(y_1\) is preferred to \(y_2\)”</li>
+    </ul>
+  </div>
+  <p>Everything hinges on the noise distribution. If \(\epsilon\) follows a <span class="la-term" data-term="distribuicao-gumbel">Gumbel</span>(0,1), the difference of two independent Gumbels is a <b>logistic</b>, whose cumulative distribution function is the <span class="la-term" data-term="sigmoide">sigmoid</span> (the three-line derivation is in the box just below). Result:</p>
+  <div class="la-eq">
+    \[ P(y_1 \succ y_2 \mid x) = \sigma\big(r(x,y_1) - r(x,y_2)\big) = \frac{e^{r_1}}{e^{r_1} + e^{r_2}} \]
+    <ul class="la-eq-legend">
+      <li>\(\sigma(z) = 1/(1+e^{-z})\): logistic sigmoid</li>
+      <li>\(e^{r_i}\): the “strength” \(p_i\) of response \(i\), as in Bradley & Terry (1952): \(P(i\succ j) = p_i/(p_i+p_j)\)</li>
+      <li>\(\Delta = r_1 - r_2\): the <b>log-odds</b> of the preference</li>
+    </ul>
+  </div>
+  <div class="la-callout math"><b class="t">Why two Gumbels give a sigmoid</b><p>For Gumbel(0,1), the CDF is \(F(\epsilon)=e^{-e^{-\epsilon}}\) and the density is \(f(\epsilon)=e^{-\epsilon}F(\epsilon)\). With \(\Delta = r_1 - r_2\), response \(y_1\) wins when \(\epsilon_2 &lt; \epsilon_1 + \Delta\). Fix \(\epsilon_1 = \epsilon\), use \(F\) for the chance that \(\epsilon_2\) lands below, and integrate over \(\epsilon\):
+  \[ P(y_1\succ y_2)=\int_{-\infty}^{\infty} f(\epsilon)\,F(\epsilon+\Delta)\,d\epsilon \]
+  \[ =\int_{-\infty}^{\infty} e^{-\epsilon}\,e^{-e^{-\epsilon}(1+e^{-\Delta})}\,d\epsilon \]
+  The second step merges the two exponents, because \(F(\epsilon+\Delta)=e^{-e^{-\epsilon}e^{-\Delta}}\). Substitute \(u=e^{-\epsilon}\), with \(du=-e^{-\epsilon}d\epsilon\) (as \(\epsilon\) goes from \(-\infty\) to \(\infty\), \(u\) goes from \(\infty\) to 0):
+  \[ =\int_0^\infty e^{-u(1+e^{-\Delta})}\,du=\frac{1}{1+e^{-\Delta}}=\sigma(\Delta) \]
+  It is the sigmoid, exactly (calculation).</p></div>
+  <p>This is the <span class="la-term" data-term="bradley-terry">Bradley–Terry model</span> (BT). If the noise is normal, you get the <span class="la-term" data-term="modelo-thurstone">Thurstone model</span> (1927), with \(P = \Phi\Big(\dfrac{r_1-r_2}{\sqrt2\,s}\Big)\), where \(\Phi\) is the normal CDF and \(s\) is the standard deviation of the noise. The two curves are nearly identical when the noises have the same variance. The logistic wins in practice because its gradient is simple and it matches the <span class="la-term" data-term="softmax">softmax</span> that LLMs already use. Christiano 2017 notes that it is the same Luce–Shepard choice rule and that it is “analogous to Elo in chess”.</p>
+  <figure class="la-fig" id="fig-gumbel" data-title="Duels with Gumbel noise become a sigmoid">
+    <div class="la-fig-stage" style="height:420px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>In each duel, responses \(A\) and \(B\) receive a random noise draw, and the one with the higher utility \(r+\epsilon\) wins. On the right (bottom on mobile), the histogram of \(\epsilon_B - \epsilon_A\): \(A\) wins whenever it falls to the left of \(\Delta = r_A - r_B\) (shaded area). The fraction of wins converges to \(\sigma(\Delta)\) with Gumbel, or to \(\Phi\big(\Delta/(\sqrt2\,s)\big)\) with normal noise of the same variance. The “Elo” readout converts \(\Delta\) to the chess scale.</figcaption>
+  </figure>
+  <p><span class="la-term" data-term="elo">Elo</span> is the same BT written in another base: \(P(A\succ B) = 1/\big(1+10^{-(R_A-R_B)/400}\big)\). Setting it equal to \(\sigma(\Delta r)\):</p>
+  <div class="la-eq">
+    \[ \Delta r = \frac{\ln 10}{400}\,\Delta R_{\text{Elo}} \approx 0.005756\,\Delta R_{\text{Elo}} \]
+    <ul class="la-eq-legend">
+      <li>\(\Delta R_{\text{Elo}}\): Elo rating difference; \(\Delta r\): BT reward difference</li>
+      <li>+100 Elo ⇔ \(\Delta r = 0.5756\) ⇔ 64.01% win rate; +400 Elo ⇔ \(\Delta r = 2.3026\) ⇔ 90.91%</li>
+    </ul>
+  </div>
+  <p>That is why Chatbot Arena and Anthropic report models in Elo. The LMArena leaderboard, by the way, does not use online Elo (which depends on the order of the battles): it fits a Bradley–Terry model by maximum likelihood over all battles and only then reports the result on an Elo-like scale.</p>
+  <h3>Rankings of K responses: Plackett–Luce and the InstructGPT pairs</h3>
+  <p>InstructGPT did not ask for pairs: it asked the labeler to <b>rank</b> \(K=4\) to \(9\) responses. The natural model for a ranking \(\tau\) is <span class="la-term" data-term="plackett-luce">Plackett–Luce</span> (PL): 1st place is chosen by a softmax over all of them, 2nd place by a softmax over those remaining, and so on. The softmax also falls out of noisy utilities: the same calculation as in the box above, with \(K\) Gumbels, shows that the chance of \(y_i\) having the highest utility is \(e^{r_i}/\sum_j e^{r_j}\), a softmax; sorting all of them by utility gives exactly Plackett–Luce.</p>
+  <div class="la-eq">
+    \[ P(\tau \mid x) = \prod_{i=1}^{K} \frac{\exp\big(r(x, y_{\tau(i)})\big)}{\sum_{j=i}^{K} \exp\big(r(x, y_{\tau(j)})\big)} \]
+    <ul class="la-eq-legend">
+      <li>\(\tau(i)\): index of the response placed at position \(i\)</li>
+      <li>the denominator sums only over the responses not yet chosen</li>
+      <li>with \(K=2\), PL becomes Bradley–Terry; the 1st factor alone is Ziegler 2019's “best of \(K\)” model</li>
+    </ul>
+  </div>
+  <p>InstructGPT, however, did <b>not</b> use PL. It decomposed each ranking into all \(\binom{K}{2}\) pairs and applied BT to each one:</p>
+  <div class="la-eq">
+    \[ \mathcal L(\theta) = -\frac{1}{\binom{K}{2}}\,\mathbb E_{(x,y_w,y_l)\sim D}\Big[\log\sigma\big(r_\theta(x,y_w) - r_\theta(x,y_l)\big)\Big] \]
+    <ul class="la-eq-legend">
+      <li>\(\binom{K}{2}\): number of pairs in a ranking of \(K\); from 6 (\(K=4\)) to 36 (\(K=9\))</li>
+      <li>\(r_\theta\): the RM; \(y_w\) is the higher-ranked response of the pair</li>
+    </ul>
+  </div>
+  <p>The decisive engineering detail is that <b>all pairs from a prompt go into the same batch element</b>. Pairs from the same prompt are highly correlated. Shuffled into an ordinary dataset, each response would take part in \(K-1\) separate updates, and the RM overfit in a single pass. Grouped, it takes only \(K\) RM forwards per prompt (each response goes through once) instead of \(2\binom{K}{2}\), and validation accuracy and log loss got “much better”. A batch of 64 prompts carries up to \(64\times36 = 2{,}304\) comparisons. Ties were discarded.</p>
+  <figure class="la-fig" id="fig-ranking" data-title="A ranking of K responses: pairs vs. Plackett–Luce">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>A \(K\times K\) matrix: cell \((i,j)\) above the diagonal shows \(\sigma(r_i - r_j)\) for the pair “\(i\) beats \(j\)”. In “pairs” mode, each pair's loss lights up in sequence and the average is the InstructGPT loss. In Plackett–Luce mode, the urn draws the responses one by one, by softmax over those that remain. <b>Illustrative</b> scores; with \(K=4\) (\(r = 2.0,\ 1.0,\ 0.5,\ -0.5\)), the average over the 6 pairs is 0.2637 and PL gives \(P = 0.2388\) (NLL 1.4321).</figcaption>
+  </figure>
+  <p>The two numbers differ because they measure different things. The pair average is a <i>composite likelihood</i> (interpretation): it treats the pairs as if they were independent, which they are not, but it is consistent under BT and much simpler. PL is the joint likelihood of the whole ordering. Both are minimized by pushing the scores into the right order, and both use only \(K\) forwards.</p>
+</section>
+
+<section class="la-sec">
+  <h2>The RM loss and its gradient</h2>
+  <p>With BT in hand, training the RM is <b>maximum likelihood</b>: choose the parameters \(\phi\) that make the observed judgments as likely as possible. The negative log-likelihood of a dataset of pairs is the canonical loss of every modern RM:</p>
+  <div class="la-eq">
+    \[ \mathcal L_{\text{RM}}(\phi) = -\,\mathbb E_{(x, y_w, y_l)\sim\mathcal D}\Big[\log \sigma\big(r_\phi(x,y_w) - r_\phi(x,y_l)\big)\Big] \]
+    <ul class="la-eq-legend">
+      <li>\(r_\phi\): the RM with parameters \(\phi\)</li>
+      <li>\(y_w\), \(y_l\): preferred (<i>chosen</i>) and dispreferred (<i>rejected</i>) response</li>
+      <li>\(\mathcal D\): the dataset of pairs; \(\sigma\): sigmoid</li>
+    </ul>
+  </div>
+  <p>Look again: it is the binary <span class="la-term" data-term="entropia-cruzada">cross-entropy</span> from <a data-ch="aprender-com-dados">chapter 1</a>, with label 1 (“\(y_w\) wins”) applied to the <span class="la-term" data-term="logits">logit</span> \(\Delta = r_w - r_l\). The RM is a binary classifier whose logit is a <i>difference</i> of two outputs of the same network. The gradient explains almost all of the training behavior:</p>
+  <div class="la-eq">
+    \[ \frac{\partial \mathcal L}{\partial \Delta} = -\big(1 - \sigma(\Delta)\big) = -\sigma(-\Delta), \qquad \nabla_\phi\mathcal L = -\sigma(-\Delta)\,\big(\nabla_\phi r_w - \nabla_\phi r_l\big) \]
+    <ul class="la-eq-legend">
+      <li>\(\sigma(-\Delta)\): the probability the RM itself assigns to <b>being wrong</b> on this pair</li>
+      <li>\(\nabla_\phi r_w\): direction that increases the reward of the preferred response (the gradient <i>raises</i> it)</li>
+      <li>\(-\nabla_\phi r_l\): direction that decreases the reward of the rejected one (the gradient <i>lowers</i> it)</li>
+    </ul>
+  </div>
+  <p>Each pair pulls \(r_w\) up and \(r_l\) down with strength \(\sigma(-\Delta)\). An already well-separated pair (\(\Delta = 3\), \(P = 0.9526\)) contributes a weight of 0.0474. An inverted pair (\(\Delta = -0.8\)) contributes 0.69. A tied pair contributes 0.5, with loss \(\ln 2 = 0.6931\). Training concentrates its effort where the RM is still wrong, and that has a downside: a <b>wrong</b> label keeps pulling with weight close to 1 forever. That is what Christiano's noise model fixes: in the figure's “10% noise” variant, the weight of a badly inverted pair goes to 0. Try it in the figure.</p>
+  <figure class="la-fig" id="fig-perda" data-title="The RM loss and the gradient it pushes">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>On the left (top on mobile), the rewards of the preferred response \(r_w\) (mint) and the rejected one \(r_l\) (pink), with the gradient arrows and the particles it pushes (length \(\propto \sigma(-\Delta)\)). On the right (bottom on mobile), the sigmoid \(P = \sigma(\Delta)\) (lavender) and the loss (amber) as a function of \(\Delta\). “Train” applies gradient steps: the separation grows quickly at first and then slows down. “Shift both” adds ±2 to both rewards and changes nothing in the loss. The variants swap the loss for Llama 2's margin, HelpSteer2-Preference's scaled BT, or Christiano's 10% noise model.</figcaption>
+  </figure>
+  <h3>Invariances: why every RM is normalized</h3>
+  <p>The loss only sees differences. Adding a constant to all rewards changes nothing: the RM is <b>translation invariant</b>, and the zero of the scale is arbitrary. That is why every pipeline <span class="la-term" data-term="normalizacao-do-rm">normalizes</span> the RM before RL. Stiennon adjusts the outputs so that the reference summaries have mean 0. InstructGPT sets a bias so that the labelers' demonstrations have mean 0. Ziegler normalizes to mean 0 and variance 1 under samples from the initial model. The “N+ details” reproduction computes the mean over the SFT references and writes it into the head's bias.</p>
+  <p>The loss is <b>not</b> scale invariant. Multiplying all rewards by 2 makes the RM more “confident”: the scale works as the <span class="la-term" data-term="temperatura">temperature</span> of the preference. In RL, it interacts directly with the KL penalty coefficient. Llama 2, for example, applies \(\text{whiten}(\text{logit}(\cdot))\) to the reward to balance it against the KL term (<i>logit</i> is the inverse of the sigmoid: Llama 2's RM output lies in [0,1] and goes back to the log-odds scale; <i>whiten</i> subtracts the mean and divides by the standard deviation over the batch); this comes back in the <a data-ch="ppo-rlhf">PPO and RLHF</a> chapter.</p>
+  <h3>Soft labels, ties, and loss variants</h3>
+  <p>When the label is a distribution \(\mu\) rather than a hard 1 (tie → \(\mu = (\tfrac12, \tfrac12)\); an AI labeler that says 60/40), you use the full cross-entropy:</p>
+  <div class="la-eq">
+    \[ \mathcal L = -\mu(1)\log\hat P(y_1\succ y_2) - \mu(2)\log\hat P(y_2 \succ y_1), \qquad \Delta^* = \log\frac{\mu(1)}{\mu(2)} \]
+    <ul class="la-eq-legend">
+      <li>\(\hat P\): the probability predicted by the RM, \(\sigma(\Delta)\)</li>
+      <li>\(\Delta^*\): the optimum of the loss with a soft label; a tie asks for \(\Delta^* = 0\), a 60/40 asks for \(\Delta^* \approx 0.405\)</li>
+    </ul>
+  </div>
+  <p>The variants used in practice change how the strength of the preference gets used:</p>
+  <table>
+    <thead><tr><th>Variant</th><th>Formula</th><th>Who uses it</th><th>What for</th></tr></thead>
+    <tbody>
+      <tr><td>Standard BT</td><td>\(-\log\sigma(r_w - r_l)\)</td><td>Stiennon, InstructGPT, almost everyone</td><td>direction</td></tr>
+      <tr><td><span class="la-term" data-term="margem-de-preferencia">Margin</span></td><td>\(-\log\sigma\big(r_c - r_r - m(r)\big)\)</td><td>Llama 2</td><td>require a larger separation on “much better” pairs</td></tr>
+      <tr><td>Scaled BT</td><td>\(-m\,\log\sigma(r_c - r_r)\)</td><td>HelpSteer2-Preference</td><td>weight high-magnitude pairs more, without imposing a distance</td></tr>
+      <tr><td>Multi-attribute regression</td><td>\(\sum_a (\hat s_a - s_a)^2\)</td><td>HelpSteer, HelpSteer2</td><td>absolute Likert scores, one head per attribute</td></tr>
+      <tr><td>BT + LM loss</td><td>\(\mathcal L_{\text{BT}} + \beta_{\text{rm}}\mathcal L_{\text{LM}}\)</td><td>“Secrets of RLHF” (\(\beta_{\text{rm}}=1\))</td><td>regularize the backbone</td></tr>
+    </tbody>
+  </table>
+  <p>Llama 2's margins per preference level were, in the “small” version, 1, 2/3, 1/3, and 0 (from <i>significantly better</i> to <i>negligibly better/unsure</i>), and in the “large” one, 3, 2, 1, and 0. The average gain was small (62.5% accuracy without a margin, 63.0% with the small one, and 62.9% with the large one) and showed up mainly on the “significantly better” pairs (79.1 → 80.4 → 80.7). The authors note that the large margin pushes the scores toward a bimodal distribution. In HelpSteer2-Preference, scaled BT was the best variant on RewardBench: 92.7 versus 91.5 for plain BT and for margin, training from scratch; 93.7 starting from the regression model; and 94.1 adding ExPO weight extrapolation. In other words, regression and BT carry complementary information.</p>
+</section>
+
+<section class="la-sec">
+  <h2>Architecture and training: an LLM with a scalar head</h2>
+  <p>A modern RM is the same <a data-ch="bloco-transformer">Transformer</a> from Module 1 with the last layer swapped out. InstructGPT starts from the SFT model, removes the <i>unembedding</i> layer (the <span class="la-term" data-term="lm-head">lm_head</span>, which projects the hidden state onto the vocabulary), and puts in its place a projection to <b>a single number</b>. Llama 2 initializes its RMs from checkpoints of the chat model itself, so that the RM “knows what the chat model knows”. Stiennon adds a randomly initialized linear head. As a formula:</p>
+  <div class="la-eq">
+    \[ \begin{gathered} r_\phi(x,y) = w^\top h_L(x,y)_{\text{EOS}} + b \\[4pt] w_i \sim \mathcal N(0,\sigma^2),\quad \sigma = \frac{1}{\sqrt{d_{\text{model}}+1}}\ \ \text{(at initialization)} \end{gathered} \]
+    <ul class="la-eq-legend">
+      <li>\(h_L(x,y)_{\text{EOS}} \in \mathbb R^{d_{\text{model}}}\): last-layer hidden state at the position of the <span class="la-term" data-term="token-eos">EOS token</span>, after reading the whole prompt and response</li>
+      <li>\(w \in \mathbb R^{d_{\text{model}}}\), \(b\): the <span class="la-term" data-term="cabeca-escalar">scalar head</span>; \(b\) is where normalization stores the mean</li>
+      <li>the initialization of \(w\) is the one from the “N+ details” reproduction, which fixes a typo in the original paper; \(\sigma\) is the <b>standard deviation</b> of each entry \(w_i\)</li>
+      <li>why this \(\sigma\): with entries of \(h\) of order 1 (after the final LayerNorm), \(\mathrm{Var}(w^\top h)\approx d_{\text{model}}\,\sigma^2\approx 1\), and the initial reward starts out at unit scale (interpretation)</li>
+    </ul>
+  </div>
+  <p>Why read at EOS? With causal attention, position \(t\) has only seen the tokens up to \(t\). The only position that has read the whole response is the last one, and that is where the score is read. The N+ reproduction insists on it: the reward is extracted <b>only</b> at EOS (the index of the first PAD minus 1); the “reward logits” at the other positions are worthless and come out almost always negative. Reading in the wrong place, at a PAD padding token for example, is a silent bug: training runs, the loss goes down, and the number does not mean what you think. Another detail from the same source: the RM trains with right padding, but in PPO the queries are left-padded for generation, and the masks need to be adjusted.</p>
+  <figure class="la-fig" id="fig-rm" data-title="Inside the RM: from text to scalar">
+    <div class="la-fig-stage" style="height:460px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>The prompt and response tokens rise through the Transformer and become the hidden-state matrix \(H\), drawn transposed (one column per token; \(d_{\text{model}} = 6\) here). The EOS column is multiplied, cell by cell, by the head's vector \(w\); the sum plus \(b\) gives \(r\). Switch between the preferred and the rejected response to see \(r_w\), \(r_l\), and \(\sigma(\Delta)\). Turn off “read at EOS” to see the bug of reading at a PAD, and switch to 5 heads to see HelpSteer2's multi-attribute RM (there, the \(r_w\), \(r_l\), and \(\sigma\) readouts are still those of the BT head, for comparison). <b>Illustrative</b> values.</figcaption>
+  </figure>
+  <p>HelpSteer2's RM projects the end-of-response state onto <b>5 scalars</b>, one per attribute (helpfulness, correctness, coherence, complexity, verbosity), and trains by regression. A multi-attribute RM lets you <i>choose</i> the combination at optimization time, for example discounting verbosity.</p>
+  <h3>Size, data, and the training recipe</h3>
+  <p>InstructGPT used <b>a single 6B RM</b> for 1.3B, 6B, and 175B policies. A 175B RM did reach lower validation loss, but (1) its training was more unstable, which made it worse as a starting point for PPO's value function, and (2) a 175B RM and critic would greatly increase the cost of PPO. Stiennon used an RM, policy, and critic of the same size. As for scale, Stiennon trained 7 RMs from 160M to 13B on 8k–64k comparisons: <b>doubling the data yielded ~+1.1%</b> validation accuracy, and <b>doubling the model, ~+1.8%</b>. In Gao 2022's setup, with fewer than ~2,000 comparisons the RMs stayed near chance at every size. Askell et al. 2021 also proposed preference model pre-training (PMP) on “cheap” preferences (StackExchange, Reddit, Wikipedia) before the human data, which improves sample efficiency in large models.</p>
+  <table class="la-params">
+    <thead><tr><th>Detail</th><th>Typical value</th><th>Source</th><th>Why it matters</th></tr></thead>
+    <tbody>
+      <tr><td>Epochs</td><td><b>1</b></td><td>InstructGPT, Ziegler, Llama 2, Stiennon, N+</td><td>more epochs overfit fast (InstructGPT: “obvious” deterioration of the validation loss). Gao: 4 epochs versus 1 epoch with 4× more data did not change the gold score</td></tr>
+      <tr><td>LR and batch</td><td>InstructGPT 9×10⁻⁶, cosine down to 10%, 64 prompts; Llama 2 5×10⁻⁶ (70B) / 10⁻⁵, 3% warmup, 512 pairs</td><td>papers</td><td>InstructGPT reports insensitivity to ±50% changes in LR; N+ uses 3×10⁻⁶ without a sweep</td></tr>
+      <tr><td>Seeds</td><td>3–10, pick by dev set</td><td>Stiennon</td><td>data order and head initialization change the result</td></tr>
+      <tr><td>Dropout</td><td>off</td><td>N+, Ziegler</td><td>essential in PPO; keeps the RM deterministic</td></tr>
+      <tr><td>Pairs per prompt</td><td>all in the same batch element</td><td>InstructGPT</td><td>\(K\) forwards per prompt; avoids overfitting from correlation</td></tr>
+      <tr><td>Memory</td><td>2 sequences per pair (or \(K\) per ranking)</td><td>calculation</td><td>forward/backward is paid per sequence: 2 per pair, \(K\) per grouped ranking; per sequence, the RM still saves the \([T\times V]\) vocabulary logits that SFT materializes</td></tr>
+    </tbody>
+  </table>
+  <div class="la-callout deep"><b class="t">Bridge to Module 1: scoring is a prefill</b><p>Interpretation: to give a score, the RM does <b>one</b> forward pass over prompt + response and reads one position. There is no sampling and no decode, just a <a data-ch="prefill-decode-kv">prefill</a> the length of the sequence. In the RL loop, each response generated by the policy costs the RM one prefill, while generating it cost hundreds of decode steps. That is why, in an RLHF pipeline, generation dominates the time (the subject of the <a data-ch="ppo-rlhf">PPO</a> chapter), not scoring. A <i>generative</i> judge, which writes a critique before the score (section 9), changes that math: it also decodes.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Evaluating an RM: accuracy, calibration, and RewardBench</h2>
+  <p>The main metric of an RM is <b>pairwise accuracy</b> on a held-out set: the fraction of pairs where \(r(y_w) > r(y_l)\). We have already seen the human ceilings. But there is a second, subtler question: when the RM says “\(P = 0.9\)”, is it right 90% of the time? A BT RM is <span class="la-term" data-term="calibracao-do-rm">calibrated</span> if, among the pairs where it predicts \(\sigma(\Delta) = p\), the fraction where the human agrees is \(p\). This matters because, in RL, score <b>differences</b> become reward. An overconfident RM exaggerates small differences; an underconfident one flattens them.</p>
+  <p>Bai et al. 2022 (Anthropic) plotted accuracy against \(\Delta\) and found the preference models trained only on helpfulness to be “very well calibrated”, and those trained on the helpfulness + harmlessness mix to be “slightly underconfident”. The N+ reproduction redid the plot on TL;DR and found RMs that were “still under-calibrated”. The standard measure of miscalibration is <span class="la-term" data-term="ece">ECE</span>:</p>
+  <div class="la-eq">
+    \[ \text{ECE} = \sum_b \frac{n_b}{N}\,\big|\text{acc}_b - \text{conf}_b\big|, \qquad \text{conf} = \max\big(\hat P,\ 1-\hat P\big) \]
+    <ul class="la-eq-legend">
+      <li>\(b\): confidence bins; \(n_b\): pairs in the bin; \(N\): total</li>
+      <li>\(\text{acc}_b\): fraction correct in the bin; \(\text{conf}_b\): mean predicted confidence in the bin</li>
+    </ul>
+  </div>
+  <p>The simplest remedy is <span class="la-term" data-term="escalonamento-por-temperatura">temperature scaling</span>: replace \(\sigma(\Delta)\) with \(\sigma(\Delta/T)\) and fit a single scalar \(T\) that minimizes cross-entropy on a validation set. Gao 2022 did this with their proxy RMs. Recalibrating does not change the <b>order</b> of the scores, so it does not alter any best-of-\(n\); according to the same authors, it should not affect RL either <i>in their setup</i>, which optimizes without a KL penalty (Adam is invariant to the scale of the loss). With the KL penalty of standard RLHF, dividing \(r\) by \(T\) is equivalent to multiplying the KL \(\beta\) by \(T\), and then scale matters again (section 4 and the <a data-ch="ppo-rlhf">PPO</a> chapter).</p>
+  <figure class="la-fig" id="fig-calib" data-title="Reliability diagram and the temperature that fixes the RM">
+    <div class="la-fig-stage" style="height:420px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>On the left (top on mobile), the sigmoid \(\sigma(\Delta/T)\) and, as dots, the observed accuracy in three \(|\Delta|\) bins (0.25, 1.0, 2.5; with 400, 350, and 250 pairs). On the right (bottom on mobile), the reliability diagram: predicted confidence versus accuracy, with the perfect-calibration diagonal; bubble size is the number of pairs. With \(T=1\) the RM is overconfident (ECE = 0.0318). “Find the optimal T” slides to \(T \approx 1.31\), which minimizes the NLL and brings the predictions to 0.5476 / 0.6821 / 0.8708 (ECE ≈ 0.010, our calculation). <b>Illustrative</b> data.</figcaption>
+  </figure>
+  <p>Accuracy and calibration on the training distribution still do not answer the question that matters most: does the RM <b>generalize to where the policy is going</b>? Stiennon tested this. The RM trained on TL;DR transferred to CNN/DM with 62.4% (1.3B) and 66.5% (6.7B) agreement, versus 66.9% between humans. It preferred minimal edits that improved a summary in 79.4% and 82.8% of cases (humans: 84.1%) and detected swapped roles in 92.9% and 97.2%. But it preferred the edits that <i>shortened</i> the summary only 62.6% of the time, versus 76.4% for humans: the first sign of the length bias in the next section.</p>
+  <h3>RewardBench: a standardized suite</h3>
+  <p><span class="la-term" data-term="rewardbench">RewardBench</span> (Lambert et al. 2024) gathers verified prompt–<i>chosen</i>–<i>rejected</i> triples in four categories. The core has 2,985 pairs: Chat 358, Chat Hard 456, Safety 740, and Reasoning 1,431, plus “Prior Sets” with 17.2k pairs from older datasets. The metric is pairwise accuracy. It is where HelpSteer2's Nemotron-4 340B RM reached 92.0% (1st place on June 12, 2024) and HelpSteer2-Preference's Llama-3.1-70B with scaled BT reached 94.1 (1st on October 1, 2024). <b>RewardBench 2</b> (2025) changes the format to <i>best-of-4</i> (1 correct response against 3 incorrect ones) across 6 domains (Factuality, Precise IF, Math, Safety, Focus, Ties). Models score about 20 points lower than on the first one, and the authors correlate the score with downstream use, in best-of-\(N\) and PPO.</p>
+  <div class="la-callout warn"><b class="t">Pitfall: the benchmark is not the use case</b><p>An RM is evaluated on <i>fixed</i> pairs, but used against a policy that <i>hunts for</i> its weak spots. High accuracy on RewardBench is necessary, not sufficient. The test that matters is behavior under optimization, which is the subject of the next section.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>When the reward lies: length, hacking, and over-optimization</h2>
+  <p><span class="la-term" data-term="lei-de-goodhart">Goodhart's law</span> says: when a measure becomes a target, it ceases to be a good measure. The RM is a learned <i>proxy</i> for human judgment. Optimizing it a little improves the responses; optimizing it too much finds and exploits its errors. This phenomenon goes by two names: <span class="la-term" data-term="reward-hacking">reward hacking</span>, when the policy discovers a shortcut that the RM rewards and humans do not, and <span class="la-term" data-term="superotimizacao">over-optimization</span>, the curve in which the proxy reward keeps rising while the real quality falls.</p>
+  <h3>Length bias</h3>
+  <p>The best-documented shortcut is response length. Gao 2022 reports that optimized policies producing very long responses, even when a short one would be preferred, were a real problem in the InstructGPT setting. <b>Singhal et al. 2023</b> (“A Long Way to Go”) measured it. PPO greatly increased length in every setting (WebGPT, Stack, RLCD), and when the reward gain was decomposed, <b>70–90% of the improvement</b> on WebGPT and RLCD came from length. A PPO whose reward was <i>only length</i> reproduced most of the gain: 56% versus 58% win rate for standard PPO on WebGPT, and 64% versus 63% on RLCD. The dominant source of the <span class="la-term" data-term="vies-de-comprimento">bias</span> is the RMs, “easily influenced by length biases in the preference data”. Mitigations listed in the literature include penalizing length in the reward, RMs with separate heads for length and quality (ODIN), length-controlled evaluation (AlpacaEval LC), and length-balanced data.</p>
+  <p>There are other classic examples. Ziegler 2019's RL summarizers became “smart copiers” that copied whole sentences from the text, because the labelers used “did it copy?” as a quality heuristic. Stiennon saw that, under light optimization, the models improved according to the labelers and, under strong optimization, got worse, with the RM still giving high scores to summaries that humans rejected. “Secrets of RLHF” describes a <i>pattern collapse</i> in PPO: the policy fools the RM with specific patterns to obtain abnormally high scores.</p>
+  <h3>Gao's scaling laws</h3>
+  <p><b>Gao, Schulman & Hilton 2022</b> measured over-optimization cleanly, without humans. InstructGPT's 6B RM plays the role of the human (the <b>gold RM</b>) and labels 100,000 synthetic pairs, which train <b>proxy RMs</b> from 3M to 3B. A policy is then optimized against the proxy (best-of-\(n\), or PPO without a KL penalty) and the <i>gold</i> score is measured. The distance traveled is \(d = \sqrt{D_{KL}(\pi\,\|\,\pi_{\text{init}})}\), with the <span class="la-term" data-term="kld">KL divergence</span> taken relative to the initial policy. The gold score curves follow simple forms:</p>
+  <div class="la-eq">
+    \[ R_{\text{bon}}(d) = d\,(\alpha_{\text{bon}} - \beta_{\text{bon}}\,d), \qquad R_{\text{RL}}(d) = d\,(\alpha_{\text{RL}} - \beta_{\text{RL}}\log d), \qquad \text{KL}_{\text{bon}} = \log n - \frac{n-1}{n} \]
+    <ul class="la-eq-legend">
+      <li>\(R(d)\): gain in gold score; \(R(0) := 0\)</li>
+      <li>\(\alpha\): “how much it improves” at first; \(\beta\): “how much is lost” to over-optimization. Both depend on the size of the proxy RM and on the data</li>
+      <li>\(\text{KL}_{\text{bon}}\): the Stiennon/Gao analytic formula for the KL of <span class="la-term" data-term="best-of-n">best-of-\(n\)</span> (sample \(n\) responses and keep the one with the highest proxy score); it is an upper bound (Beirami et al., 2024), nearly exact when the \(n\) responses are distinct with no reward ties (<a data-ch="awr-contrastivo">chapter 59</a>): \(n = 1{,}000\) → ≤ 5.91 nats, \(n = 60{,}000\) → ≤ 10.00 nats</li>
+      <li>peaks: \(d^* = \alpha/2\beta\) for BoN and \(d^* = e^{\alpha/\beta - 1}\) for RL (calculated from the forms)</li>
+    </ul>
+  </div>
+  <p>With illustrative coefficients (\(\alpha_{\text{bon}}=1\), \(\beta_{\text{bon}}=0.25\); \(\alpha_{\text{RL}}=1\), \(\beta_{\text{RL}}=0.5\)), BoN peaks at \(d = 2\) (KL = 4 nats, \(R = 1.0\)) and RL at \(d = e\) (KL ≈ 7.39 nats, \(R ≈ 1.359\)). Gao's main findings:</p>
+  <ol class="la-steps">
+    <li><b>RL spends much more KL than BoN</b> for the same amount of optimization, and of over-optimization. So KL is <i>not</i> a good way to compare the amount of optimization across methods. As a function of the proxy score, the two look alike.</li>
+    <li><b>The coefficients vary smoothly with proxy RM size</b>: \(\alpha_{\text{bon}}\), \(\beta_{\text{bon}}\), and \(\beta_{\text{RL}}\) change roughly logarithmically with the number of parameters, and \(\alpha_{\text{RL}}\) stays nearly constant.</li>
+    <li><b>Policy size matters little</b>: larger policies gain less from optimization, but over-optimize about the same.</li>
+    <li><b>KL penalty ≈ early stopping</b>: in their setup, it improved the proxy score reached per unit of KL, but not the gold × KL frontier. The authors caution that this result is sensitive to hyperparameters.</li>
+  </ol>
+  <p>Goodhart's taxonomy helps read the curves. In <b>regressional</b> Goodhart, the proxy is the gold plus independent noise. With Gaussian noise, optimizing partly selects for noise and the real gain is smaller than it looks, but the gold keeps rising. The gold can <i>fall</i> in two cases. The first is <b>extremal</b> Goodhart: outside the RM's training distribution, the proxy–gold relationship breaks down, as with exaggerated length. The second shows up when the RM's own error has <b>heavy tails</b>, that is, when the RM occasionally errs by a lot and best-of-\(n\) ends up “finding” that error (interpretation; this is what the figure simulates). The figure builds a toy best-of-\(n\) with both mechanisms.</p>
+  <figure class="la-fig wide" id="fig-goodhart" data-title="Goodhart in best-of-n: the proxy rises, the gold falls">
+    <div class="la-fig-stage" style="height:460px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>On the left (top on mobile), each round draws \(n\) candidate responses (dots: length × real quality) and puts a crown on the one picked by the proxy. The proxy sees quality, but adds a length bias and an error of its own with heavy tails; the “gold” punishes responses that are too long. On the right (bottom on mobile), the Monte Carlo averages of the chosen response against \(d=\sqrt{\text{KL}_{\text{bon}}}\): proxy on top, gold below (each on its own scale), with Gao's form \(d(\alpha-\beta d)\) fitted to the gold (dashed). Try the ensemble: it corrects each RM's <i>own</i> error, but not the <i>shared</i> bias. With the bias at 0 and 1 RM, the gold still falls because of the heavy tail of the RM's own error; switch to the mean of 4 and the drop disappears. With a high bias (the default, 0.7), not even the ensemble prevents the drop, because the bias is shared; from 0.8 on, the mean of 4 ends up below 1 RM at \(n = 256\) (without the noise to dilute it, the choice goes straight for length). <b>Illustrative</b> model; only the BoN KL formula is analytic (an upper bound, nearly exact here because responses never tie).</figcaption>
+  </figure>
+  <p>Bai 2022 saw something consistent with this in their training runs: early on, the preference model score gain grows roughly linearly in \(\sqrt{D_{KL}}\), across all runs. Splitting the data 50/50 between a “train” RM and a “test” RM, RL stayed robust up to ~150k training samples; after that, the two RMs began to disagree.</p>
+  <h3>Mitigations: KL, ensembles, and weight averaging</h3>
+  <p>The first line of defense is the <b>KL penalty</b> to the reference model, which keeps the policy in the region where the RM was trained. It will be the centerpiece of the <a data-ch="ppo-rlhf">PPO and RLHF</a> chapter. The others go after the RM itself:</p>
+  <ul>
+    <li><b>Ensembles.</b> Christiano 2017 already trained several predictors by bootstrap and used the average of the members, each one normalized separately. Coste et al. 2023 compared three ways to combine \(k\) RMs:</li>
+  </ul>
+  <div class="la-eq">
+    \[ R_\mu = \tfrac1k\sum_i R_i, \qquad R_{\text{WCO}} = \min_i R_i, \qquad R_{\text{UWO}} = \tfrac1k\sum_i R_i - \lambda\,\tfrac1k\sum_i\Big(R_i - \tfrac1k\sum_j R_j\Big)^2 \]
+    <ul class="la-eq-legend">
+      <li>\(R_\mu\): mean; not conservative, because it only takes one member overestimating</li>
+      <li>\(R_{\text{WCO}}\): worst case (minimum); no hyperparameter, but it can cost performance</li>
+      <li>\(R_{\text{UWO}}\): mean minus \(\lambda\) times the variance across members; penalizes disagreement</li>
+      <li>illustrative example: \(R_i = (1.8,\ 2.0,\ 2.2,\ 0.6)\) → mean 1.65; WCO 0.60; UWO (\(\lambda=0.5\)) 1.4562</li>
+    </ul>
+  </div>
+  <p>With and without 25% label noise, conservative optimization practically eliminated over-optimization in BoN, with improvements of up to 70%, and always reduced it in PPO; combined with a small KL, it prevented over-optimization at no performance cost. There is a limit, though. <b>Eisenstein et al. 2023</b> showed that ensembles that vary the <i>pre-training</i> seed generalize better than those that vary only the fine-tuning seed, but that not even they eliminate reward hacking, because all members err in similar ways. That is the shared bias in the figure. <span class="la-term" data-term="warm">WARM</span> (Ramé et al. 2024) replaces averaging the <i>predictions</i> with averaging the <i>weights</i> of several RMs fine-tuned from the same pre-training, exploiting the linear connectivity between them: at inference it costs a single RM, and it is more robust to distribution shifts and to inconsistent preferences. Rounding out the toolbox are early stopping with separate or human evaluation, RMs retrained on on-policy data (Bai, Llama 2), reward normalization and clipping, and length control.</p>
+</section>
+
+<section class="la-sec">
+  <h2>Outcome or process: ORM, PRM, and Math-Shepherd</h2>
+  <p>Up to now, the RM gave a score to the whole response. In multi-step reasoning, you can ask something else: is <i>each step</i> right? Uesato et al. 2022 defined the two kinds with an RM that predicts a “correct/incorrect” token after each step:</p>
+  <ul>
+    <li><b><span class="la-term" data-term="orm">ORM</span></b> (<i>outcome reward model</i>): the label for every step is whether the <b>final answer</b> matches the reference answer. Maximizing the ORM step by step ≈ maximizing the estimated chance of <i>reaching</i> the right answer; in other words, the ORM learns something like a value function.</li>
+    <li><b><span class="la-term" data-term="prm">PRM</span></b> (<i>process reward model</i>): the label after each step says whether the steps <b>so far</b> are correct. It requires step-by-step annotation.</li>
+  </ul>
+  <p>On GSM8K, supervising only the outcome gave a similar final-answer error, with fewer labels. But for the <i>reasoning</i> to be correct, process supervision was needed, or RMs that imitated it. The best system reduced final-answer error from 16.8% to 12.7% and <b>trace error</b> (solutions with the right answer and wrong reasoning) from 14.0% to 3.4%. Lightman et al. 2023 (“Let's Verify Step by Step”) scaled the idea up with <span class="la-term" data-term="prm800k">PRM800K</span>. Humans labeled only up to the first wrong step, and a solution's score is the <b>product</b> of the probabilities of each step being correct:</p>
+  <div class="la-eq">
+    \[ \text{score}_{\text{PRM}}(y) = \prod_{k=1}^{S} p\big(\text{step}_k\ \text{correct} \mid x, \text{step}_{1..k}\big) \]
+    <ul class="la-eq-legend">
+      <li>\(S\): number of steps in the solution; \(p\): probability given by the PRM (neutrals count as positives)</li>
+      <li>using the minimum instead of the product makes “small” differences, according to the authors</li>
+      <li>illustrative example: \((0.98,\ 0.95,\ 0.60,\ 0.97)\) → product 0.5418, minimum 0.60</li>
+    </ul>
+  </div>
+  <p>Choosing the best of 1,860 solutions on a 500-problem subset of MATH, the PRM got <b>78.2%</b> right, the ORM 72.4%, and majority voting 69.6%. Step-by-step annotation is expensive, and <span class="la-term" data-term="math-shepherd">Math-Shepherd</span> (Wang et al. 2023) generates the labels without humans: starting from step \(s_i\), a “completer” finishes \(N\) solutions and checks the final answers \(\{a_j\}\) against the reference answer \(a^*\):</p>
+  <div class="la-eq">
+    \[ y^{\text{HE}}_{s_i} = \mathbb 1\big[\exists j: a_j = a^*\big], \qquad y^{\text{SE}}_{s_i} = \frac{1}{N}\sum_{j=1}^{N}\mathbb 1[a_j = a^*] \]
+    <ul class="la-eq-legend">
+      <li>HE (<i>hard estimation</i>): the step is good if <b>any</b> continuation gets it right</li>
+      <li>SE (<i>soft estimation</i>): the fraction of continuations that get it right</li>
+      <li>example: \(N = 4\) continuations with answers (42, 17, 42, 42) and reference answer 42 → HE = 1, SE = 0.75</li>
+    </ul>
+  </div>
+  <figure class="la-fig" id="fig-prm" data-title="ORM, PRM, and Math-Shepherd's Monte Carlo labels">
+    <div class="la-fig-stage" style="height:450px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>A 4-step solution to a toy problem. <b>ORM</b>: a single label, the outcome one, stamped on every step (even the odd one). <b>PRM</b>: one probability per step; adjust step 3's and watch the product and the minimum. <b>Math-Shepherd</b>: pick the step and the completer launches \(N\) continuations; the HE/SE label comes from the fraction that reaches 42. <b>Illustrative</b> values (those from the example above, with \(N=4\)).</figcaption>
+  </figure>
+  <p>With step-by-step PPO against Math-Shepherd, a Mistral-7B went from 77.9% to 84.1% on GSM8K and from 28.6% to 33.0% on MATH; with verification at the end, 89.1% and 43.5%. Notice what SE is (interpretation): a Monte Carlo estimate of the <b>value</b> \(V(s_i)\), the expected final reward from that prefix. A PRM trained on these labels is a critic learned outside the loop. This bridge comes back in the <a data-ch="rl-fundamentos">next chapter</a>, when the value function and the critic show up.</p>
+  <div class="la-callout warn"><b class="t">Why DeepSeek-R1 did not use a PRM</b><p>The DeepSeek-R1 report says it did not use neural RMs, neither process nor outcome ones, for reasoning RL, because they suffer from reward hacking at scale. For the PRM, the authors give three reasons: it is hard to define what a “step” is, annotating steps is expensive and noisy, and any model-based PRM ends up leading to hacking. They acknowledge that PRMs work well for reranking the top N responses. Where an exact verifier exists (numeric answer, code tests), the “RM” becomes a deterministic function: that is RL with verifiable rewards, from the <a data-ch="grpo-rlvr">GRPO and RLVR</a> chapter.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>AI judges: LLM-as-judge, generative RMs, and RLAIF</h2>
+  <p>A scalar RM only returns a number. A large LLM, instructed to compare two responses, also judges, and explains itself too. Zheng et al. 2023 used GPT-4 as a <span class="la-term" data-term="llm-como-juiz">judge</span> on MT-bench and Chatbot Arena: agreement with humans was <b>85%</b> (no ties), above the 81% between humans, and humans found 75% of the GPT-4 judgments they disagreed with “reasonable”. There are three modes of use: pairwise comparison, single-answer grading, and reference-guided grading. Four biases are catalogued: <span class="la-term" data-term="vies-de-posicao">position</span>, verbosity, self-preference (the judge prefers its own answers), and limited reasoning in math (the judge gets wrong what it cannot solve). The mitigations: judge in both orders and accept only consistent wins, give the judge a reference, and ask for brief reasoning before the verdict.</p>
+  <p>The next step is to train the judge as a reward model. In <span class="la-term" data-term="rm-generativo">GenRM</span> (Zhang et al. 2024), the verifier is trained with next-token prediction, and the reward is the probability of the “Yes” token after the question “is the answer correct (Yes/No)?”. In the GenRM-CoT variant, it first writes a rationale and takes a majority vote over several rationales, spending more compute at test time. In best-of-\(N\), GenRM took an algorithmic task from 5% to 45.3%, GSM8K from 73% to 93.4%, transfer to MATH from 28% to 44.6%, and MMLU abstract algebra from 37.9% to 53.5%. <b>DeepSeek-GRM</b> (Liu et al. 2025) goes further: a <i>pointwise</i> generative RM, trained with online RL (<i>Self-Principled Critique Tuning</i>) to first write <b>principles</b> adapted to the question and then the critique, which scales at inference through parallel sampling and voting guided by a meta-RM.</p>
+  <p>Pairwise or pointwise (interpretation)? Pairwise judgment matches BT and is more robust to scale drift. But PPO and GRPO need <b>one scalar per response</b>, and that is why modern generative RMs convert the critique into a score.</p>
+  <h3>RLAIF: when the labeler is also an AI</h3>
+  <p>If an LLM judges well, it can produce the RM's training pairs itself. That is <span class="la-term" data-term="rlaif">RLAIF</span> (<i>RL from AI Feedback</i>). In <a data-ch="constitutional-ai">Constitutional AI</a> (Bai et al. 2022b), a model labels which of two responses is less harmful according to a list of principles, and the preference model is trained on a mix of AI preferences (harmlessness) and human ones (helpfulness). <b>Lee et al. 2023</b> (“RLAIF vs RLHF”) unpacked the recipe:</p>
+  <ol class="la-steps">
+    <li><b>Soft label.</b> The labeler (PaLM 2 L, without RL) reads a preamble, optional examples, the two responses, and “Preferred Response=”. The softmax of the log-probs of the tokens “1” and “2” becomes a soft label, and the RM is trained with cross-entropy against it, in a kind of distillation.</li>
+    <li><b>Position bias.</b> Mitigated by running two inferences with the order swapped and averaging them.</li>
+    <li><b>Chain of thought.</b> Asking the labeler to reason first consistently improved alignment with humans; a detailed preamble and few-shot examples helped only on some tasks.</li>
+    <li><b>Result.</b> Humans preferred RLAIF and RLHF over SFT in 71% and 73% of cases (summarization) and in 63% and 64% (helpful dialogue), a non-significant difference. On the rate of harmless responses: RLAIF 88%, RLHF 76%, SFT 64%. With a labeler the <i>same size</i> as the policy, still 68% against SFT.</li>
+    <li><b>d-RLAIF.</b> A variant skips the RM: the LLM gives a score from 1 to 10 directly during RL, avoiding an outdated (<i>stale</i>) RM, and matches or beats canonical RLAIF.</li>
+  </ol>
+  <p>The figure shows why swapping the order helps, and also what that swap does <i>not</i> fix.</p>
+  <figure class="la-fig" id="fig-juiz" data-title="The judge, position, and the soft label">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>The judge reads both responses and produces logits for the tokens “1” and “2”; the softmax becomes the soft label. A position bias \(b\) is added to the logit of whichever response appears first. In order (A, B) the bias helps \(A\); in order (B, A), it helps \(B\). Averaging the two orders removes the directional bias, but pulls the label toward 0.5 (it becomes less confident). If the two orders disagree on the winner, the evaluation protocol counts a tie. <b>Illustrative</b> model: \(P(A) = \sigma(\Delta \pm b)\).</figcaption>
+  </figure>
+  <p>AI labels are cheap and consistent, but they carry the judge's biases (position, length, self-preference). Everything in section 7 applies, and an RM trained on AI labels inherits these biases and sometimes amplifies them (interpretation). UltraFeedback is RLAIF at dataset scale (GPT-4 as the labeler), and Skywork-Reward-V2 used human + AI curation over 40M pairs.</p>
+  <h3>In the three Module 1 families</h3>
+  <p>The technical reports of the families that Module 1 serves show how these pieces combine in 2025–2026. There is no “pure” RM: they all mix rules, RMs, and judges.</p>
+  <div class="la-cards">
+    <div class="la-card" data-recipe="glm"><span class="ic">⚖️</span><h4><span class="la-rb glm"></span> GLM-5: hybrid reward</h4><p>In the <i>General RL</i> stage, the reward combines rules (precise, but limited in scope), ORMs (low variance, but hackable), and generative RMs (robust, but high variance). Expert human responses come in as <b>style anchors</b>, to avoid the verbose, formulaic “model text” pattern.</p></div>
+    <div class="la-card" data-recipe="qwen"><span class="ic">📏</span><h4><span class="la-rb qwen"></span> Qwen3: rule, reference, and RM</h4><p><i>General RL</i> covers more than 20 tasks, with three reward sources: rules (format, instruction following), a <b>reference-based</b> model (Qwen2.5-72B-Instruct scores the response against a reference answer), and a <b>reference-free</b> model (a trained RM).</p></div>
+    <div class="la-card" data-recipe="ds"><span class="ic">🧑‍⚖️</span><h4><span class="la-rb ds"></span> DeepSeek: from the CoT RM to the actor-judge</h4><p>V3 used rules (boxed answer, compiler and tests) and an RM trained from V3's SFT on preference data that includes the <b>chain of thought leading to the reward</b>, to mitigate hacking. V4 does away with scalar RMs: RL is guided by rubrics and the <b>actor itself works as a generative RM</b>.</p></div>
+  </div>
+  <p>There is also a direct bridge to Module 1: the three models served by the recipes on the two Sparks (<code>GLM-5.3-Flash-EXL3</code>, <code>qwen3.8-flash-next</code>, <code>deepseek-v4-flash-vision-exp</code>, all with an OpenAI API on port 8888) form a panel of judges from three distinct families. PoLL (Verga et al. 2024) showed that a panel of smaller models from different families has less intra-model bias and costs more than 7× less than one large judge. The rule of thumb, which the <a data-ch="avaliacao-pos-treino">evaluation</a> chapter details: exclude from the panel the family of the teacher that generated the data and the family of the student, to steer clear of self-preference.</p>
+  <h3>Roadmap: your first RM (or judge)</h3>
+  <ol class="la-steps">
+    <li><b>Decide the format before collecting.</b> Pairs (or rankings of \(K\) responses, grouped in the batch) for direction; strength or per-attribute Likert if you want magnitude or to control verbosity later.</li>
+    <li><b>Generate the responses from the policy you are going to optimize</b> (or one very close to it) and plan fresh collections after each round of RL. An off-distribution RM is a hackable RM.</li>
+    <li><b>Measure agreement</b> (κ, or weighted κ for ordinal scales) on a sample with 2–3 annotators, or between judge and human. It is your RM's ceiling.</li>
+    <li><b>Train 1 epoch</b>, with the SFT backbone, a scalar head read at EOS, dropout off, and a few seeds; normalize the bias to mean 0 on the references.</li>
+    <li><b>Evaluate accuracy, calibration, and generalization</b> (RewardBench and a set from your own domain), and check how the score correlates with length.</li>
+    <li><b>Under optimization, watch the gold</b>: samples evaluated by humans or by a judge from another family, the mean length, and the KL. Proxy rising while gold stays flat is Goodhart.</li>
+  </ol>
+  <p>Now we have \(r(x,y)\): a number that summarizes preferences, with its flaws mapped out. What remains is the central question of reinforcement-based post-training: <i>how do you make an LLM push this number up</i>, if the reward only arrives at the end of the response and you cannot differentiate through sampling? The <a data-ch="rl-fundamentos">next chapter</a> answers with the policy gradient theorem, REINFORCE, and the family of ideas that leads to PPO.</p>
+</section>

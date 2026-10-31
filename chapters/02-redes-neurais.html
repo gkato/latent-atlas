@@ -1,0 +1,371 @@
+<p class="la-lead">Por trás de siglas como SwiGLU, RMSNorm, <code>rms_norm_eps</code> e <code>output_gate_type: sigmoid</code> existe uma peça simples: um <span class="la-term" data-term="neuronio-artificial">neurônio</span> que multiplica números por pesos, soma tudo e decide quanto do resultado deixar passar. Coloque milhões deles em camadas, ligue as camadas por atalhos e normalize os números no caminho, e você tem o esqueleto de qualquer LLM, do GLM-5.3-Flash ao DeepSeek-V4-Flash. Neste capítulo você vai montar essa peça do zero, ver o plano se dobrar na tela, treinar uma rede ao vivo no navegador e entender por que as receitas copiam com tanto cuidado cada ε e cada função de ativação do checkpoint.</p>
+
+<section class="la-sec">
+  <h2>O neurônio: pesar, somar, decidir</h2>
+  <p>Imagine um porteiro de festa com uma prancheta. Para cada convidado ele olha algumas características (\(x_1\): está na lista? \(x_2\): chegou de chinelo?), dá a cada uma um peso (a lista vale muito e a favor, o chinelo vale um pouco e contra), soma tudo, desconta o próprio mau humor e decide. Esse porteiro é um neurônio artificial. A matemática inteira cabe numa linha:</p>
+  <div class="la-eq">
+    \[ z = \sum_{i=1}^{n} w_i\,x_i + b = \mathbf w^\top \mathbf x + b, \qquad a = f(z) \]
+    <ul class="la-eq-legend">
+      <li>\(\mathbf x \in \mathbb R^n\): as entradas (as características que o neurônio olha)</li>
+      <li>\(\mathbf w \in \mathbb R^n\): os <b>pesos</b>, aprendidos no treino. O sinal diz se a entrada conta a favor (+) ou contra (−) e o módulo diz quanto</li>
+      <li>\(b\): o <span class="la-term" data-term="vies">viés</span> (<i>bias</i>), um limiar que desloca a decisão</li>
+      <li>\(z\): a <span class="la-term" data-term="pre-ativacao">pré-ativação</span>, a “nota” bruta</li>
+      <li>\(f\): a <span class="la-term" data-term="funcao-de-ativacao">função de ativação</span>, que transforma a nota em resposta (degrau, sigmoide, ReLU…)</li>
+      <li>\(a\): a saída, ou ativação, do neurônio</li>
+    </ul>
+  </div>
+  <p>Faça uma conta à mão. Com \(\mathbf x = (2, -1)\), \(\mathbf w = (0{,}5;\ 1{,}5)\) e \(b = 0{,}2\): \(z = 0{,}5\cdot 2 + 1{,}5\cdot(-1) + 0{,}2 = -0{,}3\). Se \(f\) for a ReLU, a saída é \(\max(0, -0{,}3) = 0\): o neurônio fica em silêncio. Se \(f\) for a sigmoide, a saída é \(1/(1+e^{0{,}3}) \approx 0{,}4256\), um “talvez, puxando para o não”.</p>
+  <h3>O que um neurônio enxerga: uma reta</h3>
+  <p>O conjunto de pontos em que \(\mathbf w^\top \mathbf x + b = 0\) é uma reta no plano (em \(n\) dimensões, um hiperplano). O vetor \(\mathbf w\) é perpendicular a essa reta e aponta para o lado em que \(z\) cresce. A distância com sinal de um ponto até a reta é \(z/\lVert\mathbf w\rVert\); ou seja, \(z\) é essa distância multiplicada por \(\lVert\mathbf w\rVert\) (positiva do lado para onde \(\mathbf w\) aponta). Um neurônio responde a duas perguntas: de que lado da reta o ponto está, e a que distância.</p>
+  <p>Na figura abaixo, cada ponto do plano é um convidado. O fundo mostra a resposta \(a = f(z)\) do neurônio em cada posição, e o losango é um convidado que passeia pelo plano. À esquerda você vê o mesmo neurônio desenhado como um grafo: as entradas fluem pelos pesos até o somador e depois pela ativação.</p>
+  <figure class="la-fig" id="fig-neuronio" data-title="O neurônio-porteiro">
+    <div class="la-fig-stage" style="height:400px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Mexa em \(w_1\), \(w_2\) e \(b\). A reta tracejada é a fronteira \(z = 0\) e a seta é \(\mathbf w\), sempre perpendicular a ela. A espessura de cada aresta no grafo é \(|w_i|\) e a cor é o sinal. Passe o mouse sobre o plano para mover o convidado. O contador mostra quantos dos 16 pontos o neurônio classifica certo. Os dados são ilustrativos.</figcaption>
+  </figure>
+  <p>Repare em duas coisas. Primeiro, mudar \(b\) só desliza a reta, sem girá-la. Quem gira é a razão entre \(w_1\) e \(w_2\). Segundo, com os controles padrão você consegue acertar os 16 pontos, porque as duas nuvens estão separadas por uma reta. Se os pontos rosa estivessem nos dois cantos opostos (o padrão <b>XOR</b>), nenhuma reta resolveria.</p>
+  <div class="la-callout deep"><b class="t">Aprofundamento · um pouco de história</b><p>O perceptron de Rosenblatt (1958) era exatamente este neurônio com um degrau como ativação. Em 1969, Minsky e Papert mostraram que um neurônio isolado não resolve o XOR, e a área esfriou por anos. A saída, conhecida desde então, é empilhar neurônios em <b>camadas</b> e treinar todos juntos. Faltava um jeito eficiente de treinar, que só se popularizou nos anos 1980 com o backpropagation (seção 6).</p></div>
+  <p>Num LLM, a entrada de um neurônio é o vetor inteiro que representa um token. No GLM-5.3-Flash e no DeepSeek-V4-Flash esse vetor tem 4.096 números (<code>hidden_size</code>); no Qwen3.8-Flash-Next, 2.560. Um único neurônio da camada intermediária de um <span class="la-term" data-term="expert">expert</span> do GLM (uma das FFNs pequenas de uma camada <span class="la-term" data-term="mixture-of-experts">MoE</span>, <a data-ch="mixture-of-experts">capítulo 11</a>) tem, portanto, 4.096 pesos, e o expert tem 2.048 desses neurônios. Ninguém programa um por um: eles vêm empacotados numa matriz.</p>
+</section>
+
+<section class="la-sec">
+  <h2>A camada linear: uma matriz que entorta o espaço</h2>
+  <p>Ponha \(m\) neurônios lado a lado, todos olhando para a mesma entrada \(\mathbf x\). Cada um tem seu vetor de pesos. Empilhe esses vetores como <b>linhas</b> de uma matriz e você tem uma <span class="la-term" data-term="camada-linear">camada linear</span>:</p>
+  <div class="la-eq">
+    \[ \mathbf y = W\mathbf x + \mathbf b, \qquad W \in \mathbb R^{m\times n},\quad y_i = \sum_{j=1}^{n} W_{ij}\,x_j + b_i \]
+    <ul class="la-eq-legend">
+      <li>\(n\): largura da entrada (<i>in_features</i>); \(m\): largura da saída (<i>out_features</i>), ou seja, o número de neurônios</li>
+      <li>linha \(i\) de \(W\): os pesos do neurônio \(i\); coluna \(j\) de \(W\): para onde a entrada \(j\) “empurra” a saída</li>
+      <li>\(\mathbf b \in \mathbb R^m\): um viés por neurônio (muitos LLMs não usam)</li>
+      <li>custo: \(m\cdot n\) multiplicações e somas por token, ou \(2mn\) <abbr title="operações de ponto flutuante">FLOPs</abbr></li>
+    </ul>
+  </div>
+  <p>Os checkpoints guardam \(W\) nessa convenção <code>[out, in]</code>, a mesma do <code>nn.Linear</code> do PyTorch. Quando o inventário do GLM diz que o <code>gate_proj</code> de um expert tem forma <code>[2048, 4096]</code>, está dizendo: 2.048 neurônios, cada um com 4.096 pesos, 8,4 milhões de números.</p>
+  <h3>A geometria: o que uma matriz faz com o plano</h3>
+  <p>Uma matriz \(2\times 2\) transforma o plano de um jeito bem específico: a origem fica no lugar, retas continuam retas e linhas paralelas continuam paralelas e igualmente espaçadas. O truque para ler qualquer matriz é olhar suas <b>colunas</b>: a primeira coluna é para onde vai o vetor \(\hat{\mathbf e}_1 = (1,0)\), a segunda é para onde vai \(\hat{\mathbf e}_2 = (0,1)\). Todo o resto segue por linearidade. O viés \(\mathbf b\) desloca tudo em bloco (a transformação vira <b>afim</b>).</p>
+  <figure class="la-fig" id="fig-geometria" data-title="Uma matriz entorta o plano">
+    <div class="la-fig-stage" style="height:420px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Escolha uma matriz. A grade e a letra “F” se deformam continuamente da identidade até \(W\). As setas menta e lavanda são as colunas de \(W\), ou seja, as imagens de \(\hat{\mathbf e}_1\) e \(\hat{\mathbf e}_2\). O determinante é o fator de área: com \(\det W = 0\) (“achatar”) o plano inteiro cai numa reta. Ligue “ReLU depois” para ver a primeira não-linearidade dobrar o plano.</figcaption>
+  </figure>
+  <p>Três observações que vão voltar muitas vezes na trilha:</p>
+  <ol class="la-steps">
+    <li><b>O determinante mede o que se perde.</b> Com \(\det W = 0\) a matriz tem <i>posto</i> 1: duas dimensões entram, uma sai, e a informação da outra se perde de vez. Matrizes de posto baixo são uma forma deliberada de comprimir, e vão reaparecer no <span class="la-term" data-term="mla">MLA</span> (<a data-ch="mla">capítulo 12</a>) e nos gates de baixo posto do GLM e do Qwen.</li>
+    <li><b>Refletir inverte a letra.</b> O “F” espelhado mostra \(\det W &lt; 0\): a orientação do plano virou do avesso.</li>
+    <li><b>A ReLU dobra.</b> Depois da matriz, a ReLU zera as coordenadas negativas. Tudo o que estava fora do primeiro quadrante é esmagado contra os eixos. É a primeira operação da figura que <i>não</i> é linear.</li>
+  </ol>
+  <h3>Por que empilhar lineares não adianta</h3>
+  <p>Aplique duas camadas lineares em sequência: \(W_2(W_1\mathbf x + \mathbf b_1) + \mathbf b_2 = (W_2W_1)\,\mathbf x + (W_2\mathbf b_1 + \mathbf b_2)\). O resultado é <b>outra</b> transformação afim, com matriz \(W_2W_1\). Cem camadas lineares seguidas equivalem a uma só. A rede ficaria presa em transformações que mantêm retas retas, e nenhuma delas separa o XOR. É por isso que toda rede neural intercala as matrizes com funções não lineares.</p>
+  <div class="la-callout why"><b class="t">Por que isso importa para quem serve modelos</b><p>Quase todos os parâmetros de um LLM moram em camadas lineares. Servir o modelo é, em grande parte, ler essas matrizes da memória e multiplicá-las por vetores. Quantizar é guardar \(W\) com menos bits (<a data-ch="quantizacao-fundamentos">Parte IV</a>). <span class="la-term" data-term="tensor-parallel">Paralelismo de tensor</span> é cortar \(W\) por linhas ou colunas entre GPUs (<a data-ch="paralelismos">capítulo 38</a>). Cada otimização das receitas começa por entender que “camada” quer dizer “matriz”.</p></div>
+  <p>Um detalhe de contabilidade: uma camada linear tem \(m\cdot n\) pesos mais \(m\) vieses. Os decoders dos três modelos dispensam o viés nas projeções de atenção (<code>attention_bias: false</code> no GLM e no Qwen), o que economiza parâmetros e simplifica a quantização. As torres de visão (<span class="la-term" data-term="vit">ViT</span>, o Transformer que lê a imagem, <a data-ch="multimodal">capítulo 17</a>) ainda usam viés: as MLPs do ViT do Qwen, a MLP SwiGLU do ViT do GLM e o <span class="la-term" data-term="merger-visual">Aligner</span> do DeepSeek têm <code>bias</code>.</p>
+</section>
+
+<section class="la-sec">
+  <h2>Funções de ativação: o zoológico das dobras</h2>
+  <p>A função de ativação é o que dá à rede o poder de dobrar o espaço. Uma boa ativação precisa ser barata, ter derivada fácil de calcular (o treino depende dela, seção 6) e não <span class="la-term" data-term="saturacao-ativacao">saturar</span> demais: se a curva fica plana, a derivada vai a zero e o aprendizado para. Cada família resolve esse equilíbrio de um jeito, e as três receitas usam quase todas, cada uma num papel diferente.</p>
+  <figure class="la-fig" id="fig-ativacoes" data-title="Zoológico de ativações">
+    <div class="la-fig-stage" style="height:430px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Escolha uma função e arraste a sonda \(z\). A curva grossa é \(f(z)\) e a tracejada é \(f'(z)\) (ligue “derivada”). As outras funções ficam ao fundo para comparação. Cada pontinho é um valor de \(z\) que sobe do eixo até \(f(z)\) e depois desliza até o eixo vertical: é a função levando entradas a saídas. Sem mexer no slider, a sonda passeia sozinha (o slider mostra “auto”). O cartão mostra a fórmula e onde a função aparece nas receitas. Com GELU selecionada, “aproximação tanh” desenha a variante <code>gelu_pytorch_tanh</code> e a diferença máxima para a GELU exata, calculada na hora.</figcaption>
+  </figure>
+  <h3>As seis que você precisa conhecer</h3>
+  <dl class="la-kv">
+    <dt><span class="la-term" data-term="sigmoide">Sigmoide</span> \(\sigma(z) = \frac{1}{1+e^{-z}}\)</dt>
+    <dd>Esmaga qualquer número para \((0, 1)\). A derivada \(\sigma(1-\sigma)\) nunca passa de 0,25, então dezenas de sigmoides em série multiplicam o gradiente por números pequenos até ele sumir. Caiu em desuso como ativação de camadas escondidas, mas virou a função de <b>porta</b> por excelência: um número entre 0 e 1 é exatamente “quanto deixar passar”.</dd>
+    <dt><span class="la-term" data-term="tanh">tanh</span> \(\tanh(z) = 2\sigma(2z) - 1\)</dt>
+    <dd>Uma sigmoide esticada para \((-1, 1)\) e centrada no zero. Reinou nas redes recorrentes (LSTM). Hoje aparece como peça de outras funções: na aproximação rápida da GELU e no <span class="la-term" data-term="softcap-logits">softcap</span> de logits \(c\cdot\tanh(z/c)\).</dd>
+    <dt><span class="la-term" data-term="relu">ReLU</span> \(\max(0, z)\)</dt>
+    <dd>A mais barata: uma comparação. Derivada 1 para \(z&gt;0\) e 0 para \(z&lt;0\), sem saturação do lado positivo. Deixa muitos neurônios exatamente em zero (ativações esparsas). O risco é o <span class="la-term" data-term="neuronio-morto">neurônio morto</span>: se \(z\) fica negativo para todas as entradas, o gradiente é zero para sempre.</dd>
+    <dt><span class="la-term" data-term="softplus">Softplus</span> \(\ln(1+e^{z})\)</dt>
+    <dd>Uma ReLU suavizada: sempre positiva, com derivada \(\sigma(z)\). É a escolha quando você precisa de um número <b>estritamente positivo</b> que venha de uma conta livre, como uma taxa de decaimento.</dd>
+    <dt><span class="la-term" data-term="gelu">GELU</span> \(z\,\Phi(z)\)</dt>
+    <dd>\(\Phi\) é a distribuição acumulada da normal padrão. A GELU multiplica \(z\) pela probabilidade de uma normal ficar abaixo de \(z\), um “ReLU probabilístico” suave com um pequeno mergulho negativo (mínimo ≈ −0,17). Popularizada pelo BERT e pelo GPT-2. Existe uma aproximação com tanh, \(\tfrac{z}{2}\big(1+\tanh(\sqrt{2/\pi}\,(z + 0{,}044715\,z^3))\big)\), que no PyTorch se chama <code>gelu_pytorch_tanh</code>.</dd>
+    <dt><span class="la-term" data-term="silu">SiLU / Swish</span> \(z\,\sigma(z)\)</dt>
+    <dd>A entrada multiplicada pela própria sigmoide: o neurônio “se autoriza” a passar. Suave, não monótona (mínimo ≈ −0,278 em \(z\approx -1{,}278\)) e sem teto. É a ativação que os três LLMs declaram no <code>config.json</code> (<code>hidden_act: silu</code>), porque é a metade “porta” da SwiGLU (seção 5).</dd>
+  </dl>
+  <div class="la-callout info"><b class="t">Siglas das receitas que vão aparecer</b><p>A tabela abaixo, e o resto do capítulo, cita peças dos três modelos que só serão estudadas mais adiante. Aqui basta saber o que cada uma é. Passe o mouse sobre a sigla para ver a definição curta.</p>
+    <ul>
+      <li><b><span class="la-term" data-term="gdn">GDN</span> · <span class="la-term" data-term="kda">KDA</span></b>: atenção linear recorrente, que resume o passado num estado de tamanho fixo em vez de guardar cada token. O GDN (Gated DeltaNet) está em 36 camadas do Qwen, e o KDA em 34 camadas do GLM (<a data-ch="atencao-linear">cap. 14</a>).</li>
+      <li><b><span class="la-term" data-term="dsa">DSA</span> · <span class="la-term" data-term="qsa">QSA</span> · <span class="la-term" data-term="lightning-indexer">lightning indexer</span></b>: atenção esparsa. Um indexador barato dá nota aos tokens antigos e a atenção cara lê só os melhores: DSA no GLM, QSA no Qwen, indexador da <span class="la-term" data-term="csa-hca">CSA</span> no DeepSeek. <span class="la-term" data-term="swa">SWA</span> é a janela deslizante (<a data-ch="atencao-esparsa">cap. 13</a>).</li>
+      <li><b>MLA</b>: atenção em que K e V saem de um latente comprimido por token, usada pelo GLM e pelo DeepSeek (<a data-ch="mla">cap. 12</a>).</li>
+      <li><b>MoE</b>: a FFN vira centenas de experts, e um <span class="la-term" data-term="roteador">roteador</span> escolhe poucos por token. Existe ainda um <span class="la-term" data-term="shared-expert">expert compartilhado</span> que roda sempre (<a data-ch="mixture-of-experts">cap. 11</a>).</li>
+      <li><b><span class="la-term" data-term="mhc">mHC</span> · <span class="la-term" data-term="gated-residual">Gated Residual</span></b>: o fluxo residual (seção 9) alargado para 4 fluxos. O mHC está no GLM e no DeepSeek, e o Gated Residual (GR) no Qwen (<a data-ch="hiperconexoes">cap. 15</a>).</li>
+      <li><b><span class="la-term" data-term="ple">PLE</span></b>: a memória de <span class="la-term" data-term="ngram-embedding">N-gram embedding</span> do Qwen, uma tabela gigante consultada por hash de bigramas e trigramas (<a data-ch="ngram-mtp">cap. 16</a>).</li>
+      <li><b><span class="la-term" data-term="mtp">MTP</span> · <span class="la-term" data-term="dflash2">DFlash2</span> · <span class="la-term" data-term="dspark">DSpark</span></b>: <span class="la-term" data-term="rascunhador">rascunhadores</span> da <span class="la-term" data-term="decodificacao-especulativa">decodificação especulativa</span>, redes pequenas que propõem vários tokens para o modelo grande conferir de uma vez (<a data-ch="especulacao-fundamentos">cap. 35</a>).</li>
+      <li><b>ViT · <span class="la-term" data-term="merger-visual">merger/Aligner</span></b>: a torre de visão e o tradutor que leva os vetores dela para a largura do LLM (<a data-ch="multimodal">cap. 17</a>).</li>
+      <li><b><span class="la-term" data-term="fp32">FP32</span> · <span class="la-term" data-term="bf16">BF16</span> · <span class="la-term" data-term="fp16">FP16</span> · <span class="la-term" data-term="fp8-e4m3">FP8</span></b>: formatos de número com 32, 16, 16 e 8 bits. Menos bits ocupam menos memória, mas representam os valores com menos precisão (<a data-ch="numeros-no-computador">cap. 4</a> e <a data-ch="fp8-fp4-microescala">cap. 21</a>).</li>
+    </ul></div>
+  <div class="la-table-wrap"><table class="la-params">
+    <thead><tr><th>Ativação</th><th>Onde aparece</th><th>Receita</th><th>Por que ela, ali</th></tr></thead>
+    <tbody>
+      <tr><td>SiLU</td><td>Todas as FFNs e experts (SwiGLU); conv curta causal + SiLU em q, k, v do KDA (GLM) e do GDN (Qwen); dentro do gate de leitura do Gated Residual e da conv do PLE (Qwen); MLP SwiGLU do ViT do DeepSeek; MLP SwiGLU (com viés) do ViT do GLM e o merger SwiGLU 4096 → 10240 → 4096 do GLM, com <code>swiglu_limit</code> 10</td><td><span class="la-rb all"></span></td><td>Suave e sem teto: preserva magnitude e dá gradientes bem-comportados. <code>hidden_act</code> precisa ser <code>silu</code>: o código do vLLM usado pelo GLM e pelo DeepSeek recusa outra ativação</td></tr>
+      <tr><td>Sigmoide</td><td>Portas: saída do GDN e da atenção, leitura e escrita do Gated Residual, gate do PLE e do expert compartilhado (Qwen); \(\beta\) e gate de saída do KDA, roteador, pesos <code>pre</code>/<code>post</code> do mHC (GLM); mHC, <code>hc_head</code> e cabeça de confiança do DSpark (DeepSeek)</td><td><span class="la-rb all"></span></td><td>Limitada a \((0,1)\): diz “quanto passa” e nunca amplifica. <code>post = 2·σ(·)</code> estende o intervalo para \((0,2)\)</td></tr>
+      <tr><td>Softplus</td><td>Decaimento do GDN: \(\alpha_t = \exp(-e^{A_{\log}}\,\mathrm{softplus}(W_a\mathbf x + \texttt{dt\_bias}))\) (Qwen); score do roteador \(\sqrt{\mathrm{softplus}(\cdot)}\), o <span class="la-term" data-term="sqrtsoftplus">sqrtsoftplus</span> (DeepSeek)</td><td><span class="la-rb qwen"></span> <span class="la-rb ds"></span></td><td>Garante uma taxa positiva, logo \(\alpha_t \in (0,1)\). O GLM trocou esse caminho ilimitado por \(-5\cdot\sigma(\cdot)\), o <span class="la-term" data-term="safe-gate">“safe gate”</span> (<code>gate_lower_bound: -5.0</code>)</td></tr>
+      <tr><td>ReLU</td><td>Scores dos indexadores esparsos: \(I = \sum_h w_h\,\mathrm{ReLU}(\mathbf q_h\cdot\mathbf k)\) na DSA do GLM e no lightning indexer do DeepSeek; \(I_{ib} = \sum_h \mathrm{ReLU}(\mathbf q_i^h\cdot\bar{\mathbf k}_b)\) na QSA do Qwen, sobre a chave média \(\bar{\mathbf k}_b\) de cada bloco de 4 tokens e sem peso \(w_h\) por cabeça (<a data-ch="atencao-esparsa">cap. 13</a>)</td><td><span class="la-rb all"></span></td><td>Barata e robusta em FP8/FP4: afinidades negativas viram 0 e só evidência positiva soma no ranking</td></tr>
+      <tr><td>GELU</td><td>MLP do ViT do Qwen (<code>hidden_act: gelu_pytorch_tanh</code>); merger do Qwen (LayerNorm → fc1 → GELU → fc2; o config só declara a ativação do ViT, então confira no código qual GELU o merger usa); Aligner do DeepSeek (<code>F.gelu</code>, exata)</td><td><span class="la-rb qwen"></span> <span class="la-rb ds"></span></td><td>Herança das torres de visão (família SigLIP/ViT). Exata ou tanh precisa bater com o treino</td></tr>
+      <tr><td>tanh</td><td>Dentro da GELU aproximada do ViT do Qwen (daí o selo Qwen); softcap de logits: suportado pelo código do DFlash2 do GLM, mas desligado (<code>final_logit_softcapping</code> ausente → 0)</td><td><span class="la-rb qwen"></span> <span class="la-rb glm"></span></td><td>Teto suave e simétrico</td></tr>
+    </tbody>
+  </table></div>
+  <div class="la-callout warn"><b class="t">Armadilha · a ativação é parte do checkpoint</b><p>Os pesos foram treinados <i>junto</i> com uma ativação específica. Trocar GELU exata por GELU-tanh muda cada saída em até ~5×10⁻⁴ (a figura calcula). Parece pouco, mas o erro se repete em cada neurônio de cada camada e se acumula. Esse é o tipo de desvio que não quebra nada visivelmente e só aparece quando você mede a divergência entre as distribuições (<span class="la-term" data-term="kld">KLD</span>, <a data-ch="medindo-qualidade">capítulo 25</a>). Ao portar um modelo, copie <code>hidden_act</code> e as variantes exatas.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>MLP: empilhando dobras até caber qualquer função</h2>
+  <p>Uma <span class="la-term" data-term="mlp">MLP</span> (<i>multilayer perceptron</i>) alterna matrizes e ativações. A versão com uma camada escondida já é poderosa:</p>
+  <div class="la-eq">
+    \[ \mathbf y = W_2\, f(W_1\mathbf x + \mathbf b_1) + \mathbf b_2 \]
+    <ul class="la-eq-legend">
+      <li>\(W_1 \in \mathbb R^{h\times n}\): a camada escondida, com \(h\) neurônios (a <b>largura</b>)</li>
+      <li>\(f\): a ativação, aplicada elemento a elemento</li>
+      <li>\(W_2 \in \mathbb R^{m\times h}\): a camada de saída, que <b>combina</b> as respostas dos \(h\) neurônios</li>
+    </ul>
+  </div>
+  <p>O <span class="la-term" data-term="aproximacao-universal">teorema da aproximação universal</span> (Cybenko, 1989, para sigmoides; Hornik, 1991; Leshno e colegas, 1993, para qualquer ativação não polinomial) garante que uma MLP assim, com neurônios suficientes, aproxima qualquer função contínua num domínio limitado com a precisão que você quiser. A intuição é construtiva e cabe numa figura. Cada neurônio ReLU \(\mathrm{ReLU}(x - k_i)\) é uma <b>dobradiça</b>: zero até \(k_i\) e uma rampa depois. Somando dobradiças com inclinações escolhidas, dá para desenhar qualquer poligonal:</p>
+  <div class="la-eq">
+    \[ g(x) = f(k_0) + \sum_{i=0}^{N-1} c_i\,\mathrm{ReLU}(x - k_i), \qquad c_i = s_i - s_{i-1} \]
+    <ul class="la-eq-legend">
+      <li>\(k_i\): os pontos de dobra (aqui, igualmente espaçados)</li>
+      <li>\(s_i\): a inclinação desejada no trecho \(i\) (com \(s_{-1} = 0\)); \(c_i\) é quanto a inclinação muda na dobra \(i\), o peso de saída do neurônio \(i\)</li>
+    </ul>
+  </div>
+  <figure class="la-fig" id="fig-aproximacao" data-title="Somando dobradiças">
+    <div class="la-fig-stage" style="height:390px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>A curva tracejada é o alvo e a grossa é a soma de \(N\) neurônios. Embaixo, cada neurônio aparece como uma curva fina (dobradiças para ReLU, degraus para sigmoide). Aumente \(N\) e veja o erro máximo cair. Clique em “▶ montar” para adicionar neurônios um a um. A contagem de parâmetros é \(3N+1\): peso e viés de cada neurônio escondido, um peso de saída por neurônio e um viés de saída.</figcaption>
+  </figure>
+  <p>Com sigmoides o raciocínio é parecido: uma sigmoide bem íngreme é um degrau, e uma soma de degraus desenha uma escada que se ajusta à curva. Repare que, para o mesmo \(N\), as dobradiças ganham, porque interpolam com retas em vez de patamares.</p>
+  <div class="la-callout deep"><b class="t">Aprofundamento · o que o teorema não diz</b><p>O teorema garante que os pesos <i>existem</i>. Ele não diz como achá-los nem quantos neurônios são necessários, e para funções complicadas a largura necessária pode crescer exponencialmente com a dimensão. Na prática, <b>profundidade</b> é mais econômica: cada camada dobra o resultado das dobras anteriores, e o número de regiões lineares de uma rede ReLU pode crescer exponencialmente com o número de camadas (Montúfar e colegas, 2014). É por isso que LLMs têm dezenas de camadas, e não uma camada escondida gigantesca.</p></div>
+  <p>Toda FFN de um Transformer é uma MLP. Uma leitura útil (Geva e colegas, 2021) é tratá-la como uma <b>memória chave-valor</b>: cada linha de \(W_1\) é uma “chave” que detecta um padrão no vetor do token, a ativação decide se o padrão está presente, e a coluna correspondente de \(W_2\) é o “valor” que o neurônio escreve de volta. Nas receitas há MLPs clássicas, de duas matrizes com viés, nas torres de visão: o Aligner do DeepSeek-V4-Flash-Vision-Exp é \(9216 \to 4096 \to 4096\) com GELU, e a MLP de cada bloco do ViT do Qwen é \(1152 \to 4304 \to 1152\) com GELU-tanh. No decoder, as FFNs usam uma variante com porta, a SwiGLU, que é o assunto da próxima seção.</p>
+</section>
+
+<section class="la-sec">
+  <h2>Portas multiplicativas: quanto deixar passar</h2>
+  <p>Até aqui os neurônios só <b>somam</b> sinais. Uma porta (<span class="la-term" data-term="gating">gating</span>) introduz uma <b>multiplicação</b> entre sinais: um ramo calcula o conteúdo \(\mathbf u\), outro calcula uma abertura \(\mathbf g\) entre 0 e 1, e a saída é o produto elemento a elemento.</p>
+  <div class="la-eq">
+    \[ \mathbf y = \sigma(W_g\mathbf x) \odot (W_u\mathbf x) \]
+    <ul class="la-eq-legend">
+      <li>\(W_u\mathbf x\): o conteúdo, “o que eu quero dizer”</li>
+      <li>\(\sigma(W_g\mathbf x) \in (0,1)^m\): a abertura de cada torneira, calculada <b>a partir do próprio dado</b></li>
+      <li>\(\odot\): produto elemento a elemento (Hadamard). A coordenada \(i\) da saída é \(g_i\cdot u_i\)</li>
+    </ul>
+  </div>
+  <div class="la-callout analogy"><b class="t">Analogia · a mesa de som</b><p>Pense numa mesa de som com um fader por canal. O ramo \(\mathbf u\) é a música de cada canal; o ramo \(\mathbf g\) é a posição dos faders. A diferença para uma mesa comum é que aqui quem mexe nos faders é a própria música: cada token escolhe, para si, quais canais sobem e quais descem.</p></div>
+  <p>Por que multiplicar, e não só somar? Há quatro razões, e todas aparecem nas receitas:</p>
+  <ol class="la-steps">
+    <li><b>Decisão dependente do dado.</b> A mesma camada deixa passar coisas diferentes para tokens diferentes, sem precisar de pesos diferentes.</li>
+    <li><b>Magnitude sob controle.</b> Com \(\sigma\in(0,1)\) a saída nunca é maior que o conteúdo. Uma porta nunca amplifica, e isso ajuda a estabilidade numérica.</li>
+    <li><b>Interações de segunda ordem.</b> O produto de duas funções lineares de \(\mathbf x\) é quadrático em \(\mathbf x\). Uma camada com porta representa, com poucos parâmetros, relações do tipo “A <i>e</i> B”.</li>
+    <li><b>Caminhos para o gradiente.</b> Quando a porta está aberta, o sinal (e o gradiente) atravessa quase intacto. Essa é a ideia da LSTM (1997) e das <i>highway networks</i> (2015), e é parente próxima da conexão residual (seção 9).</li>
+  </ol>
+  <figure class="la-fig" id="fig-portas" data-title="A torneira: gating multiplicativo">
+    <div class="la-fig-stage" style="height:420px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Um vetor de 8 dimensões entra no topo e se divide em conteúdo \(\mathbf u = W_u\mathbf x\) e porta \(\mathbf g\). Cada torneira abre conforme o valor da porta, e as partículas que chegam à saída \(\mathbf y = \mathbf g\odot\mathbf u\) ficam mais fortes ou mais fracas. Troque o token para ver que a porta depende do dado. Troque o tipo (GLU, SwiGLU, GeGLU) e desloque o viés da porta para fechá-la ou abri-la. Valores ilustrativos.</figcaption>
+  </figure>
+  <h3>A família GLU, e por que a SwiGLU venceu</h3>
+  <p>Dauphin e colegas (2017) chamaram \(\sigma(W_g\mathbf x)\odot W_u\mathbf x\) de <span class="la-term" data-term="glu">GLU</span> (<i>gated linear unit</i>). Shazeer (2020) testou trocar a sigmoide da porta por outras ativações dentro da FFN do Transformer: com GELU virou <b>GeGLU</b>, com SiLU virou <b>SwiGLU</b>, e ambas melhoraram a qualidade em relação à FFN com ReLU. A FFN passa a ter três matrizes: <code>gate_proj</code> (\(W_g\)), <code>up_proj</code> (\(W_u\)) e <code>down_proj</code>, que volta à largura do modelo:</p>
+  <div class="la-eq">
+    \[ \mathrm{FFN}_{\text{SwiGLU}}(\mathbf x) = W_{\text{down}}\big(\mathrm{SiLU}(W_{\text{gate}}\mathbf x)\odot W_{\text{up}}\mathbf x\big) \]
+    <ul class="la-eq-legend">
+      <li>\(\mathrm{SiLU}(z) = z\,\sigma(z)\): o ramo da porta. Como não é limitado a \((0,1)\), a SwiGLU não é uma torneira pura, mas uma interação multiplicativa suave: \(z_g\,\sigma(z_g)\,z_u\)</li>
+      <li>é a <span class="la-term" data-term="swiglu">SwiGLU</span> de todas as FFNs, experts e expert compartilhado dos três modelos</li>
+    </ul>
+  </div>
+  <p>Como o produto \(z_g\cdot z_u\) não tem teto, o GLM e o DeepSeek ainda limitam os dois ramos antes de multiplicar (<code>swiglu_limit: 10.0</code>). Esse <i>clamp</i> e a contagem de parâmetros da SwiGLU são detalhados no <a data-ch="bloco-transformer">capítulo 7</a>.</p>
+  <h3>O Qwen3.8 é um modelo de portas</h3>
+  <p>No Qwen3.8-Flash-Next a porta é um tema de arquitetura, não um detalhe. O tech report atribui a ela boa parte da estabilidade de treino. Estas são as portas que um token encontra ao atravessar o modelo. Nem todas estão em todas as camadas: a primeira linha de cada cartão diz onde ela mora (a figura da seção 10 desenha o percurso inteiro).</p>
+  <div class="la-cards">
+    <div class="la-card"><span class="ic">🚰</span><h4>Saída do GDN</h4><p><i>36 camadas GDN.</i> \(W_o[\sigma(W_z\mathbf x)\odot\mathrm{RMSNorm}(\mathbf y)]\), com <code>in_proj_z</code> <code>[6144, 2560]</code>. O config diz <code>output_gate_type: sigmoid</code>: segundo o tech report, a sigmoide supera a SiLU que o Gated DeltaNet original usava (<a data-ch="atencao-linear">cap. 14</a>).</p></div>
+    <div class="la-card"><span class="ic">🎯</span><h4>Saída da atenção</h4><p><i>12 camadas QSA (índices 3, 7, …, 47).</i> O <code>q_proj</code> tem <code>[12288, 2560]</code> = 24 cabeças × 256 × 2: metade é a query, metade é uma porta sigmoide por cabeça e por dimensão, aplicada antes do <code>o_proj</code> (<a data-ch="atencao">cap. 6</a>).</p></div>
+    <div class="la-card"><span class="ic">🧑‍🔧</span><h4>Expert compartilhado</h4><p><i>Todas as 48 camadas (MoE).</i> \(\sigma(\mathbf g\cdot\mathbf x)\cdot\mathrm{Shared}(\mathbf x)\), com <code>shared_expert_gate</code> <code>[1, 2560]</code>: um único número por token decide quanto do <span class="la-term" data-term="shared-expert-gate">expert compartilhado</span> entra (<a data-ch="mixture-of-experts">cap. 11</a>).</p></div>
+    <div class="la-card"><span class="ic">🔤</span><h4>Gate do N-gram</h4><p><i>Só na camada de índice 1 (a 2ª, contando do zero), antes da leitura do GR.</i> O vetor recuperado da tabela de n-gramas entra em cada ramo com \(g_i = \sigma(\mathrm{sign}(z_i)\sqrt{|z_i|})\), onde \(z_i\) compara uma chave com o estado do ramo (<a data-ch="ngram-mtp">cap. 16</a>).</p></div>
+    <div class="la-card"><span class="ic">🛣️</span><h4>Gated Residual</h4><p><i>Toda camada, duas vezes: lê antes do mixer e antes do MoE, e escreve depois de cada um.</i> Leitura: \(G = \sigma(W_{\text{up}}\,\mathrm{SiLU}(W_{\text{down}}\cdot))\), com posto 320, um gate por elemento dos 4 × 2560. Escrita: \(\mathbf s = 2\sigma(\cdot) \in (0,2)^4\), um escalar por ramo (<a data-ch="hiperconexoes">cap. 15</a>).</p></div>
+  </div>
+  <p>Os outros dois modelos também usam portas, só que em menos lugares. No GLM, o KDA termina com \(\mathrm{RMSNorm}(\mathbf o)\odot\sigma(g_b(g_a(\mathbf x)))\), uma porta de baixo posto (128), e o \(\beta\) da regra delta é uma sigmoide. O mHC do GLM e do DeepSeek lê os 4 fluxos residuais com pesos \(\sigma(\cdot)\) e escreve com \(2\sigma(\cdot)\).</p>
+  <div class="la-callout why"><b class="t">Por que isso importa na inferência</b><p>No checkpoint FP8-denso do Qwen, os 591 tensores convertidos para FP8 tiveram RMSE relativo entre 0,0240 e 0,0268 (mediana 0,0262). O pior caso foram os <code>block_inject_weight</code> da escrita do Gated Residual, só um pouco acima da mediana, e o impacto disso em GPU não foi medido. Ou seja, esses números <b>não</b> mostram que as portas sejam especialmente frágeis. Mesmo assim, a receita mantém em BF16 o roteador, o <code>shared_expert_gate</code>, as projeções <code>in_proj_a/b</code> do GDN e as normas. São tensores pequenos, então quantizá-los economizaria quase nada, e a saída deles multiplica ou escolhe caminhos inteiros. <i>Interpretação</i> (é a prática da receita, não um resultado medido): quantize as matrizes grandes e proteja as portas pequenas.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>O grafo computacional e a regra da cadeia</h2>
+  <p>Treinar é ajustar os pesos para diminuir uma perda \(L\) (<a data-ch="aprender-com-dados">capítulo 1</a>). Para isso precisamos do gradiente: quanto \(L\) muda quando cada peso muda um pouquinho. Com bilhões de pesos, calcular isso peso a peso seria impossível. O que torna o treino viável é olhar a rede como um <span class="la-term" data-term="grafo-computacional">grafo computacional</span>: um encadeamento de operações simples (multiplicar, somar, ativar), em que cada nó sabe calcular a própria derivada local.</p>
+  <p>A <span class="la-term" data-term="regra-da-cadeia">regra da cadeia</span> diz como juntar as derivadas locais: se \(L\) depende de \(a\), que depende de \(z\), que depende de \(w\), então</p>
+  <div class="la-eq">
+    \[ \frac{\partial L}{\partial w} = \frac{\partial L}{\partial a}\cdot\frac{\partial a}{\partial z}\cdot\frac{\partial z}{\partial w} \]
+    <ul class="la-eq-legend">
+      <li>cada fator é uma derivada <b>local</b>, calculada por um único nó do grafo</li>
+      <li>quando uma variável alimenta vários caminhos, as contribuições de cada caminho se <b>somam</b></li>
+    </ul>
+  </div>
+  <p>A figura percorre um neurônio sigmoide com perda quadrática, \(L = \tfrac12(\sigma(wx+b) - y)^2\), com \(x = 1{,}5\), \(w = 0{,}8\), \(b = -0{,}5\) e alvo \(y = 1\). Na ida (<i>forward</i>), os valores fluem da esquerda para a direita. Na volta (<i>backward</i>), os gradientes fluem da perda para os pesos, e cada nó multiplica o que recebe pela sua derivada local.</p>
+  <figure class="la-fig" id="fig-backprop" data-title="O grafo e o caminho de volta">
+    <div class="la-fig-stage" style="height:380px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Avance os passos. Em menta, os valores da ida; em rosa, os gradientes da volta, com a derivada local de cada nó escrita na aresta. No último passo, o peso dá um passo de descida do gradiente e a perda cai. Mexa nos sliders para recalcular tudo. A linha “diferença finita” confere o gradiente analítico com \(\frac{L(w+h)-L(w-h)}{2h}\).</figcaption>
+  </figure>
+  <p>Com os valores padrão: \(z = 0{,}7\), \(a = \sigma(0{,}7) \approx 0{,}6682\) e \(L \approx 0{,}0550\). Voltando: \(\partial L/\partial a = a - y \approx -0{,}3318\); a sigmoide contribui \(a(1-a) \approx 0{,}2217\), então \(\partial L/\partial z \approx -0{,}0736\); e como \(z = wx + b\), \(\partial L/\partial w = x\cdot\partial L/\partial z \approx -0{,}1104\) e \(\partial L/\partial b \approx -0{,}0736\). Gradiente negativo quer dizer “aumente \(w\)”. Com passo \(\eta = 1\), \(w\) vai a 0,910, \(b\) a −0,426, e a perda cai para ≈ 0,0395.</p>
+  <h3>Backpropagation em matrizes</h3>
+  <p>Numa rede de verdade, cada nó é uma camada inteira e as derivadas locais são matrizes, os <span class="la-term" data-term="jacobiano">jacobianos</span>. Para uma camada \(\mathbf z = W\mathbf a_{\text{prev}} + \mathbf b\), \(\mathbf a = f(\mathbf z)\), o <span class="la-term" data-term="backpropagation">backpropagation</span> faz três contas:</p>
+  <div class="la-eq">
+    \[ \boldsymbol\delta = f'(\mathbf z)\odot\frac{\partial L}{\partial\mathbf a}, \qquad \frac{\partial L}{\partial W} = \boldsymbol\delta\,\mathbf a_{\text{prev}}^{\top}, \qquad \frac{\partial L}{\partial \mathbf a_{\text{prev}}} = W^{\top}\boldsymbol\delta \]
+    <ul class="la-eq-legend">
+      <li>\(\boldsymbol\delta\): o gradiente na pré-ativação, o “sinal de erro” da camada</li>
+      <li>\(\boldsymbol\delta\,\mathbf a_{\text{prev}}^{\top}\): produto externo; cada peso \(W_{ij}\) recebe “erro do neurônio \(i\)” × “entrada \(j\)”</li>
+      <li>\(W^\top\boldsymbol\delta\): o erro devolvido à camada anterior, pela <b>transposta</b> da mesma matriz</li>
+    </ul>
+  </div>
+  <p>Veja as três contas acontecendo numa camada pequena, com 3 neurônios e 4 entradas (\(W\) é \(3\times4\)). A primeira é elemento a elemento. A segunda, o <b>produto externo</b>, transforma uma coluna de 3 números e uma linha de 4 numa matriz \(3\times4\), do mesmo tamanho de \(W\), porque cada peso precisa do seu próprio gradiente. A terceira gira \(W\) (a transposta troca linhas por colunas) e a multiplica por \(\boldsymbol\delta\).</p>
+  <figure class="la-fig" id="fig-backprop-matriz" data-title="Backprop de uma camada, em matrizes">
+    <div class="la-fig-stage" style="height:360px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Avance os passos. (1) \(\boldsymbol\delta = f'(\mathbf z)\odot\partial L/\partial\mathbf a\), linha a linha. (2) \(\partial L/\partial W = \boldsymbol\delta\,\mathbf a_{\text{prev}}^\top\): cada célula \((i,j)\) é \(\delta_i\cdot a_j\) e a matriz se preenche célula a célula. (3) \(W\) gira até virar \(W^\top\), e cada linha de \(W^\top\) faz um produto escalar com \(\boldsymbol\delta\). Troque para ReLU e veja que um neurônio com \(z &lt; 0\) zera o próprio \(\delta_i\) e, com ele, uma linha inteira de \(\partial L/\partial W\). Os números são ilustrativos; “↻ sortear” gera outros.</figcaption>
+  </figure>
+  <p>Com um lote de tokens, as colunas \(\boldsymbol\delta\) e \(\mathbf a_{\text{prev}}\) viram matrizes (uma coluna por token), e as contas (2) e (3) viram multiplicações de matrizes comuns. O backward custa, portanto, cerca do dobro da ida: duas multiplicações do tamanho de \(W\) para cada uma do forward.</p>
+  <p>O backprop é um caso de <span class="la-term" data-term="diferenciacao-automatica">diferenciação automática</span> em modo reverso: uma única volta, que custa da ordem de duas idas, entrega o gradiente em relação a <b>todos</b> os parâmetros de uma vez. A alternativa ingênua, a <span class="la-term" data-term="diferenca-finita">diferença finita</span>, precisaria de pelo menos uma ida extra por parâmetro. Para os 321.323.031.390 parâmetros do GLM-5.3-Flash, seriam 321 bilhões de passadas para um único passo de treino.</p>
+  <div class="la-callout why"><b class="t">Por que isso importa, se as receitas só fazem inferência</b><p>Três razões. <b>(1) Memória:</b> o backward precisa das ativações de cada camada guardadas desde a ida; por isso treinar custa muito mais memória que inferir. Na inferência, motores como o vLLM rodam só o forward, com o autograd desligado, e cada camada descarta sua entrada assim que produz a saída. O que persiste entre tokens é o KV cache ou o estado recorrente (<a data-ch="prefill-decode-kv">capítulo 10</a>). <b>(2) Ferramentas de quantização</b> usam informação derivada do treino, como aproximações do hessiano da perda (<a data-ch="hadamard-trelica-exl3">capítulo 22</a>), e o treino com quantização simulada (<span class="la-term" data-term="qat">QAT</span>) ensina o modelo a tolerar o erro: é o caso do KV em FP8 do DeepSeek-V4 (<a data-ch="kv-cache-quantizado">capítulo 23</a>). <b>(3) Tudo o que o gradiente moldou</b> (ativação, ε, portas, escalas) precisa ser reproduzido fielmente na inferência, senão o modelo servido é outro.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Profundidade, largura e a conta dos parâmetros</h2>
+  <p>A <span class="la-term" data-term="largura">largura</span> de uma rede é o número de neurônios por camada, e a <span class="la-term" data-term="profundidade">profundidade</span> é o número de camadas. Uma MLP com larguras \(n_0 \to n_1 \to \dots \to n_L\) tem</p>
+  <div class="la-eq">
+    \[ P = \sum_{\ell=1}^{L} \big(n_{\ell-1}\,n_\ell + n_\ell\big) \]
+    <ul class="la-eq-legend">
+      <li>\(n_{\ell-1}n_\ell\): os pesos da matriz da camada \(\ell\)</li>
+      <li>\(n_\ell\): os vieses (some zero se a camada não tem viés)</li>
+    </ul>
+  </div>
+  <p>Faça a conta para o Aligner do DeepSeek, uma MLP \(9216 \to 4096 \to 4096\) com viés: \(9216\cdot4096 + 4096 + 4096\cdot4096 + 4096 = 54.534.144\) parâmetros, os “≈ 54,5 M” do inventário. A MLP de um bloco do ViT do Qwen (\(1152\to4304\to1152\), com viés) dá 9.921.872, e os 27 blocos somam 267.890.544 só de MLP. Na SwiGLU sem viés são três matrizes, \(3\,d\,d_{ff}\): um expert do GLM ou do DeepSeek (\(4096\to2048\)) tem 25.165.824 parâmetros, um expert do Qwen (\(2560\to640\)) tem 4.915.200, e a FFN densa das camadas 0–2 do GLM (\(4096\to12288\)) tem 150.994.944.</p>
+  <p>Agora é hora de treinar uma rede de verdade. A figura abaixo roda uma MLP pequena no seu navegador, com forward, backprop e descida do gradiente (Adam) a cada quadro. A tarefa é separar pontos em duas classes no plano.</p>
+  <figure class="la-fig" id="fig-playground" data-title="Laboratório: uma MLP treinando ao vivo">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>O fundo é a probabilidade prevista pela rede em cada ponto do plano (menta = classe A, rosa = classe B). Ao lado (embaixo, no celular), a rede: arestas coloridas pelo sinal do peso e com espessura pelo módulo; embaixo, a curva de perda. Mude largura, profundidade, ativação e conjunto de dados, e clique em “↺ reiniciar”. Com ativação “linear” a espiral é impossível, por mais camadas que você ponha: é a seção 2 acontecendo na sua frente.</figcaption>
+  </figure>
+  <p>Algumas experiências valem a pena. Na espiral, uma camada estreita (2 neurônios) não dá conta; 8 neurônios em 2 camadas costumam resolver. Com tanh a fronteira fica suave; com ReLU, poligonal, feita de pedaços de reta, como na seção 4. Aumentar a profundidade aumenta as dobras possíveis, mas também deixa o treino mais delicado. Guarde essa tensão para a seção 9.</p>
+  <h3>O que profundidade e largura custam na inferência</h3>
+  <div class="la-compare">
+    <div><h4>Largura</h4><p>Mais neurônios por camada significa matrizes maiores. Numa GPU isso é paralelo e eficiente, mas no <span class="la-term" data-term="decode">decode</span> cada peso precisa ser lido da memória para cada passo. Os três modelos são estreitos para o tamanho que têm (<code>hidden_size</code> 4096, 2560 e 4096) e escondem a capacidade nos experts: o Qwen tem só 2.560 de largura para 125 B de parâmetros.</p></div>
+    <div><h4>Profundidade</h4><p>Camadas são sequenciais: a camada \(\ell+1\) espera a \(\ell\) terminar, então a profundidade entra direto na latência de cada token (45 camadas no GLM, 48 no Qwen, 43 no DeepSeek). Com paralelismo de tensor, cada camada ainda paga comunicações entre GPUs, então profundidade também multiplica a latência de rede (<a data-ch="paralelismos">capítulo 38</a>).</p></div>
+  </div>
+</section>
+
+<section class="la-sec">
+  <h2>Normalização: LayerNorm e RMSNorm</h2>
+  <p>Numa rede profunda, a escala dos números muda de camada para camada e de token para token. Uma camada que recebe entradas com magnitude 0,01 num token e 100 no seguinte tem de servir aos dois ao mesmo tempo, e o treino fica instável. A normalização resolve isso reescalando o vetor de cada token para uma magnitude padrão antes de entregá-lo à próxima camada. As duas versões que importam são estas:</p>
+  <div class="la-eq">
+    \[ \mathrm{LayerNorm}(\mathbf x) = \boldsymbol\gamma\odot\frac{\mathbf x - \mu}{\sqrt{\sigma^2 + \varepsilon}} + \boldsymbol\beta \qquad\qquad \mathrm{RMSNorm}(\mathbf x) = \boldsymbol\gamma\odot\frac{\mathbf x}{\sqrt{\tfrac1d\sum_i x_i^2 + \varepsilon}} \]
+    <ul class="la-eq-legend">
+      <li>\(\mathbf x\in\mathbb R^d\): o vetor de <b>um</b> token (a normalização é feita ao longo das features, token a token)</li>
+      <li>\(\mu = \tfrac1d\sum_i x_i\), \(\sigma^2 = \tfrac1d\sum_i (x_i-\mu)^2\): média e variância do vetor</li>
+      <li>\(\boldsymbol\gamma\) (ganho) e \(\boldsymbol\beta\) (viés): vetores aprendidos de tamanho \(d\), que devolvem à rede a liberdade de escolher a escala de cada feature</li>
+      <li>\(\varepsilon\): a <span class="la-term" data-term="epsilon-da-norma">épsilon</span>, um número pequeno que evita dividir por zero (no config: <code>rms_norm_eps</code>)</li>
+    </ul>
+  </div>
+  <p>A <span class="la-term" data-term="layernorm">LayerNorm</span> (Ba, Kiros e Hinton, 2016) centra e reescala. A <span class="la-term" data-term="rmsnorm">RMSNorm</span> (Zhang e Sennrich, 2019) pula a centragem e o viés e divide só pela raiz da média dos quadrados. É mais barata (uma redução em vez de duas) e, na prática, funciona tão bem quanto. Os decoders dos três modelos usam RMSNorm; as torres de visão variam (o ViT do Qwen usa LayerNorm com viés; os do GLM e do DeepSeek usam RMSNorm).</p>
+  <p>A propriedade central é a <span class="la-term" data-term="invariancia-de-escala">invariância de escala</span>: para qualquer \(\alpha &gt; 0\), \(\mathrm{RMSNorm}(\alpha\mathbf x) = \mathrm{RMSNorm}(\mathbf x)\), desde que \(\varepsilon\) seja desprezível perto de \(\mathrm{RMS}(\mathbf x)^2\). Não importa se a camada anterior entregou um vetor enorme ou minúsculo: a próxima recebe sempre algo com RMS ≈ 1 (vezes \(\boldsymbol\gamma\)).</p>
+  <figure class="la-fig" id="fig-normas" data-title="LayerNorm, RMSNorm e o papel do ε">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Um vetor de 16 dimensões (em cima) é normalizado passo a passo até a saída (embaixo). Mude a <b>escala da entrada</b> de 10⁻⁴ a 10³: a saída não se mexe, até que \(\mathrm{RMS}^2\) fique perto de ε e a saída deixe de chegar a RMS 1. Troque o tipo: LayerNorm centra antes; “RMSNorm (1+w)” guarda o ganho como desvio de 1, como no Qwen; “agrupada” normaliza cada grupo de 4 separadamente, como os 4 ramos de 2560 do Qwen. Ligue o outlier para ver uma dimensão gigante achatar as outras.</figcaption>
+  </figure>
+  <h3>O ε não é um detalhe</h3>
+  <p>O ε é somado à <b>média dos quadrados</b>, então ele passa a dominar quando \(\mathrm{RMS}(\mathbf x) \lesssim \sqrt\varepsilon\). Com \(\varepsilon = 10^{-5}\) isso acontece abaixo de RMS ≈ 0,0032; com \(10^{-6}\), abaixo de 0,001; com \(10^{-20}\), só abaixo de \(10^{-10}\). Nessa região a saída deixa de ir a RMS 1 e fica \(\approx \mathbf x/\sqrt\varepsilon\), proporcional à entrada: a norma para de amplificar ruído minúsculo até a escala padrão. Com RMS de entrada \(10^{-4}\) e \(\varepsilon = 10^{-5}\), a saída tem RMS ≈ 0,0316 em vez de 1 (ainda maior que a entrada, só que longe de 1). Um valor de ε diferente do usado no treino muda a saída justamente nos tokens de vetor pequeno, e de forma sistemática.</p>
+  <div class="la-inrecipe" data-recipe="glm"><div class="la-inrecipe-h"><span class="la-rb glm"></span><span class="k">Correção no vLLM</span><code>visão: rms_norm_eps 1e-5 → 1e-6</code></div><div class="la-inrecipe-b"><p>O texto do GLM-5.3-Flash usa <code>rms_norm_eps: 1e-5</code>. O checkpoint declara o mesmo valor para a torre de visão, mas ela foi treinada com 1e-6. O código do vLLM usado pela receita força <code>self.rms_norm_eps = 1e-6</code> na visão, com o comentário de que servir com 1e-5 “faz a RMSNorm derivar e produz descrições de imagem repetitivas/degradadas”. Um único número errado no config estraga uma modalidade inteira sem gerar erro algum.</p></div></div>
+  <div class="la-inrecipe" data-recipe="ds"><div class="la-inrecipe-h"><span class="la-rb ds"></span><span class="k">Config</span><code>rms_norm_eps: 1e-20</code> (Vision-Exp) · <code>1e-06</code> (0731)</div><div class="la-inrecipe-b"><p>O checkpoint Vision-Exp, o da lane atual, traz ε = 1e-20 em todas as RMSNorm do tronco de texto e no <code>rsqrt</code> do mHC; o 0731 traz 1e-6. A torre de visão não segue esse campo: a RMSNorm do ViT (<code>patches/vision_exp/vision.py</code>) usa o default <code>eps=1e-6</code>. Com 1e-20, o ε só evita a divisão exata por zero. <i>Interpretação</i>: a norma fica praticamente sem piso. O repositório não mede o impacto dessa diferença. Note que 1e-20 existe em FP32 e em BF16, mas vira zero em FP16. <i>Interpretação</i>: esse é um bom motivo para a norma calcular em FP32.</p></div></div>
+  <h3>Implementação: FP32 por dentro e o ganho “1 + w”</h3>
+  <p>O trecho abaixo (simplificado de <code>files/ple_layer_patched.py</code> da receita Qwen) é a RMSNorm agrupada do N-gram embedding. Ele concentra três decisões de implementação que você vai encontrar em todo modelo moderno:</p>
+<pre data-lang="python"><code>class Qwen3_8FlashNextPLEGroupedNorm(nn.Module):
+    def __init__(self, hidden_size, eps, group_size, dtype):
+        super().__init__()
+        self.eps, self.group_size = eps, group_size
+        self.weight = nn.Parameter(torch.zeros(hidden_size, dtype=dtype))  # w começa em ZERO
+
+    def forward(self, hidden_states):
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.float()                              # (1) conta em FP32
+        grouped = hidden_states.unflatten(-1, (-1, self.group_size))       # (2) 10240 → 4 × 2560
+        variance = grouped.square().mean(dim=-1, keepdim=True)
+        normalized = (grouped * torch.rsqrt(variance + self.eps)).flatten(-2)
+        return (normalized * (1.0 + self.weight.float())).to(input_dtype)  # (3) ganho = 1 + w</code></pre>
+  <ol class="la-steps">
+    <li><b>FP32 por dentro.</b> A soma de 2.560 quadrados em BF16 (erro relativo de arredondamento ≈ 3,9×10⁻³ por operação) perderia precisão, e um ε como 1e-20 viraria zero em FP16. A norma sobe para FP32, calcula e volta ao dtype original. Compare com a RMSNorm do ViT do DeepSeek (<code>patches/vision_exp/vision.py</code>), que faz o mesmo <code>x.float()</code> … <code>.to(dtype)</code>.</li>
+    <li><b>Grupos.</b> Com <code>group_size</code> = 2560, o vetor de 10.240 números (os 4 ramos do Gated Residual) é normalizado ramo a ramo, a <span class="la-term" data-term="rmsnorm-agrupada">RMSNorm agrupada</span>. <i>Interpretação</i>: se a norma fosse única, um ramo de escala grande ditaria o divisor dos outros três. Normalizando por grupo, cada ramo mantém sua própria escala.</li>
+    <li><b>Ganho zero-centrado.</b> O peso é inicializado em 0 e aplicado como \(1 + w\), o <span class="la-term" data-term="ganho-zero-centrado">ganho zero-centrado</span>. No DeepSeek, o ganho é o próprio peso, inicializado em 1 (<code>torch.ones</code>). Matematicamente dá no mesmo, mas <i>interpretação</i>: com weight decay puxando \(w\) para 0, o que se preserva é o ganho 1 (identidade), não o ganho 0 (que apagaria o sinal).</li>
+  </ol>
+  <div class="la-callout warn"><b class="t">Armadilha · “w” ou “1 + w”?</b><p>Um loader que aplique o peso do Qwen como ganho direto, esquecendo o “1 +”, multiplica a saída de cada norma por números perto de zero, e o modelo gera lixo. O contrário (somar 1 a um ganho que já é o próprio peso, como no DeepSeek) dobra a escala. Ao portar um modelo, leia a <code>forward</code> da norma no código de referência: o nome do tensor (<code>*.weight</code>) não diz qual convenção vale.</p></div>
+  <h3>Onde as normas moram nos três modelos</h3>
+  <div class="la-compare">
+    <div data-recipe="glm"><h4>GLM-5.3-Flash</h4><p>RMSNorm antes de cada subcamada (<code>input_layernorm</code>, <code>post_attention_layernorm</code>) e no fim (<code>model.norm</code>); dentro do MLA, <code>q_a_layernorm</code> [1536] e <code>kv_a_layernorm</code> [512] normalizam os latentes; o <code>k_norm</code> do indexador é uma <b>LayerNorm com viés</b> [128], ε 1e-6; o KDA termina com RMSNorm × porta sigmoide; q e k do KDA passam por <span class="la-term" data-term="normalizacao-l2">normalização L2</span>. <b>Rascunhadores:</b> a MTP (camada 45) normaliza o embedding do próximo token e o estado do alvo com <code>enorm</code> e <code>hnorm</code> [4096] antes do <code>eh_proj</code>; o DFlash2 normaliza as features do alvo com RMSNorm depois do <code>fc</code>, tem <code>k_norm</code> (QK-Norm) e usa <code>rms_norm_eps</code> 1e-5.</p></div>
+    <div data-recipe="qwen"><h4>Qwen3.8-Flash-Next</h4><p>Não há pré-norma nem norma final explícitas: a leitura do Gated Residual normaliza cada ramo (agrupada, 1 + w) e o <code>hyper_connection_mixer</code> substitui o <code>model.norm</code>. QK-Norm por cabeça (<code>q_norm</code>, <code>k_norm</code> [256]) na atenção; RMSNorm gated [128] na saída do GDN; <code>rms_norm_eps</code> = 1e-6. <b>Rascunhador:</b> a MTP normaliza as duas entradas antes de juntá-las, <code>pre_fc_norm_embedding</code> [2560] (o embedding do próximo token) e <code>pre_fc_norm_hidden</code> [10240] (os 4 ramos do estado do alvo).</p></div>
+    <div data-recipe="ds"><h4>DeepSeek-V4-Flash</h4><p>RMSNorm antes da atenção e da FFN (<code>attn_norm</code>, <code>ffn_norm</code>), no latente da query (<code>q_norm</code> [1024]) e no KV (<code>kv_norm</code> [512]); cada cabeça de query ainda é dividida pelo próprio RMS, <b>sem peso</b>. O report diz que não precisa de <span class="la-term" data-term="qk-clip">QK-Clip</span> justamente por normalizar queries e KV. <b>Rascunhador:</b> o DSpark repete a família de normas do alvo (<code>q_norm</code>, <code>kv_norm</code>, <code>attn_norm</code>, <code>ffn_norm</code>, mais <code>main_norm</code> na entrada e uma norma final) e também divide Q pelo RMS de cada cabeça, sem peso.</p></div>
+  </div>
+  <div class="la-callout recipe" data-recipe="qwen"><b class="t"><span class="la-rb qwen"></span> Na receita · normas não se quantizam</b><p>Um vetor de ganho tem só \(d\) números, e multiplica tudo o que passa por ele. Quantizá-lo economizaria quase nada e arriscaria muito. O conversor FP8-denso do Qwen mantém as normas em BF16, e a receita GLM também. No vLLM, a norma costuma ser <b>fundida</b> com a soma residual (<code>fused_add_rms_norm</code>): um kernel lê o resíduo uma vez, soma, normaliza e escreve (<a data-ch="kernels">capítulo 28</a>).</p></div>
+  <div class="la-callout deep"><b class="t">Aprofundamento · GatedNorm</b><p>Norma e porta podem se juntar: \(\mathrm{GatedNorm}(\mathbf u) = \mathrm{RMSNorm}(\mathbf u)\odot\sigma(W_2\,\mathrm{SiLU}(W_1\,\mathrm{RMSNorm}(\mathbf u)))\). É exatamente a leitura do Gated Residual do Qwen. Segundo o tech report, a <span class="la-term" data-term="gatednorm">GatedNorm</span> sozinha reduz os picos de perda (<i>loss spikes</i>) de 32,0 para 3,2 a cada 10 mil passos, num treino de estresse com 4× o LR ótimo, e remove outliers de ativação. O <a data-ch="hiperconexoes">capítulo 15</a> desenvolve isso.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Conexões residuais: a estrada expressa do gradiente</h2>
+  <p>Volte à regra da cadeia. Numa rede “simples” de \(L\) camadas, \(\mathbf h_{\ell+1} = F_\ell(\mathbf h_\ell)\), o gradiente que chega à primeira camada é um produto de \(L\) jacobianos:</p>
+  <div class="la-eq">
+    \[ \frac{\partial L}{\partial\mathbf h_0} = J_0^\top J_1^\top\cdots J_{L-1}^\top\,\frac{\partial L}{\partial\mathbf h_L}, \qquad J_\ell = \frac{\partial F_\ell}{\partial\mathbf h_\ell} \]
+    <ul class="la-eq-legend">
+      <li>se cada \(J_\ell\) encolhe vetores por um fator 0,9, depois de 64 camadas sobra \(0{,}9^{64}\approx 0{,}001\): o <span class="la-term" data-term="gradiente-evanescente">gradiente evanescente</span></li>
+      <li>se cada um estica por 1,1, sobra \(1{,}1^{64}\approx 445\): o <span class="la-term" data-term="gradiente-explosivo">gradiente explosivo</span></li>
+    </ul>
+  </div>
+  <p>É um telefone sem fio: cada camada repete a mensagem um pouco distorcida, e depois de muitas camadas o começo da fila não recebe nada útil. Em 2015, He e colegas observaram que redes simples mais profundas treinavam <i>pior</i> que redes rasas (uma de 56 camadas tinha erro de treino maior que uma de 20). A solução foi a <span class="la-term" data-term="conexao-residual">conexão residual</span>: em vez de substituir o vetor, cada camada <b>soma</b> uma correção a ele.</p>
+  <div class="la-eq">
+    \[ \mathbf h_{\ell+1} = \mathbf h_\ell + F_\ell(\mathbf h_\ell) \quad\Longrightarrow\quad \frac{\partial\mathbf h_{\ell+1}}{\partial\mathbf h_\ell} = I + \frac{\partial F_\ell}{\partial\mathbf h_\ell} \]
+    <ul class="la-eq-legend">
+      <li>\(I\): a identidade, um caminho pelo qual o gradiente passa sem ser multiplicado por nada</li>
+      <li>desenrolando: \(\mathbf h_L = \mathbf h_0 + \sum_\ell F_\ell(\mathbf h_\ell)\). A saída é a entrada mais a soma das contribuições de todas as camadas</li>
+    </ul>
+  </div>
+  <figure class="la-fig" id="fig-residual" data-title="Telefone sem fio vs estrada expressa">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Simulação real, com matrizes aleatórias de 24 dimensões calculadas nesta página. Em cima, a fila de camadas: o brilho de cada uma é a norma do gradiente que chega até ela (o pulso rosa viaja da perda para a entrada). Embaixo, em escala log, o RMS das ativações (menta) e a norma do gradiente (rosa) camada a camada. Compare “simples”, “residual” e “residual + pré-norma” e mexa na profundidade e no ganho dos pesos.</figcaption>
+  </figure>
+  <p>Repare no que a simulação mostra. Ela começa com ReLU, ganho 1 e 32 camadas. Na rede simples, o gradiente que chega à primeira camada é cerca de 5×10⁻⁷ do que saiu da perda: morreu no caminho. Suba o ganho e ele passa a explodir. Existe um ganho crítico (por volta de 1,5 nesta simulação; na teoria de campo médio, \(\sqrt2\approx1{,}41\), a inicialização de He) em que as normas quase se conservam, mas é um fio de navalha: em 64 camadas, ganho 1,4 deixa o gradiente em 2×10⁻³ e ganho 1,6 o multiplica por 12. Com resíduo e sem normalização, o caminho identidade salva o gradiente, mas cada camada soma sua saída sem freio, e ativações e gradiente crescem cerca de 10⁵ vezes em 32 camadas. Com <b>resíduo + pré-norma</b>, \(\mathbf h_{\ell+1} = \mathbf h_\ell + F_\ell(\mathrm{Norm}(\mathbf h_\ell))\), o gradiente chega à entrada na mesma ordem de grandeza (≈ 1,3×) e as ativações crescem devagar, de 1 para cerca de 13 em 32 camadas: crescimento polinomial, não exponencial. Cada subcamada lê uma cópia normalizada e escreve uma soma. Esse é o desenho de todo LLM moderno, e o vetor que atravessa a pilha tem nome: <span class="la-term" data-term="fluxo-residual">fluxo residual</span>. O <a data-ch="bloco-transformer">capítulo 7</a> o trata como um barramento.</p>
+  <p>O ViT do DeepSeek (<code>patches/vision_exp/vision.py</code>) mostra o padrão em duas linhas:</p>
+<pre data-lang="python"><code>def forward(self, x, cos, sin):
+    x = x + self.attn(self.norm1(x), cos, sin)   # lê normalizado, SOMA no resíduo
+    return x + self.mlp(self.norm2(x))           # idem para a MLP (SwiGLU)</code></pre>
+  <div class="la-callout recipe" data-recipe="all"><b class="t"><span class="la-rb all"></span> Nas receitas · o resíduo ficou largo</b><p>Os três modelos alargam o fluxo residual para <b>4 fluxos</b>. GLM e DeepSeek usam o mHC (<code>hc_mult: 4</code>, 4 × 4096 = 16.384 números por token), com a matriz de mistura entre fluxos projetada, por 20 iterações de Sinkhorn, no conjunto das matrizes duplamente estocásticas, cuja norma espectral é ≤ 1. É a preocupação desta seção (não deixar o sinal explodir ao longo da profundidade) virando restrição de arquitetura. O Qwen usa o Gated Residual (4 × 2560 = 10.240). No experimento do tech report (modelo 25B-A3B, 560 B tokens), a perda caiu de 1,617 (pré-norma clássica) para 1,596 (mHC estático), 1,594 (mHC dinâmico) e 1,590 (GR). Detalhes no <a data-ch="hiperconexoes">capítulo 15</a>.</p></div>
+  <div class="la-callout why"><b class="t">Por que isso importa para quem escreve receitas</b><p>O fluxo residual é o lugar onde se “escuta” o modelo. Os rascunhadores especulativos leem hidden states de camadas do alvo (o GLM precisa contrair os 4 fluxos do mHC para 4096 com <code>hc_contract</code> antes de entregá-los ao DFlash2), e a abliteração edita o que as camadas escrevem nele (<a data-ch="abliteracao">capítulo 19</a>). E resíduo largo custa banda: no Qwen servido pelo vLLM, os pesos do Gated Residual ficam em BF16 replicados nas duas GPUs, 1,19 GiB lidos por passo, cerca de 13% do tráfego.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Nas receitas: ativações, portas e normas no config</h2>
+  <p>Agora você consegue ler um LLM como um mapa de metrô: cada leitura do resíduo, cada norma, cada porta e cada ativação tem um lugar e uma razão de estar ali. Duas coisas importam para ler o mapa. Primeiro, a pilha é feita de camadas que se repetem, mas <b>nem toda camada é igual</b>: o mixer de tokens (a peça que mistura informação entre posições) alterna entre dois ou três tipos, e cada camada tem <b>um</b> deles, nunca todos. Segundo, algumas peças ficam <b>fora</b> da camada: a entrada, a saída, a torre de visão e os rascunhadores. A figura mostra esse percurso para os três modelos, com o mesmo código de cores deste capítulo.</p>
+  <figure class="la-fig wide" id="fig-mapa" data-title="O caminho de um token pelo modelo">
+    <div class="la-fig-stage" style="height:560px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>O token (o ponto que viaja) entra no alto, dá voltas pela caixa “dentro de cada camada” e sai embaixo. A cada volta, o contador e a faixa de quadradinhos mostram em que camada ele está (a animação percorre as camadas 0 a 3 e a última). Onde a linha se divide em alternativas (“ou”), o token passa só pelo ramo daquela camada, e os outros ficam apagados. Estações tracejadas só existem em algumas camadas, como o PLE do Qwen, que roda apenas na camada de índice 1, antes da leitura do GR. As torres à parte (visão e rascunhadores) não ficam no caminho do texto. As fichas são coloridas por categoria: menta = ativação, âmbar = porta, lavanda = norma. Filtre por categoria para acender só um tipo. Os nomes e fórmulas vêm dos configs e do código das receitas.</figcaption>
+  </figure>
+  <div class="la-table-wrap"><table class="la-params">
+    <thead><tr><th>Parâmetro</th><th>Valor</th><th>Receita</th><th>O que faz</th><th>Por que importa</th></tr></thead>
+    <tbody>
+      <tr><td><code>hidden_act</code></td><td><code>silu</code></td><td><span class="la-rb all"></span></td><td>Ativação do ramo de porta da SwiGLU em FFNs e experts</td><td>Os pesos foram treinados com ela; o vLLM do GLM e do DeepSeek recusa qualquer outra</td></tr>
+      <tr><td><code>rms_norm_eps</code></td><td>1e-5 (texto); visão forçada a 1e-6</td><td><span class="la-rb glm"></span></td><td>ε de todas as RMSNorm do texto</td><td>A visão com 1e-5 gera descrições repetitivas; o vLLM corrige</td></tr>
+      <tr><td><code>rms_norm_eps</code></td><td>1e-6</td><td><span class="la-rb qwen"></span></td><td>ε das RMSNorm, inclusive a agrupada do PLE (key, query, conv)</td><td>Com ganho 1 + w; detalhes da PLE no <a data-ch="ngram-mtp">cap. 16</a></td></tr>
+      <tr><td><code>rms_norm_eps</code></td><td>1e-20 (Vision-Exp) · 1e-6 (0731)</td><td><span class="la-rb ds"></span></td><td>ε das RMSNorm do tronco de texto e do <code>rsqrt</code> do mHC (a RMSNorm do ViT usa 1e-6 fixo)</td><td>Troca de checkpoint muda o ε; impacto não medido no repositório</td></tr>
+      <tr><td><code>index_dsa_use_layernorm</code></td><td><code>true</code> (default)</td><td><span class="la-rb glm"></span></td><td><code>k_norm</code> do indexador vira LayerNorm com viés [128], ε 1e-6</td><td>Um dos poucos lugares com LayerNorm no decoder: centragem + viés</td></tr>
+      <tr><td><code>output_gate_type</code></td><td><code>sigmoid</code></td><td><span class="la-rb qwen"></span></td><td>Ativação da porta de saída do GDN</td><td>Limitada a (0,1); segundo o tech report, melhor que a SiLU do GDN original</td></tr>
+      <tr><td><code>linear_attn_config.gate_lower_bound</code></td><td>−5.0</td><td><span class="la-rb glm"></span></td><td>Gate de decaimento do KDA: \(-5\cdot\sigma(\cdot)\in(-5,0)\)</td><td>Troca o caminho ilimitado com softplus por um limitado com sigmoide (<a data-ch="atencao-linear">cap. 14</a>)</td></tr>
+      <tr><td><code>swiglu_limit</code></td><td>10.0</td><td><span class="la-rb glm"></span> <span class="la-rb ds"></span></td><td>Clamp do gate (≤ 10) e do up (±10) antes do produto</td><td>O produto SwiGLU não tem teto; detalhes no <a data-ch="bloco-transformer">cap. 7</a></td></tr>
+      <tr><td><code>hidden_act</code> (visão)</td><td><code>gelu_pytorch_tanh</code></td><td><span class="la-rb qwen"></span></td><td>MLP do ViT (1152 → 4304 → 1152, com viés)</td><td>Aproximação tanh da GELU: precisa bater com o treino</td></tr>
+      <tr><td><code>hc_eps</code></td><td>1e-6</td><td><span class="la-rb glm"></span> <span class="la-rb ds"></span></td><td>ε somado aos pesos <code>pre</code> (sigmoide) e nas normalizações do <span class="la-term" data-term="sinkhorn-knopp">Sinkhorn</span></td><td><i>Interpretação</i>: evita pesos de leitura exatamente nulos e divisões por zero no Sinkhorn</td></tr>
+    </tbody>
+  </table></div>
+  <h3>Checklist para o seu modelo novo</h3>
+  <p>Quando um modelo novo sair (o <a data-ch="receita-do-zero">capítulo 46</a> faz isso com o MiMo-V2.6-Flash), leia o config e o código de referência com esta lista na mão:</p>
+  <ol class="la-steps">
+    <li><b>Ativação.</b> Procure <code>hidden_act</code> (texto e visão). <code>gelu</code> e <code>gelu_pytorch_tanh</code> são funções diferentes. O MiMo declara <code>silu</code>, e o vLLM rejeita outra ativação no MoE dele.</li>
+    <li><b>ε e o nome do campo.</b> O nome varia: <code>rms_norm_eps</code> (GLM, Qwen, DeepSeek), <code>layernorm_epsilon</code> (MiMo, 1e-6), <code>norm_eps</code> (config de inferência do DeepSeek). Confira também se alguma sub-torre usa outro valor, como a visão do GLM.</li>
+    <li><b>Tipo e convenção da norma.</b> LayerNorm ou RMSNorm? Tem viés? O ganho é \(w\) ou \(1 + w\)? É agrupada? Tem peso ou não (como a norma por cabeça da query do DeepSeek)?</li>
+    <li><b>Portas.</b> Liste cada \(\sigma(\cdot)\) e cada “2·σ”. Cheque se o motor as implementa com a mesma forma e mantenha-as em alta precisão ao quantizar.</li>
+    <li><b>Meça.</b> Mesmo com tudo conferido, compare a distribuição do modelo servido com a referência (KLD). Desvios de ε, de ativação e de convenção de ganho aparecem lá antes de aparecer num benchmark.</li>
+  </ol>
+  <p>Com neurônios, camadas, ativações, portas, normas e resíduos na bagagem, falta a linguagem para falar de tudo isso em escala: vetores de 4.096 dimensões, lotes de tokens, cabeças de atenção empilhadas em tensores 4D, e a conta de FLOPs de cada multiplicação. É o assunto do <a data-ch="tensores-algebra">próximo capítulo</a>.</p>
+</section>

@@ -1,0 +1,1254 @@
+[
+ {
+  "num": 0,
+  "id": "mapa-da-jornada",
+  "part": 0,
+  "title": "Mapa da jornada",
+  "navTitle": "Mapa da jornada",
+  "scope": "JÁ ESCRITO (exemplar). Refinar: tabela real das 3 receitas (modelo, params totais/ativos, quantização, KV dtype, TP, spec decode, contexto, velocidade medida).",
+  "prereqs": [],
+  "recipes": [
+   "glm",
+   "qwen",
+   "ds"
+  ],
+  "n_primary": 0,
+  "n_secondary": 0
+ },
+ {
+  "num": 1,
+  "id": "aprender-com-dados",
+  "part": 1,
+  "title": "O que é aprender: funções, perdas e gradientes",
+  "navTitle": "Aprender com dados",
+  "scope": "Machine learning como ajuste de uma função f_θ a dados; parâmetros; aprendizado supervisionado e auto-supervisionado (prever o próximo token); função de perda (MSE, entropia cruzada, log-verossimilhança, nats vs bits); superfície de perda; gradiente e descida do gradiente (animada), taxa de aprendizado, SGD e minibatches; otimizadores (momentum, Adam/AdamW, e a ideia do Muon — ortogonalização de atualizações — citado no treino do Qwen3.8); generalização, overfitting, conjuntos de treino/validação/teste; treino vs inferência (o foco da plataforma é inferência: os pesos ficam congelados).",
+  "prereqs": [],
+  "recipes": [
+   "glm",
+   "qwen",
+   "ds"
+  ],
+  "n_primary": 0,
+  "n_secondary": 0
+ },
+ {
+  "num": 2,
+  "id": "redes-neurais",
+  "part": 1,
+  "title": "Redes neurais: neurônios, camadas e backprop",
+  "navTitle": "Redes neurais",
+  "scope": "Neurônio artificial, camada linear y = Wx + b como transformação geométrica; funções de ativação (ReLU, GELU, SiLU/Swish, sigmoid, softplus, tanh) com gráficos; MLP e aproximação universal (intuição); gating multiplicativo (preparar GLU/SwiGLU); grafo computacional, regra da cadeia e backpropagation animados; profundidade, largura, contagem de parâmetros de uma MLP; normalização (LayerNorm, RMSNorm) como estabilizador; por que redes profundas precisam de conexões residuais (prepara o fluxo residual).",
+  "prereqs": [
+   "aprender-com-dados"
+  ],
+  "recipes": [
+   "glm",
+   "qwen",
+   "ds"
+  ],
+  "n_primary": 0,
+  "n_secondary": 1
+ },
+ {
+  "num": 3,
+  "id": "tensores-algebra",
+  "part": 1,
+  "title": "Tensores e a álgebra linear de um LLM",
+  "navTitle": "Tensores & álgebra",
+  "scope": "Vetores, produto escalar como similaridade (cosseno), normas L2/RMS, matrizes como funções lineares, multiplicação de matrizes animada (linha×coluna), formas/shapes [batch, seq, hidden], broadcasting, notação einsum, tensores 3D/4D (cabeças), transposição e reshape; fatoração de baixo posto (W ≈ A·B) — base de MLA/LoRA/Markov head; matrizes ortogonais e rotações (base de RoPE e Hadamard); FLOPs de uma matmul (2·m·n·k), GEMM vs GEMV (lote grande vs 1 token), intensidade aritmética introdutória.",
+  "prereqs": [
+   "redes-neurais"
+  ],
+  "recipes": [
+   "glm",
+   "qwen",
+   "ds"
+  ],
+  "n_primary": 0,
+  "n_secondary": 4
+ },
+ {
+  "num": 4,
+  "id": "numeros-no-computador",
+  "part": 1,
+  "title": "Como o computador guarda números",
+  "navTitle": "Números no computador",
+  "scope": "Bits e bytes; inteiros sem/ com sinal (complemento de 2), INT8/INT4; anatomia do ponto flutuante (sinal, expoente, mantissa, bias, subnormais, Inf/NaN) com explorador de bits interativo (LA.num); FP32, FP16, BF16 (faixa vs precisão); erro de arredondamento, arredondamento ao par (RNE), épsilon da máquina, overflow/underflow; acumulação em FP32 dentro de matmuls; por que inferência moderna usa BF16 como “base” e formatos menores para pesos/KV; tamanho em bytes de um tensor. Prepara a Parte IV. ADIÇÃO (completude): Não-associatividade da soma em ponto flutuante (a ordem de redução muda os bits — raiz do não-determinismo de kernels paralelos e do custo do greedy bit-idêntico) e overflow de inteiros em índices (int32 além de 2^31 com 1M de contexto → int64).",
+  "prereqs": [
+   "tensores-algebra"
+  ],
+  "recipes": [
+   "glm",
+   "qwen",
+   "ds"
+  ],
+  "n_primary": 1,
+  "n_secondary": 4
+ },
+ {
+  "num": 5,
+  "id": "tokens-embeddings",
+  "part": 2,
+  "title": "Tokens, vocabulário e embeddings",
+  "navTitle": "Tokens & embeddings",
+  "scope": "Tokenização (BPE animado: fusões de pares), vocabulário e tamanhos reais (GLM 154.880; Qwen 248.320; DeepSeek 129.280), tokens especiais, chat templates (papéis system/user/assistant, <think>, tokens de ferramenta, image pad), tokenizer.json/tokenizer_config; embedding como consulta de linha numa matriz [vocab × hidden] (animado); geometria do espaço de embedding; lm_head/unembedding e logits; embeddings amarrados vs não amarrados (Qwen lm_head não amarrado); custo de memória do embedding e do lm_head (ex.: 248.320×2560); por que vocabulário grande encarece o rascunho especulativo (prepara vocabulário reduzido). ADIÇÃO (completude): Checkpoints sem template Jinja: encoder Python próprio usado como chat template (DeepSeek encoding_dsv4.py com --tokenizer-mode deepseek_v4), copiado e corrigido pelo entrypoint da receita.",
+  "prereqs": [
+   "tensores-algebra",
+   "numeros-no-computador"
+  ],
+  "recipes": [
+   "glm",
+   "qwen",
+   "ds"
+  ],
+  "n_primary": 15,
+  "n_secondary": 7
+ },
+ {
+  "num": 6,
+  "id": "atencao",
+  "part": 2,
+  "title": "Atenção: como os tokens conversam",
+  "navTitle": "Atenção",
+  "scope": "Intuição (buscar informação em outros tokens), Q/K/V como projeções, produto escalar escalado por √d, softmax (temperatura), matriz de atenção animada/heatmap, máscara causal, soma ponderada de V, multi-head attention (head_dim, num_heads, divisão do hidden), projeção de saída o_proj, complexidade O(n²) em tempo e memória; atenção como “memória associativa”; attention sinks (logit aprendido extra no denominador — DeepSeek attn_sink) e o fenômeno de sinks; prepara KV cache e variantes eficientes. ADIÇÃO (completude): Gated Attention (gate de saída sigmoide por cabeça antes do o_proj; no Qwen o q_proj carrega query+gate) e QK-Norm (RMSNorm por cabeça em q e k para estabilizar os logits sem qk-clip).",
+  "prereqs": [
+   "tokens-embeddings"
+  ],
+  "recipes": [
+   "glm",
+   "qwen",
+   "ds"
+  ],
+  "n_primary": 3,
+  "n_secondary": 3
+ },
+ {
+  "num": 7,
+  "id": "bloco-transformer",
+  "part": 2,
+  "title": "O bloco Transformer e o fluxo residual",
+  "navTitle": "Bloco Transformer",
+  "scope": "Arquitetura decoder-only: embedding → N blocos → norma final → lm_head; o fluxo residual como “barramento” (animado: cada subcamada lê e escreve); pré-normalização com RMSNorm; FFN/MLP com SwiGLU (gate·up·down) e o limite swiglu_limit (clamp, GLM default 10.0); contagem de parâmetros por bloco (atenção + FFN) com calculadora; onde ficam os FLOPs; camadas densas vs MoE (prepara Parte III); nomes reais de tensores (q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj, model.layers.N....) para ler checkpoints.",
+  "prereqs": [
+   "atencao"
+  ],
+  "recipes": [
+   "glm",
+   "qwen",
+   "ds"
+  ],
+  "n_primary": 6,
+  "n_secondary": 3
+ },
+ {
+  "num": 8,
+  "id": "posicao-rope",
+  "part": 2,
+  "title": "Posição: RoPE, NoPE, mRoPE e YaRN",
+  "navTitle": "Posição & RoPE",
+  "scope": "Por que atenção precisa de posição; posições absolutas vs relativas; RoPE como rotação de pares de dimensões (animação de vetores girando, frequências por θ); rope_theta (10000, 160000 no compressor DS, 10⁷ no Qwen); RoPE parcial (partial_rotary_factor: Qwen 64 de 256 dims; DeepSeek 64 dims de 512; is_neox_style); NoPE (GLM MLA com qk_rope_head_dim=0) e por que funciona em modelos híbridos; mRoPE (seções temporais/altura/largura para imagem e vídeo, Qwen); extensão de contexto: interpolação, NTK, YaRN (factor, original_max_position_embeddings, mscale) — Qwen 262.144→1M (patch do override aninhado), DeepSeek YaRN fator 16 de 64K→1M; max_position_embeddings vs max_model_len.",
+  "prereqs": [
+   "atencao"
+  ],
+  "recipes": [
+   "glm",
+   "qwen",
+   "ds"
+  ],
+  "n_primary": 20,
+  "n_secondary": 5
+ },
+ {
+  "num": 9,
+  "id": "geracao-amostragem",
+  "part": 2,
+  "title": "Gerando texto: logits, amostragem e raciocínio",
+  "navTitle": "Geração & amostragem",
+  "scope": "Loop autoregressivo animado; logits → probabilidades; greedy, temperatura, top-k, top-p (nucleus), min-p, penalidades (repetition, presence, frequency), seed e determinismo (patch de determinismo do Qwen: top-k ordenado, finalize de MoE), stop tokens e strings, max_tokens/min_tokens; modelos de raciocínio: <think>, reasoning effort, orçamentos de thinking (DeepSeek thinking-token budgets), enable_thinking via chat_template_kwargs, parsers de raciocínio; defaults de amostragem recomendados pelas receitas (client defaults GLM, generation_config); por que especulação exige cuidado com amostragem (prepara Parte VII). ADIÇÃO (completude): Truque Gumbel-max (amostrar ≡ argmax(logits/T + ruído Gumbel), usado por amostradores em GPU e pelo seletor do DFlash2) e detecção de loops de repetição vs cauda longa de raciocínio (quando aumentar max_tokens ajuda).",
+  "prereqs": [
+   "bloco-transformer"
+  ],
+  "recipes": [
+   "glm",
+   "qwen",
+   "ds"
+  ],
+  "n_primary": 32,
+  "n_secondary": 21
+ },
+ {
+  "num": 10,
+  "id": "prefill-decode-kv",
+  "part": 2,
+  "title": "Prefill, decode e o KV cache",
+  "navTitle": "Prefill, decode & KV",
+  "scope": "As duas fases da inferência; prefill paralelo (compute-bound) vs decode 1 token por vez (memory-bound); intensidade aritmética e roofline animado; KV cache: por que guardar K e V, crescimento com o contexto (animado), fórmula de bytes por token (camadas × kv_heads × head_dim × 2 × bytes) e exemplos; métricas TTFT, TPOT/ITL, throughput; batching em decode amortiza a leitura dos pesos (tokens/s agregados vs por usuário); por que contexto longo e concorrência disputam memória; ponte para arquiteturas que encolhem o KV (MLA, esparsa, linear).",
+  "prereqs": [
+   "geracao-amostragem",
+   "posicao-rope"
+  ],
+  "recipes": [
+   "glm",
+   "qwen",
+   "ds"
+  ],
+  "n_primary": 0,
+  "n_secondary": 7
+ },
+ {
+  "num": 11,
+  "id": "mixture-of-experts",
+  "part": 3,
+  "title": "Mixture-of-Experts: especialistas e roteadores",
+  "navTitle": "Mixture-of-Experts",
+  "scope": "Ideia do MoE (capacidade sem custo proporcional); roteador (gate linear → scores), top-k animado com tokens escolhendo especialistas; funções de score: softmax, sigmoid, sqrtsoftplus (DeepSeek); normalização dos pesos e routed_scaling_factor; shared experts (sempre ativos; Qwen com gate sigmoide no shared); balanceamento: aux loss vs aux-loss-free com viés de correção (noaux_tc, e_score_correction_bias); roteamento limitado por grupos; hash MoE (DeepSeek camadas 0–2: tabela tid2eid, sem GEMM de router); camadas densas iniciais (GLM camadas 0–2 densas, first_k_dense); números reais (GLM 288 experts top-8 +1 shared, interm. 2048; Qwen 512 top-10 +1 shared, interm. 640; DeepSeek 256 top-6 +1 shared, interm. 2048); parâmetros totais vs ativos (calculadora); desbalanceamento de carga e por que importa na inferência; prepara kernels MoE e expert parallel.",
+  "prereqs": [
+   "bloco-transformer"
+  ],
+  "recipes": [
+   "glm",
+   "qwen",
+   "ds"
+  ],
+  "n_primary": 19,
+  "n_secondary": 20
+ },
+ {
+  "num": 12,
+  "id": "mla",
+  "part": 3,
+  "title": "Encolhendo o KV: MQA, GQA e MLA",
+  "navTitle": "MLA & KV compacto",
+  "scope": "Do MHA ao MQA e GQA (compartilhar K/V entre cabeças, animado); Multi-head Latent Attention: compressão de K/V num vetor latente (kv_lora_rank 512), projeções de subida, q_lora_rank, RoPE desacoplado (qk_rope_head_dim 64) vs NoPE (GLM: qk_rope_head_dim=0 → quebra suposições de kernels, ex.: “pe_dim must be 64 for fp8_ds_mla”), absorção de pesos no decode (por que o cache é só o latente), DeepSeek-V4: K=V compartilhados (kv_lora_rank = head_dim = 512, 448 NoPE + 64 RoPE), o_lora_rank e o_groups (8), 64 cabeças; bytes por token MHA vs GQA vs MLA (calculadora); layout de cache MLA (preparar fp8_ds_mla/nvfp4_ds_mla na Parte IV); kernels FlashMLA/sparse MLA. ADIÇÃO (completude): RoPE inverso na saída quando V=K: como V carrega a rotação absoluta, a saída da atenção do DeepSeek-V4 é desrotacionada nas 64 dims (fused_inv_rope_fp8_quant) antes do wo_a.",
+  "prereqs": [
+   "prefill-decode-kv"
+  ],
+  "recipes": [
+   "glm",
+   "qwen",
+   "ds"
+  ],
+  "n_primary": 14,
+  "n_secondary": 14
+ },
+ {
+  "num": 13,
+  "id": "atencao-esparsa",
+  "part": 3,
+  "title": "Atenção esparsa e contexto de 1 milhão de tokens",
+  "navTitle": "Atenção esparsa",
+  "scope": "Por que O(n²) mata contexto longo; janela deslizante (SWA: DeepSeek sliding_window 128 em todas as camadas; drafter SWA do DFlash2 GLM); atenção esparsa com indexador leve (lightning indexer estilo DSA: pontua, top-k, atenção só nos escolhidos); GLM: indexer “kpool” sobre blocos comprimidos de 4 tokens (index_kpool=4, select_k=512 pools → ~2048 tokens, index_topk 2048) + cauda não comprimida, FlashInfer GLM_NSA; DeepSeek-V4: compressão de KV por camada (compress_ratios: C4A razão 4 com indexer top-512 em 21 camadas, C128A razão 128 em 20 camadas, camadas 0–1 só SWA), cache K do indexer; Qwen QSA (Qwen Sparse Attention: indexador comprimido escolhe ≤2048 tokens em micro-blocos de 4, só 12 camadas); NSA; custo de memória por token resultante e por que 1M de contexto cabe; dense prefill do indexer e casos de borda (skip top-k, skip empty c128) como conceitos. ADIÇÃO (completude): Como o indexador é treinado: destilação por KL contra a distribuição da atenção densa (em duas fases), o que explica por que a seleção top-k quase não perde qualidade.",
+  "prereqs": [
+   "mla"
+  ],
+  "recipes": [
+   "glm",
+   "qwen",
+   "ds"
+  ],
+  "n_primary": 43,
+  "n_secondary": 27
+ },
+ {
+  "num": 14,
+  "id": "atencao-linear",
+  "part": 3,
+  "title": "Atenção linear, regra delta e modelos híbridos",
+  "navTitle": "Atenção linear & híbridos",
+  "scope": "Atenção linear como RNN: estado-matriz S (d×d) atualizado a cada token (animado), custo O(n) e memória constante; esquecimento/decay com gates; regra delta (DeltaNet: escrever corrigindo o erro de associação), Gated DeltaNet (Qwen GDN: 36 das 48 camadas, heads QK/V, gate sigmoid), KDA/Kimi Delta Attention (GLM: 34 camadas linear_attention; gate por canal lower_bound·sigmoid(exp(A_log)·(g+dt_bias)), beta, normalização L2 de q/k, estado FP32 [heads,128,128]) — marcar interpretações; convolução curta causal (conv_state); forma paralela por chunks para prefill (chunk_kda, chunk_gla, FlashKDA) vs forma recorrente no decode; esquemas híbridos 3:1 (linear:plena) e por que combinar; consequências para servir: estado por sequência (tipo Mamba) no vLLM (MambaSpec, mamba_cache_mode align, grupos Mamba), impossibilidade de “voltar no meio” do estado → prefix caching só em pontos alinhados (prepara Parte VI).",
+  "prereqs": [
+   "atencao-esparsa"
+  ],
+  "recipes": [
+   "glm",
+   "qwen",
+   "ds"
+  ],
+  "n_primary": 20,
+  "n_secondary": 16
+ },
+ {
+  "num": 15,
+  "id": "hiperconexoes",
+  "part": 3,
+  "title": "Hyper-connections: alargando o fluxo residual",
+  "navTitle": "Hyper-connections",
+  "scope": "Limites do resíduo único; hyper-connections: n fluxos residuais (hc_mult=4) com matrizes de leitura/escrita/mistura; mHC (manifold-constrained, mistura restrita via Sinkhorn — hc_sinkhorn_iters, DeepSeek hc_dim 16384 = 4×4096; GLM retorna (hidden, residual, post, comb), hc_post/hc_contract para extrair hidden de 4096 — usado pelos hooks EAGLE3); Qwen Gated Residual (4 ramos de 2560, gate elementwise dependente dos dados substitui a pré-norma, escrita com um escalar por ramo, hyper_connection_mixer final substitui o RMSNorm final); custo de memória/banda de ativações (buffers de 256 MiB etc.) e implicações para kernels (b12x mHC exige 4096); por que isso importa para quem escreve drafter/hook.",
+  "prereqs": [
+   "bloco-transformer"
+  ],
+  "recipes": [
+   "glm",
+   "qwen",
+   "ds"
+  ],
+  "n_primary": 13,
+  "n_secondary": 12
+ },
+ {
+  "num": 16,
+  "id": "ngram-mtp",
+  "part": 3,
+  "title": "Memória N-gram (PLE) e Multi-Token Prediction",
+  "navTitle": "N-gram & MTP",
+  "scope": "N-gram Embedding do Qwen (chamado PLE no código): hash de bigramas/trigramas do contexto local → índice numa tabela de 320M linhas × 160 dims (51,2B params), gate de contexto e convolução curta dilatada, injetado nos 4 ramos na camada 2 (índice 1); “capacidade sem FLOPs” e endereçamento determinístico (permite prefetch/offload para CPU/mmap); dtype da tabela (FP8/NVFP4) e por que o vLLM precisou de patch (detect_ple_dtype, hf-overrides, ple_layer_patched, tabela empacotada); Multi-Token Prediction: cabeças/camadas extras que preveem tokens futuros no treino; GLM (bloco MTP no índice 45), Qwen (1 camada MTP com QSA e MoE FP8 em blocos 128×128, alias mtp.layers.48), DeepSeek (num_nextn_predict_layers 3 no Vision-Exp, 1 no 0731); MTP como rascunhador (ponte para Parte VII).",
+  "prereqs": [
+   "hiperconexoes",
+   "mixture-of-experts"
+  ],
+  "recipes": [
+   "glm",
+   "qwen",
+   "ds"
+  ],
+  "n_primary": 24,
+  "n_secondary": 22
+ },
+ {
+  "num": 17,
+  "id": "multimodal",
+  "part": 3,
+  "title": "Visão: como um LLM enxerga imagens",
+  "navTitle": "Multimodal",
+  "scope": "Vision Transformer: imagem → patches (patch 14) → embeddings; torre visual (ViT de 27 blocos no Qwen; 32 camadas no DeepSeek Vision-Exp); merger/aligner/projector para o espaço do LLM; tokens de imagem (<|image_pad|>, <|video_pad|>, DeepSeek <｜deepseek_image｜> id 129264, downsample 3, ≤384 tokens/imagem); mRoPE para posições 2D/3D; vídeo (Qwen) vs GIF como quadro único (DeepSeek); servir visão no vLLM (processador multimodal, --mm-encoder-tp-mode data para replicar o encoder, limites por prompt, cache do encoder), a visão do DeepSeek enxertada por hotfix; formatos da API (image_url, base64, <image>path</image>). ADIÇÃO (completude): Roteamento MoE condicionado à modalidade (bias_vl no DeepSeek Vision-Exp: tokens de imagem usam viés de roteamento próprio e pulam a tabela de hash — issue #175).",
+  "prereqs": [
+   "atencao",
+   "posicao-rope"
+  ],
+  "recipes": [
+   "glm",
+   "qwen",
+   "ds"
+  ],
+  "n_primary": 34,
+  "n_secondary": 9
+ },
+ {
+  "num": 18,
+  "id": "tres-modelos",
+  "part": 3,
+  "title": "Os três modelos dissecados",
+  "navTitle": "Os três modelos",
+  "scope": "Explorador interativo lado a lado de GLM-5.3-Flash, Qwen3.8-Flash-Next e DeepSeek-V4-Flash: mapa camada a camada (tipos de mixer, MoE/denso, MTP), leitura guiada do config.json campo a campo, parâmetros totais vs ativos, FLOPs/token (GLM ~19,5B ativos, ~36 GFLOP/token com a divisão por componente), bytes de KV/estado por token e por sequência, novidades de cada um e a linhagem (GLM-5.x, Qwen3-Next→3.5→3.8/Qwen4Exp, DeepSeek V2/V3/V3.2→V4); “o que um motor precisa suportar” para cada modelo (lista de requisitos que motivam patches); exercício: dado um config.json, prever memória e gargalos.",
+  "prereqs": [
+   "mla",
+   "atencao-esparsa",
+   "atencao-linear",
+   "hiperconexoes",
+   "ngram-mtp",
+   "multimodal"
+  ],
+  "recipes": [
+   "glm",
+   "qwen",
+   "ds"
+  ],
+  "n_primary": 2,
+  "n_secondary": 7
+ },
+ {
+  "num": 19,
+  "id": "abliteracao",
+  "part": 3,
+  "title": "Direções no espaço latente: abliteração",
+  "navTitle": "Abliteração",
+  "scope": "Engenharia de representações: conceitos como direções no fluxo residual; direção de recusa (diferença de médias de ativações entre prompts), projeção ortogonal para remover uma direção; aplicar nos pesos de saída (o_proj) de camadas selecionadas vs em runtime; GLM ablit_runtime (o_proj L15–45, arquivos refusal_direction_*.pt, ABLIT=1), checkpoint abliterado do Qwen (o_proj das 12 camadas QSA, termos de uso), ablação em runtime no DeepSeek; custos de qualidade (medir KLD), riscos e responsabilidade (tratar de forma educacional: o que muda no modelo e por que um pesquisador deve medir e documentar). ADIÇÃO (completude): Transplante de pesos: copiar byte a byte o o_proj de um checkpoint doador (padrão do GLM) vs ortogonalizar; camadas-âncora (0–14) mantidas intactas; testar estatisticamente se a direção publicada difere de uma direção aleatória.",
+  "prereqs": [
+   "tres-modelos"
+  ],
+  "recipes": [
+   "glm",
+   "qwen",
+   "ds"
+  ],
+  "n_primary": 27,
+  "n_secondary": 2
+ },
+ {
+  "num": 20,
+  "id": "quantizacao-fundamentos",
+  "part": 4,
+  "title": "Por que e como quantizar",
+  "navTitle": "Fundamentos de quantização",
+  "scope": "Motivação (memória e banda: bytes por token de decode); quantização uniforme (escala, zero-point, simétrica/assimétrica) animada sobre um histograma de pesos; erro de arredondamento e clipping; granularidade: por tensor, canal, grupo, bloco (e bits efetivos por peso incluindo escalas); outliers e por que estragam a escala; weight-only (W4A16) vs pesos+ativações (W8A8/W4A8), dequantização “on the fly” dentro do kernel; PTQ vs QAT; calibração (conjuntos de calibração, GPTQ/AWQ como ideia de minimizar erro de saída e não de peso); métricas de erro (MSE, SQNR) — usar LA.num.quantInt; mistura de precisões por componente (experts em 4 bits, atenção em BF16/FP8, como nas 3 receitas). ADIÇÃO (completude): Quantização estática vs dinâmica de ativações: escalas calculadas em runtime por token ou por bloco (act_quant de 128 no DeepSeek, FP8-dense do Qwen sem calibração) vs escalas calibradas fixas.",
+  "prereqs": [
+   "numeros-no-computador",
+   "prefill-decode-kv",
+   "mixture-of-experts"
+  ],
+  "recipes": [
+   "glm",
+   "qwen",
+   "ds"
+  ],
+  "n_primary": 7,
+  "n_secondary": 11
+ },
+ {
+  "num": 21,
+  "id": "fp8-fp4-microescala",
+  "part": 4,
+  "title": "FP8, FP4 e microescalas: MXFP4, MXFP8 e NVFP4",
+  "navTitle": "FP8, FP4 & microescala",
+  "scope": "FP8 E4M3 (FN, máx 448) vs E5M2 (máx 57344) com explorador de bits; escalas FP8 por tensor, por canal e por bloco 128×128 (DeepSeek: lineares FP8 com escala UE8M0 por bloco 128×128; experts FP8 em blocos do MTP do Qwen); FP4 E2M1 (os 15 valores); Microscaling OCP: blocos de 32 com escala E8M0 (MXFP4 nos experts do DeepSeek; MXFP8); NVFP4: blocos de 16 com escala E4M3 + escala global FP32 (checkpoint nvidia/Qwen3.8-Flash-Next-NVFP4, modelopt, hf_quant_config.json, input_scale/weight_scale_2); comparação interativa de erro (LA.num.mx / nvfp4 / quantInt) nos mesmos pesos; bits efetivos (4,25 / 4,5); suporte de hardware (tensor cores FP4/FP8 do Blackwell, sm_120/sm_121) e o que acontece quando o kernel não suporta uma forma (fallback MXFP8→BF16 do Qwen); W4A16 (b12x no DeepSeek) vs FP4 nativo.",
+  "prereqs": [
+   "quantizacao-fundamentos"
+  ],
+  "recipes": [
+   "glm",
+   "qwen",
+   "ds"
+  ],
+  "n_primary": 33,
+  "n_secondary": 27
+ },
+ {
+  "num": 22,
+  "id": "hadamard-trelica-exl3",
+  "part": 4,
+  "title": "Rotações, treliças e EXL3",
+  "navTitle": "Hadamard, treliças & EXL3",
+  "scope": "Incoerência: por que rotacionar pesos espalha outliers (Hadamard randomizado animado com LA.num.fwht, vetores de sinais suh/svh); quantização vetorial vs escalar; quantização codificada por treliça (TCQ/QTIP): estados, caminhos, Viterbi (animado), treliça “bitshift”, codebook computado (mcg, marcador 0xCBAC1FED); EXL3 (exllamav3): tiles 16×16, tensores trellis int16 [K/16, N/16, 16·bits], bits por peso (4 bpw “TR3”, uniform-K4), escopo só nos experts roteados (resto em BF16), 164 GiB/120 shards; decodificação no kernel (GEMV/GEMM com dequant on-the-fly, kernels E2/E3/FAST, experts thin/fat); integração no vLLM como método de quantização (Exl3Config, Exl3MoEMethod, Exl3LinearMethod, registro no Dockerfile); qualidade: KLD 0,024555 a 4 bpw ≈ FP8 oficial (0,024629) com 54% dos bytes; projeções densas em FP8 Marlin (GLM53_DENSE_FP8) ou BF16 e a cópia BF16 large-M.",
+  "prereqs": [
+   "fp8-fp4-microescala"
+  ],
+  "recipes": [
+   "glm",
+   "qwen",
+   "ds"
+  ],
+  "n_primary": 24,
+  "n_secondary": 20
+ },
+ {
+  "num": 23,
+  "id": "kv-cache-quantizado",
+  "part": 4,
+  "title": "Quantizando o KV cache",
+  "navTitle": "KV cache quantizado",
+  "scope": "Por que quantizar o KV (capacidade e banda de leitura em contexto longo); FP8 KV com escalas (por tensor, calibradas; k_scale/v_scale), qualidade; layouts MLA quantizados: fp8_ds_mla (GLM; latente FP8 + parte RoPE — conferir bytes/token no inventário) e nvfp4_ds_mla (DeepSeek: na prática layout FP8 de 584 B/token — explicar a contabilidade 21 C4 × 584/4 + 20 C128 × 584/128 + indexer K 132/4 + SWA constante por sequência ≈ 3,4 MB/seq; 2,33M tokens em 17,04 GiB); Qwen: KV FP8 nos kernels QSA (patch_qsa_fp8_kv, backport vllm#55557) e estado SSM/GDN em BF16; BF16 KV no lane vLLM 0.30 (1.340.476 tokens); calibrated NVFP4 MLA KV (card do quantizador GLM); --kv-cache-dtype e como interage com o backend de atenção; trade-offs de qualidade medidos. ADIÇÃO (completude): Cache K do indexador (132 B por entrada comprimida, replicado) e o opt-in MXFP4 (use_fp4_indexer_cache): metade dos bytes lidos, com risco de drift na seleção top-k em contexto profundo.",
+  "prereqs": [
+   "fp8-fp4-microescala",
+   "mla",
+   "atencao-esparsa"
+  ],
+  "recipes": [
+   "glm",
+   "qwen",
+   "ds"
+  ],
+  "n_primary": 35,
+  "n_secondary": 13
+ },
+ {
+  "num": 24,
+  "id": "checkpoints",
+  "part": 4,
+  "title": "Checkpoints: safetensors, configs e integridade",
+  "navTitle": "Checkpoints",
+  "scope": "O que há dentro de um repositório de modelo no Hugging Face (config.json, generation_config, tokenizer, chat_template, *.safetensors, model.safetensors.index.json, hf_quant_config.json); formato safetensors (cabeçalho JSON + blobs, mmap, zero-copy) animado; sharding; nomes de tensores e como o loader do vLLM os mapeia (weight_loader, packed modules, stacked params); quantization_config e quant_method; --hf-overrides (inclusive aninhado) e patches de config (alias do índice da camada MTP no Qwen, detecção do dtype do PLE); criação de checkpoints híbridos (FP8-dense do Qwen: experts NVFP4 + densos FP8), dense overlay (GLM tools/dense_overlay.py), espelhos e snapshots imutáveis (GLM Mia-AiLab mirror, revisões fixas por hash), download (HF_TOKEN, termos de modelos com acesso restrito), verificação (check-weights/verify-weights, SHA-256), distribuição para o worker (rsync vs NFS). ADIÇÃO (completude): Layout do cache local do Hugging Face Hub (blobs, snapshots, refs/main) e modo offline (HF_HUB_OFFLINE=1): resolve_snapshot, hard-links para blobs e a armadilha do newline em refs/main.",
+  "prereqs": [
+   "quantizacao-fundamentos"
+  ],
+  "recipes": [
+   "glm",
+   "qwen",
+   "ds"
+  ],
+  "n_primary": 98,
+  "n_secondary": 46
+ },
+ {
+  "num": 25,
+  "id": "medindo-qualidade",
+  "part": 4,
+  "title": "Medindo o estrago: perplexidade, KLD e paridade numérica",
+  "navTitle": "Medindo qualidade",
+  "scope": "Por que “parece bom” não basta; perplexidade; divergência KL entre distribuições do modelo quantizado e da referência (nats; exemplo animado de duas distribuições), painéis de KLD (GLM 4 bpw 0,024555 vs FP8 0,024629); top-1 agreement; testes de paridade numérica entre kernels (tolerâncias, calibrated tests do GLM, numeric config), greedy determinístico e reprodutibilidade (patch de determinismo do Qwen), testes de fumaça funcionais (tool calling, JSON, contexto longo/needle), qualidade vs velocidade como fronteira de Pareto; como documentar resultados (datas, commits, imagens).",
+  "prereqs": [
+   "quantizacao-fundamentos",
+   "hadamard-trelica-exl3"
+  ],
+  "recipes": [
+   "glm",
+   "qwen",
+   "ds"
+  ],
+  "n_primary": 19,
+  "n_secondary": 19
+ },
+ {
+  "num": 26,
+  "id": "gpu-por-dentro",
+  "part": 5,
+  "title": "GPU por dentro: SMs, tensor cores e banda",
+  "navTitle": "GPU por dentro",
+  "scope": "Arquitetura de GPU: SMs, warps, threads, registradores, shared memory, L2, memória global; tensor cores e formatos suportados (BF16/FP8/FP4) por geração; compute capability (sm_90, sm_100, sm_120, sm_121/sm_121a do GB10 — Blackwell “de consumo”: o que muda para kernels escritos para datacenter), CUDA toolkit (cu130), PTX vs cubin, compilação para arquitetura específica; hierarquia e banda de memória: HBM vs LPDDR5X (GB10 ~273 GB/s por nó, 128 GB); roofline refinado com números do GB10; por que decode é limitado por banda (modelo de custo do passo do DeepSeek: bytes lidos por passo); GEMM vs GEMV revisitado; ocupação e latência de lançamento.",
+  "prereqs": [
+   "prefill-decode-kv",
+   "numeros-no-computador"
+  ],
+  "recipes": [
+   "glm",
+   "qwen",
+   "ds"
+  ],
+  "n_primary": 8,
+  "n_secondary": 27
+ },
+ {
+  "num": 27,
+  "id": "memoria-unificada",
+  "part": 5,
+  "title": "Memória unificada: CPU e GPU na mesma RAM",
+  "navTitle": "Memória unificada",
+  "scope": "UMA (Apple Silicon, Grace-Hopper/Blackwell, GB10): um único pool para CPU e GPU; o que gpu_memory_utilization significa quando o SO também usa a mesma RAM (valores das receitas: Qwen 0,835→0,80, etc.); page cache do Linux competindo com a GPU, MemAvailable, drop_caches, swap; carregamento a frio (cold load UMA patch do GLM: orçamento vs MemAvailable), InstantTensor, staging/read-ahead de safetensors, clone de 64 KiB (patch_loadclone), mmap; NFS para compartilhar pesos entre nós (head exporta, worker monta; opções); offload para CPU (tabela PLE do Qwen via handshake no host porque o GB10 não tem stream memory ops); orçamento completo de memória por nó (pesos + KV + ativações + CUDA graphs + SO) com figura interativa. ADIÇÃO (completude): Segurança do host em UMA: watchdog de memória (memwatch.sh, REQUIRE_IDLE_GPU, NV_ERR_NO_MEMORY no journal) contra hard-resets; tunables de VM (min_free_kbytes, watermarks) e cgroups, com seu custo medido; memória pinned (cuMemHostRegister), CUDA IPC e ZMQ entre processos no offload do PLE.",
+  "prereqs": [
+   "gpu-por-dentro"
+  ],
+  "recipes": [
+   "glm",
+   "qwen",
+   "ds"
+  ],
+  "n_primary": 90,
+  "n_secondary": 39
+ },
+ {
+  "num": 28,
+  "id": "kernels",
+  "part": 5,
+  "title": "Kernels: Triton, CUTLASS, Marlin, FlashInfer e b12x",
+  "navTitle": "Kernels",
+  "scope": "O que é um kernel e como é lançado; kernels memory-bound vs compute-bound; tiling e fusão (animado: 3 kernels vs 1 fundido); FlashAttention (softmax online em blocos) e derivados (FlashMLA, FlashInfer, sparse MLA, backends FLASH_ATTN/TRITON_ATTN/FLASHINFER e máscaras); linguagens: CUDA C++, CUTLASS/CuTe, Triton; GEMM quantizado (Marlin W4A16/FP8, dequant em registradores), MoE: fused MoE, grouped GEMM, experts “thin” vs “fat” (GLM E2/E3/FAST, kernel exl3_fat_moe), MoE cooperativo em 2 estágios para decode, b12x (DeepSeek W4A16 MXFP4, --moe-backend flashinfer_b12x; “não use --moe-backend marlin” no GLM), kernels de atenção linear (chunk_kda/FlashKDA); perfis de lançamento por GPU (QSA GB10 profiles), JIT vs AOT, determinismo; como um patch troca um kernel. ADIÇÃO (completude): Split-K/flash-decoding (particionar a sequência no decode e fundir por log-sum-exp); anatomia do mainloop de GEMM (cp.async multi-estágio, swizzle de shared memory, ldmatrix, atomics vetoriais); DeepGEMM, TileLang e CuTeDSL (alias de headers sm121→sm120); Programmatic Dependent Launch (PDL) e por que é desligado no SM12x; streams CUDA auxiliares para sobrepor GEMMs.",
+  "prereqs": [
+   "gpu-por-dentro",
+   "quantizacao-fundamentos"
+  ],
+  "recipes": [
+   "glm",
+   "qwen",
+   "ds"
+  ],
+  "n_primary": 110,
+  "n_secondary": 82
+ },
+ {
+  "num": 29,
+  "id": "cuda-graphs-warmup",
+  "part": 5,
+  "title": "CUDA graphs, torch.compile e warmup",
+  "navTitle": "CUDA graphs & warmup",
+  "scope": "Custo de lançamento de kernels na CPU vs duração do passo de decode; captura e replay de CUDA graphs (animado), tamanhos de captura (cudagraph capture sizes / max), graphs “piecewise” vs “full”, “breakable CUDA graphs” (DeepSeek, medições), torch.compile/Inductor e compilation-config, modo eager (--enforce-eager) para depurar; warmup de kernels e de formas (boot-shape warmup do GLM, kernel_warmup do DeepSeek), caches de compilação (Triton/Inductor cache, volumes montados); paridade entre ranks (ranks que capturam graphs diferentes travam o NCCL); tempo de boot e como encurtá-lo. ADIÇÃO (completude): Sincronização host-device no hot path (.item(), .tolist(), nonzero()) — custo de CPU e incompatibilidade com a captura; custom ops opacas (direct_register_custom_op, fake impl, mutates_args); autotuning de kernels (FlashInfer, ExLlamaV3) feito antes da captura, com táticas em cache coerentes entre ranks, e por que as receitas às vezes o desligam.",
+  "prereqs": [
+   "kernels"
+  ],
+  "recipes": [
+   "glm",
+   "qwen",
+   "ds"
+  ],
+  "n_primary": 48,
+  "n_secondary": 32
+ },
+ {
+  "num": 30,
+  "id": "vllm-arquitetura",
+  "part": 6,
+  "title": "Por dentro do vLLM",
+  "navTitle": "Arquitetura do vLLM",
+  "scope": "O que um motor de inferência faz; vLLM V1: API server (OpenAI), AsyncLLM, EngineCore (processo separado), Scheduler, KV cache manager, Executor (uniproc/mp/Ray), Workers, Model Runner (V1 vs V2 — relevante para os lanes do DeepSeek), sampler; registro de modelos (model registry, arquitetura do config → classe Python) e como um modelo novo é implementado; plugins de quantização (QuantizationConfig, LinearMethodBase, FusedMoEMethodBase — como o EXL3 foi plugado); seleção de backend de atenção; variáveis VLLM_* e flags; versões dev, forks e imagens customizadas (vLLM glm53-flash image, Anemll dspark-vllm-gx10 0.1.1, “unholy-fusion”, lane vLLM 0.30); overlays vs patches (arquivos inteiros substituídos vs edições pontuais) — conceito apenas, detalhado na Parte IX. ADIÇÃO (completude): Construção do modelo no meta device (sem alocar memória) e materialização seletiva de subárvores (usada pelo processo de offload do PLE).",
+  "prereqs": [
+   "cuda-graphs-warmup",
+   "tres-modelos"
+  ],
+  "recipes": [
+   "glm",
+   "qwen",
+   "ds"
+  ],
+  "n_primary": 27,
+  "n_secondary": 46
+ },
+ {
+  "num": 31,
+  "id": "paged-attention-kv",
+  "part": 6,
+  "title": "PagedAttention e o orçamento de KV cache",
+  "navTitle": "PagedAttention & KV",
+  "scope": "Fragmentação de memória e a ideia de paginação (animado: blocos físicos, tabela de blocos, sequências crescendo); block_size; como o vLLM calcula o espaço de KV (profile run: pesos + ativações de pico + graphs; gpu_memory_utilization × memória total − resto) com calculadora; linhas de boot “GPU KV cache size: N tokens”, “Maximum concurrency for X tokens per request”; max_model_len; KV cache híbrido: grupos por tipo de camada (atenção plena/MLA, indexer, SWA, Mamba/estado linear, drafter) e page sizes unificados (GLM grupos MLA+indexer, KpoolTail, 4×Mamba, drafter SWA com slot-share; páginas de 3584 tokens), log de capacidade do GLM, medições das três receitas (Qwen 1.340.476 tokens BF16; DeepSeek 2,33M tokens em 17,04 GiB; GLM — conferir); por que 1M de contexto + concorrência é seguro no DeepSeek (README “How the KV cache works”). ADIÇÃO (completude): Workspaces pré-alocados (workspace do indexador, scratch de kernels e split-K, workspace manager/lock_workspace) descontados do KV no profile run, e o 'rightsize' que devolve GiB ao pool.",
+  "prereqs": [
+   "vllm-arquitetura",
+   "kv-cache-quantizado",
+   "atencao-linear"
+  ],
+  "recipes": [
+   "glm",
+   "qwen",
+   "ds"
+  ],
+  "n_primary": 26,
+  "n_secondary": 42
+ },
+ {
+  "num": 32,
+  "id": "scheduler-batching",
+  "part": 6,
+  "title": "Scheduler, batching contínuo e chunked prefill",
+  "navTitle": "Scheduler & batching",
+  "scope": "Batching estático vs contínuo (animado); orçamento de tokens por passo (max_num_batched_tokens) e de sequências (max_num_seqs); chunked prefill (fatias de prefill misturadas com decodes), prioridade de decode, piso de decode (GLM fair scheduler v5, patch_scheduler_decode_floor, GLM53_MIXED_PREFILL_CHUNK=512), alinhamento de chunks para estados Mamba (patch_mamba_align_chunking), preempção e recomputação, agendamento assíncrono (placeholders -1 no DeepSeek), controle de admissão/fairness de prefills (issues do DeepSeek: inflight cap), escadas de concorrência (GLM 1M ctx, MNBT 2048, MAX_NUM_SEQS 16), perfis de serviço (“lanes” 1M/6, 200K/16) e como escolher os números para o seu workload. ADIÇÃO (completude): Passos mistos (prefill + decode) saem do CUDA graph FULL de batch uniforme e custam caro — a raiz do problema de fairness do GLM.",
+  "prereqs": [
+   "paged-attention-kv"
+  ],
+  "recipes": [
+   "glm",
+   "qwen",
+   "ds"
+  ],
+  "n_primary": 54,
+  "n_secondary": 15
+ },
+ {
+  "num": 33,
+  "id": "prefix-caching",
+  "part": 6,
+  "title": "Prefix caching: reaproveitando o que já foi calculado",
+  "navTitle": "Prefix caching",
+  "scope": "Por que prompts repetidos (system prompts, conversas, agentes de código) desperdiçam prefill; Automatic Prefix Caching: hash encadeado de blocos, tabela de hash, contagem de referência, evicção LRU (animado); taxa de acerto e métricas (vllm:prefix_cache_*); APC em modelos híbridos: estado recorrente só existe em pontos de checkpoint → acertos alinhados (GLM 3584 tokens; patch_hybrid_prefix_hit), retenção por grupo (per-group retention), no-store (não gravar certos prefixos), retenção esparsa e replay do DFlash; SWA e prefixos (DeepSeek dspark-swa-prefix); opt-out por requisição; LMCache (experimental, offload de KV); como medir (bench_prefix_cache, pares frio/quente).",
+  "prereqs": [
+   "scheduler-batching",
+   "atencao-linear"
+  ],
+  "recipes": [
+   "glm",
+   "qwen",
+   "ds"
+  ],
+  "n_primary": 46,
+  "n_secondary": 19
+ },
+ {
+  "num": 34,
+  "id": "api-tools-estruturado",
+  "part": 6,
+  "title": "A API: chat, Responses, ferramentas e saídas estruturadas",
+  "navTitle": "API, tools & JSON",
+  "scope": "Servidor compatível com OpenAI: /v1/models, /v1/chat/completions, /v1/completions, /v1/responses (stateful vs stateless, store, replay de histórico completo), streaming SSE; served-model-name, --api-key e chaves múltiplas com concorrência (DeepSeek keys patch); chat templates e kwargs (enable_thinking, reasoning effort), reasoning parsers (separar <think>), tool calling: --enable-auto-tool-choice, --tool-call-parser, formatos (DSML do DeepSeek e recuperação de tool calls malformadas, fail-closed), tool_choice none com bad_words (GLM), stop dormente até </think>; saídas estruturadas/guided decoding com xgrammar (máscara de tokens por gramática, animado) e o bug de terminação corrigido; detokenizer; limites (max_tokens vs thinking); compatibilidade com clientes (Codex, agentes, Responses API strict). ADIÇÃO (completude): Temperatura aplicada a tokens de sintaxe de tool call (DSML) corrompe chamadas a temp > 0: distinguir tokens de sintaxe e de payload.",
+  "prereqs": [
+   "geracao-amostragem",
+   "vllm-arquitetura"
+  ],
+  "recipes": [
+   "glm",
+   "qwen",
+   "ds"
+  ],
+  "n_primary": 77,
+  "n_secondary": 37
+ },
+ {
+  "num": 35,
+  "id": "especulacao-fundamentos",
+  "part": 7,
+  "title": "Decodificação especulativa: rascunhar e verificar",
+  "navTitle": "Especulação: fundamentos",
+  "scope": "Por que funciona: decode é memory-bound → verificar k tokens custa quase o mesmo que gerar 1; loop rascunho→verificação animado; amostragem por rejeição (aceita com prob min(1, p/q), reamostra do resíduo) e por que é “sem perdas”; token bônus; taxa de aceitação α e tokens esperados por passo (1−α^{k+1})/(1−α) com calculadora; escolha de k e custo do rascunhador; verificação greedy vs probabilística (draft_sample_method probabilistic); métodos: n-gram/prompt lookup, modelo rascunho separado, EAGLE/EAGLE3 (usa hidden states do alvo), MTP, block/diffusion drafters; --speculative-config e num_speculative_tokens; como a especulação interage com batching (lote de 1+k linhas por requisição) e com amostragem/temperatura. ADIÇÃO (completude): Rollback de estado recorrente na verificação em modelos híbridos: guardar num_spec+1 estados (SSM e conv state) e escolher pelo número de tokens aceitos.",
+  "prereqs": [
+   "prefill-decode-kv",
+   "geracao-amostragem",
+   "scheduler-batching"
+  ],
+  "recipes": [
+   "glm",
+   "qwen",
+   "ds"
+  ],
+  "n_primary": 13,
+  "n_secondary": 19
+ },
+ {
+  "num": 36,
+  "id": "mtp-eagle-vocab",
+  "part": 7,
+  "title": "MTP, EAGLE e rascunhos baratos",
+  "navTitle": "MTP, EAGLE & vocab reduzido",
+  "scope": "MTP como rascunhador (Qwen MTP=3; GLM SPEC_METHOD=mtp; DeepSeek MTP-5 em lanes antigas), EAGLE3: extrair hidden states de camadas do alvo (hooks do GLM, hc_post/hc_contract), custo do rascunho dominado pelo lm_head quando o vocabulário é enorme (248.320×2560); vocabulário reduzido (FR-Spec): rascunhar só nos ~47k tokens mais frequentes de inglês/código (draft_vocab_en_code_47k), mapeamento para o vocabulário completo, versão TP-aware, experimentos de 65.536 ids e o equilíbrio aceitação × custo; block drop (backport vllm#53388, disable_eagle_block_drop); medições de aceitação/decode do Qwen (TP2+EP, MTP=3). ADIÇÃO (completude): Reuso do top-k do indexador esparso entre passos do rascunho MTP (index_share_for_mtp_iteration no Qwen QSA, +6% a +27% em código; o MTP do GLM também reusa).",
+  "prereqs": [
+   "especulacao-fundamentos",
+   "ngram-mtp"
+  ],
+  "recipes": [
+   "glm",
+   "qwen",
+   "ds"
+  ],
+  "n_primary": 31,
+  "n_secondary": 13
+ },
+ {
+  "num": 37,
+  "id": "dflash-dspark",
+  "part": 7,
+  "title": "DFlash2 e DSpark: rascunhos em bloco",
+  "navTitle": "DFlash2 & DSpark",
+  "scope": "Rascunho em bloco/paralelo (inspirado em difusão): propor vários tokens de uma vez em vez de 1 por vez; DFlash2 do GLM (drafter de 5 camadas com SWA e KV bf16, contexto projetado dos hidden EAGLE3 do alvo, k=7, seletor de candidatos com “walk” de Gumbel, atenção do drafter FLASH_ATTN — por que TRITON_ATTN com máscara causal dentro do bloco derruba a aceitação), grupo de KV do drafter e compactação (patch_glm5_drafter_group, draft KV compact), k adaptativo (patch_adaptive_k); DSpark do DeepSeek (block_size 5: âncora + ruído processados em paralelo não-causal, depois amostragem sequencial esquerda→direita com Markov head de posto 256; features de camadas-alvo em ring buffer de janela deslizante com máscara de rejeitados; 3 camadas de draft em índices virtuais 43–45; num_speculative_tokens 6; block-k, rope-swa fix); números de aceitação e ganho de decode medidos nas duas receitas. ADIÇÃO (completude): Confidence head e verificação agendada por sobrevivência/limiar (VLLM_DSPARK_SPS_CURVE, enable_adaptive_verification); estado do rascunhador fora do KV exige slot estável por requisição sob continuous batching e lotes ragged via query_start_loc; quantização do drafter DFlash2 (EXL3 6 bpw com Hessiano sintético, K/V e seletor em BF16).",
+  "prereqs": [
+   "mtp-eagle-vocab"
+  ],
+  "recipes": [
+   "glm",
+   "qwen",
+   "ds"
+  ],
+  "n_primary": 86,
+  "n_secondary": 43
+ },
+ {
+  "num": 38,
+  "id": "paralelismos",
+  "part": 8,
+  "title": "Dividindo o modelo: TP, EP, PP, DP e DCP",
+  "navTitle": "Paralelismos",
+  "scope": "Por que dividir; tensor parallel animado: column-parallel e row-parallel, o par (col→row) com 1 all-reduce, onde ficam os all-reduces num bloco (atenção e MoE: DeepSeek 43+43 por passo); formas por GPU (Qwen TP2: tabelas de shapes); expert parallel (experts divididos entre GPUs, 256 por GPU no Qwen, all-to-all vs replicação), pipeline parallel (bolhas), data parallel, decode context parallel (DCP; card do GLM com TP2/EP2/DCP2), replicação vs partição do KV em MLA sob TP (DeepSeek replica), --mm-encoder-tp-mode data; volume de comunicação por token e quando cada paralelismo vale a pena em 2 nós ligados por rede (vs NVLink). ADIÇÃO (completude): Sequence parallelism no indexador (chaves comprimidas divididas entre ranks e merge exato dos top-k locais; opt-in, −6% de TTFT a 128K) e TP do rascunhador (draft_tensor_parallel_size: mesmo TP do alvo vs TP1, a 'divisibility tax' no TP3).",
+  "prereqs": [
+   "prefill-decode-kv",
+   "mixture-of-experts",
+   "mla"
+  ],
+  "recipes": [
+   "glm",
+   "qwen",
+   "ds"
+  ],
+  "n_primary": 16,
+  "n_secondary": 27
+ },
+ {
+  "num": 39,
+  "id": "nccl-rdma",
+  "part": 8,
+  "title": "Comunicação: coletivas, NCCL e RDMA",
+  "navTitle": "NCCL & RDMA",
+  "scope": "Coletivas (all-reduce ring/tree animado, all-gather, reduce-scatter, broadcast, all-to-all); modelo α-β (latência vs banda) e por que decode (mensagens pequenas) é sensível à latência; NCCL; RDMA, RoCE v2 vs InfiniBand, ConnectX-7 (200 Gb), HCA, GID e GID index, MTU; variáveis NCCL_* (SOCKET_IFNAME, IB_HCA, IB_GID_INDEX, IB_DISABLE, NET/plugins, DEBUG) e GLOO_SOCKET_IFNAME como aparecem nas receitas; resolução de HCA/GID (test-nccl-ib-hca-gid-resolve); torch.distributed, rendezvous (MASTER_ADDR/PORT), --nnodes/--node-rank/--headless, executor mp vs Ray, head vs worker; broadcast de metadados por shared memory (ring buffer SHM, hotfix issue117); SSH sem senha, containers com --network host/--ipc host/--privileged, dispositivos RDMA no Docker; diagnósticos (nccl-tests, ib_write_bw). ADIÇÃO (completude): Implementações de all-reduce do vLLM (PyNCCL, custom all-reduce, symmetric memory — no GB10 multi-nó só PyNCCL funciona); GPUDirect RDMA/DMA-BUF ausente no GB10 (coletivas via buffer no host); watchdog do NCCL (600 s) e flight recorder (TORCH_NCCL_*, TORCH_FR_*) para diagnosticar travas.",
+  "prereqs": [
+   "paralelismos"
+  ],
+  "recipes": [
+   "glm",
+   "qwen",
+   "ds"
+  ],
+  "n_primary": 126,
+  "n_secondary": 14
+ },
+ {
+  "num": 40,
+  "id": "tp3-tp4",
+  "part": 8,
+  "title": "Além de 2 nós: TP=3, TP=4 e divisibilidade",
+  "navTitle": "TP=3 & TP=4",
+  "scope": "Por que TP=3 é difícil: dimensões que precisam dividir por 3 (cabeças 64, o_groups 8, experts 288/256, vocab 129.280 % 3, hidden); padding e sharding desigual (dsv4_tp_pad, apply_tp3_patch), vocab-parallel embedding e parameter/weight_utils sobrescritos (overlay tp3 do GLM, FlyCockpit MIT), FlashKDA em TP3, cooperative MoE ABI2 64 linhas; topologias físicas com 3–4 nós (switch vs ligações diretas, pinos de CX7); números medidos (DeepSeek TP3 a 16 slots vs TP2 a 6; GLM TP3/TP4 throughput) e quando vale a pena crescer. ADIÇÃO (completude): Stalls distribuídos no TP4 e a mitigação por fatiamento da chamada final do sparse-MLA em ≤64 linhas (contorno, não correção da race).",
+  "prereqs": [
+   "nccl-rdma"
+  ],
+  "recipes": [
+   "glm",
+   "qwen",
+   "ds"
+  ],
+  "n_primary": 44,
+  "n_secondary": 28
+ },
+ {
+  "num": 41,
+  "id": "engenharia-de-receita",
+  "part": 9,
+  "title": "Engenharia de receita: imagens, overlays, patches e launchers",
+  "navTitle": "Engenharia de receita",
+  "scope": "Imagem Docker como base reprodutível (tags vs digests @sha256, multi-arch arm64, build com patches inline, compilação de extensões para sm_121a); overlays (arquivos inteiros) vs hotfixes pontuais; patches “source-exact” e “fail-closed” (fixar SHA-256 do alvo, recusar se diferente, publicar por os.replace atômico, auto-verificar), idempotência e ordem (GLM53_OVERLAY_ORDER, cadeia do entrypoint do DeepSeek), mesma ordem nos dois ranks; .env e precedência de configuração; o fluxo de um start.sh (checagens, SSH, rsync/NFS, subir containers no head e no worker, health checks, logs); testes em CPU com fixtures de arquivos upstream; CI de validação; CHANGELOG, versões, e como aposentar hacks quando o upstream corrige. ADIÇÃO (completude): Recriar vs reiniciar containers: overlays são reaplicados a cada start, então mudar um flag ou desfazer um hotfix exige ./stop + ./start (recriar), não restart.",
+  "prereqs": [
+   "vllm-arquitetura",
+   "nccl-rdma",
+   "checkpoints"
+  ],
+  "recipes": [
+   "glm",
+   "qwen",
+   "ds"
+  ],
+  "n_primary": 6,
+  "n_secondary": 213
+ },
+ {
+  "num": 42,
+  "id": "receita-glm",
+  "part": 9,
+  "title": "Reconstruindo a receita GLM-5.3-Flash EXL3",
+  "navTitle": "Receita GLM",
+  "scope": "Reconstrução conceitual passo a passo da receita GLM (use glm-launch.md §6 e glm-mods.md §6): orçamento, hardware/rede, imagem e patches de build, pesos (espelho EXL3), overlays na ordem, argumentos do vllm serve (explicar cada um e seus valores/perfis), KV fp8_ds_mla e grupos, DFlash2 k=7 + adaptive-k, prefix caching híbrido, scheduler fair, opções (dense FP8, cooperative MoE, E3 fat prefill, InstantTensor, NFS, ABLIT, TP3/TP4, perfil tp2-long-coding), verificação e números medidos (decode/prefill/concorrência/KLD); cada passo linkando o capítulo do conceito. Figura: “linha do tempo do boot” e “mapa de decisões”.",
+  "prereqs": [
+   "engenharia-de-receita"
+  ],
+  "recipes": [
+   "glm"
+  ],
+  "n_primary": 49,
+  "n_secondary": 6
+ },
+ {
+  "num": 43,
+  "id": "receita-qwen",
+  "part": 9,
+  "title": "Reconstruindo a receita Qwen3.8-Flash-Next NVFP4",
+  "navTitle": "Receita Qwen",
+  "scope": "Reconstrução conceitual passo a passo da receita Qwen (qwen-launch.md §6 e qwen-mods.md §6): orçamento de bytes, hardware/rede, imagem (day-0 vs lane vLLM 0.30 vs TP1), pesos (NVFP4 nvidia / local-inference-lab / RadixArk / FP8 oficial / FP8-dense / ABLIT), correções de checkpoint e loader (PLE, MTP alias, FP8 block MoE, MXFP8 fallback), argumentos (TP2+EP, MTP=3, GMU, max-model-len 262144, max-num-seqs, MNBT, KV FP8, mm-encoder-tp-mode, YaRN opcional), vocabulário reduzido do drafter, verificação (check/verify weights, logs de KV) e números (lanes day-0 e 0.30); gotchas.",
+  "prereqs": [
+   "engenharia-de-receita"
+  ],
+  "recipes": [
+   "qwen"
+  ],
+  "n_primary": 54,
+  "n_secondary": 26
+ },
+ {
+  "num": 44,
+  "id": "receita-deepseek",
+  "part": 9,
+  "title": "Reconstruindo a receita DeepSeek-V4-Flash DSpark",
+  "navTitle": "Receita DeepSeek",
+  "scope": "Reconstrução conceitual passo a passo da receita DeepSeek (ds-launch.md e ds-mods.md): as três lanes (Anemll default, Stage-C, official-main), imagem Anemll 0.1.1, pesos (Vision-Exp vs 0731, revisões fixas), NFS opcional, cadeia de hotfixes no entrypoint (o que cada grupo corrige), argumentos (TP2 mp, 1M ctx, nvfp4_ds_mla, DSpark k=6 probabilístico, moe-backend flashinfer_b12x, MNBT/seqs, thinking budgets, Responses API, tool parser DSML), TP3 opcional, Stage-C 200K/16, visão, verificação (strict Responses verifier, audit values), números medidos (lanes, A/Bs, aceitação, modelo de custo do passo).",
+  "prereqs": [
+   "engenharia-de-receita"
+  ],
+  "recipes": [
+   "ds"
+  ],
+  "n_primary": 46,
+  "n_secondary": 34
+ },
+ {
+  "num": 45,
+  "id": "benchmarking",
+  "part": 9,
+  "title": "Medindo desempenho: TTFT, TPOT, escadas e A/B/A",
+  "navTitle": "Benchmarking",
+  "scope": "Métricas (TTFT, TPOT/ITL, tokens/s por usuário vs agregado, prefill tok/s, aceitação especulativa, capacidade de KV); metodologia: prompts frios únicos vs quentes, thinking desligado, max_tokens=min_tokens fixos, warmup, repetições, mediana/p95, escada de concorrência, A/B/A (uma variável por vez), registrar commit/imagem/data; ferramentas das receitas (bench_decode, bench_concurrency, bench_prefix_cache, sweep.py, bench-miaai, ab-measure) e como ler seus resultados; números das três receitas comparados com cautela (hardware igual, workloads diferentes); modelo de custo do passo (fable report) para prever antes de medir; armadilhas (cache quente, thermal, NCCL fallback para TCP, logs). ADIÇÃO (completude): Endpoint /metrics (Prometheus): contadores cumulativos (spec_decode_* por posição, prefix_cache_*, inter_token_latency) lidos por delta antes/depois de cada braço; canários e gates de aceitação no boot.",
+  "prereqs": [
+   "receita-glm",
+   "receita-qwen",
+   "receita-deepseek"
+  ],
+  "recipes": [
+   "glm",
+   "qwen",
+   "ds"
+  ],
+  "n_primary": 38,
+  "n_secondary": 25
+ },
+ {
+  "num": 46,
+  "id": "receita-do-zero",
+  "part": 9,
+  "title": "Tutorial: sua receita para um modelo recém-lançado",
+  "navTitle": "Receita do zero",
+  "scope": "Tutorial prático completo usando o modelo recém-lançado escolhido em new-model-tutorial.md: triagem do card/config, matemática de memória, escolha de quantização/checkpoint (ou quantizar e medir KLD), topologia, suporte no motor (o que falta, como escrever overlay/patch source-exact, teste numérico contra HF), args de lançamento, especulação, validação, benchmark, tuning iterativo com critérios de decisão, empacotamento (Dockerfile, .env, start.sh, README, CHANGELOG). Com comandos e snippets explicados, e checklist final. Cada passo aponta os capítulos de conceito.",
+  "prereqs": [
+   "benchmarking"
+  ],
+  "recipes": [
+   "glm",
+   "qwen",
+   "ds"
+  ],
+  "n_primary": 0,
+  "n_secondary": 0
+ },
+ {
+  "num": 47,
+  "id": "laboratorio",
+  "part": 9,
+  "title": "Laboratório: o construtor de receitas",
+  "navTitle": "Laboratório",
+  "scope": "Capítulo-ferramenta interativo: o leitor escolhe (ou digita) a arquitetura (presets GLM-5.3-Flash, Qwen3.8-Flash-Next, DeepSeek-V4-Flash, o modelo novo do tutorial, ou campos livres: camadas, hidden, experts, top-k, tipos de atenção, KV por token), formato de pesos (BF16/FP8/NVFP4/MXFP4/EXL3 bpw), nós/TP/EP, contexto, concorrência, KV dtype, método especulativo (k, α) → calcula memória por nó (pesos, KV, estado, ativações, graphs, SO), capacidade de KV em tokens, concorrência máxima para um contexto, teto de tok/s de decode por banda com e sem especulação, e gera um esqueleto de .env + comando vllm serve comentado, com alertas (“não cabe”, “TP não divide heads”, “vocab não divide por 3”) e links para os capítulos. Várias figuras vivas (barras de memória, velocímetro, diagrama de topologia).",
+  "prereqs": [
+   "receita-do-zero"
+  ],
+  "recipes": [
+   "glm",
+   "qwen",
+   "ds"
+  ],
+  "n_primary": 0,
+  "n_secondary": 0
+ },
+ {
+  "num": 48,
+  "id": "motor-exato-tensorfold",
+  "part": 9,
+  "title": "Um motor exato: como o TensorFold pensa a inferência",
+  "navTitle": "Motor exato (TensorFold)",
+  "scope": "O TensorFold como segundo motor de inferência (alternativa ao vLLM) e as ideias de projeto que o diferenciam: motor por família de modelo vs motor genérico; exatidão como invariante (rascunho = decodificação serial, concorrente = solo, retomado = fresco; invariância de lote; kernels row-independent); amostragem chaveada (chave derivada do prompt/seed/posição, Gumbel-max, por que a verificação especulativa vira teste de igualdade); não-associatividade do fp32 e TP por all-gather de parciais fp32 somadas em ordem de rank (em vez de all-reduce); um rank por Spark, rendezvous TCPStore, NCCL via ctypes, protocolo \"rank 0 decide / rank 1 aplica\" (ADMIT/EVICT/MOVE/GROW/FILL/ROUND…), doorbell ocioso; orçamento de memória MemAvailable − reserva e o congelamento em memória unificada; pool de KV por token compartilhado entre streams com extents de 2048 tokens (vs páginas do PagedAttention); estados de prompt guardados em grade de 64 tokens, prefixo compartilhado e replay (vs APC); janelas de verificação e rounds com CUDA graphs por tamanho de janela; all-gather RDMA de um tiro (RoCE WRITE, flags, epoch) vs NCCL; tabela comparativa vLLM × TensorFold de decisões e trade-offs (o que se ganha, o que se perde: logprobs, n>1, penalidades, generalidade).",
+  "prereqs": [
+   "vllm-arquitetura",
+   "paged-attention-kv",
+   "prefix-caching",
+   "especulacao-fundamentos",
+   "nccl-rdma"
+  ],
+  "recipes": [
+   "glm",
+   "tf"
+  ],
+  "sources": [
+   "docs/pesquisa/tensorfold-overview.md",
+   "docs/pesquisa/tensorfold-patches-a.md",
+   "docs/pesquisa/tensorfold-patches-b.md"
+  ],
+  "minutes": 45
+ },
+ {
+  "num": 49,
+  "id": "receita-glm-tensorfold",
+  "part": 9,
+  "title": "Trocando o motor: a receita GLM no TensorFold",
+  "navTitle": "Receita GLM · TensorFold",
+  "scope": "Reconstrução conceitual passo a passo da receita GLM-5.3-Flash EXL3 sobre TensorFold v0.6.0 + 53 patches (repo v1.3.2): requisitos (2 Sparks, link CX7 direto, RoCE v2 GID, ssh), start.sh/prepare.sh/stop.sh (5 etapas, imagem com hash dos patches, GHCR, pull vs build, digest pinado, patch -p0 em ordem, revision pins, NFS), TODOS os parâmetros de scripts/config.sh (PARALLEL, CONTEXT, KV, DENSE q4/fp8/bf16, DRAFTER dflash2/mtp, DRAFT_POLICY fnc7:0.3, COPY/COPY_MAX/COPY_CODE, SHARED_PREFIX, MAX_TOKENS, THINKING, VISION, COMM roce/nccl, SPLIT, KDA_CHUNKED, TF_GLM_L2PF, TF_GLM_EXL3_LOADS, TF_ROCE_MAX_KB, TF_ROCE_WAIT_S, TF_GLM_MULTI_LONE, TF_GLM_CACHE_ENTRIES, MULTI_PREFILL, KV_POOL_GIB, MEMORY_RESERVE_GIB, limites de visão, etc.) agrupados por fase com o porquê; os patches por área (pesos, KV, prompt, prompt em 2 Sparks, KDA, reuso, decode, memória, indexer, link, rascunhos, concorrência, amostragem, servidor) com efeitos medidos; números (decode 1–4 requisições prosa/estruturado, TTFT, prefill até ~982k tokens com needle, reuso 34 s → <0,07 s, GSM8K/HumanEval, pool 2.922.496 tokens) com condições (clocks 2.200 MHz, sparkDash); comparação honesta com a receita vLLM (cap. 42) — não é A/B controlado; licença do DFlash2 (CC BY-NC-ND) vs DRAFTER=mtp; ressalvas (q4 e francês, KV fp8 com perda); checklist de reprodução.",
+  "prereqs": [
+   "motor-exato-tensorfold",
+   "receita-glm"
+  ],
+  "recipes": [
+   "tf",
+   "glm"
+  ],
+  "sources": [
+   "docs/pesquisa/tensorfold-overview.md",
+   "docs/pesquisa/tensorfold-patches-a.md",
+   "docs/pesquisa/tensorfold-patches-b.md"
+  ],
+  "minutes": 45
+ },
+ {
+  "num": 50,
+  "id": "pos-treino-mapa",
+  "part": 10,
+  "title": "O mapa do pós-treino: do modelo base ao assistente",
+  "navTitle": "Mapa do pós-treino",
+  "scope": "Abertura do Módulo 2. Por que pós-treinar (base → instruct → reasoning; o que o pré-treino não entrega: formato, seguir instruções, preferências, segurança, raciocínio verificável); o pipeline típico (SFT → otimização de preferência → RL) e variações modernas (distilação on-policy, RLVR, MOPD do MiMo); taxonomia visual de TODOS os métodos do módulo (SFT; RLHF = preferências + reward model + PPO; DPO, IPO, KTO, SimPO; PPO, AWR, contrastivo, RM + RL customizado (A3C, TRPO, GRPO…); Constitutional AI; self-play e debate) com o que cada um exige (dados pareados/binários/verificáveis, reward model, modelo de referência, rollouts on-policy, custo); conceitos transversais: objetivo com KL ao modelo de referência e por que ele existe, on-policy vs off-policy, recompensa vs preferência, quem \"julga\" (humano, IA, verificador); o que se sabe do pós-treino das famílias do Módulo 1 (GLM-5.x, Qwen3.x, DeepSeek V3/R1/V4, MiMo MOPD) — com fontes; ponte com o Módulo 1 (inferência dentro do loop de RL, servir o modelo pós-treinado); como estudar o módulo.",
+  "prereqs": [
+   "geracao-amostragem",
+   "aprender-com-dados"
+  ],
+  "recipes": [
+   "glm",
+   "qwen",
+   "ds"
+  ],
+  "sources": [
+   "docs/pesquisa/pos-treino-sft-sistemas.md",
+   "docs/pesquisa/pos-treino-rm-rl-ppo.md",
+   "docs/pesquisa/pos-treino-dpo-familia.md",
+   "docs/pesquisa/pos-treino-grpo-cai-selfplay.md",
+   "docs/pesquisa/pos-treino-avaliacao-receita.md"
+  ],
+  "minutes": 35
+ },
+ {
+  "num": 51,
+  "id": "treino-memoria-lora",
+  "part": 10,
+  "title": "Treinar não é inferir: memória, otimizadores, ZeRO e LoRA",
+  "navTitle": "Memória de treino & LoRA",
+  "scope": "Matemática de memória do treino vs inferência (pesos, gradientes, momentos do AdamW, pesos mestres FP32 em precisão mista; bytes/parâmetro) com calculadora interativa; ativações e gradient checkpointing; precisão mista BF16/FP8 no treino; otimizadores (SGD, Adam/AdamW, Muon — usado no pré-treino do Qwen3.8 — e seus estados), schedules de LR (warmup, cosine), packing e comprimento de sequência; paralelismo de treino: data parallel, ZeRO-1/2/3, FSDP, e TP/PP/EP para treino (ligar ao cap. de paralelismos de inferência); PEFT: LoRA (W + BA, rank r, α, módulos-alvo, inicialização), QLoRA (NF4, dupla quantização, otimizadores paginados), DoRA, LoRA em experts de MoE; merge de adaptadores; o que cabe em 2× DGX Spark (full FT vs LoRA/QLoRA para 8B/30B/100B+ e MoE) e num Mac M4 24 GB com MLX — números das fontes, estimativas rotuladas.",
+  "prereqs": [
+   "pos-treino-mapa",
+   "memoria-unificada",
+   "paralelismos",
+   "quantizacao-fundamentos"
+  ],
+  "recipes": [
+   "qwen"
+  ],
+  "sources": [
+   "docs/pesquisa/pos-treino-sft-sistemas.md",
+   "docs/pesquisa/pos-treino-rm-rl-ppo.md",
+   "docs/pesquisa/pos-treino-dpo-familia.md",
+   "docs/pesquisa/pos-treino-grpo-cai-selfplay.md",
+   "docs/pesquisa/pos-treino-avaliacao-receita.md"
+  ],
+  "minutes": 40
+ },
+ {
+  "num": 52,
+  "id": "sft",
+  "part": 10,
+  "title": "Supervised Fine-Tuning: aprendendo com demonstrações",
+  "navTitle": "SFT",
+  "scope": "SFT como fundação de todos os métodos: entropia cruzada de próximo token sobre demonstrações (ligar ao cap. 1), máscara de perda só nos tokens do assistente, chat templates e tokens especiais (ligar ao cap. 5), formatos de dados (JSONL de mensagens), packing; dados: qualidade vs quantidade (LIMA etc.), diversidade, dados sintéticos e distilação de modelos mais fortes, rejection-sampling fine-tuning (RFT/STaR), filtragem; distilação on-policy e MOPD (Multi-Teacher On-Policy Distillation do MiMo-V2.6: vantagem por token log π_teacher − log π_student, MOPD2) — com números das fontes; hiperparâmetros (LR, épocas, batch) e curvas de treino; esquecimento catastrófico e como medir; overfitting de formato; SFT para raciocínio (traces longos) e tool use; avaliação de um SFT; frameworks (TRL SFTTrainer, Unsloth, Axolotl, LLaMA-Factory, torchtune, mlx-lm lora) com configurações reais.",
+  "prereqs": [
+   "treino-memoria-lora",
+   "tokens-embeddings",
+   "aprender-com-dados"
+  ],
+  "recipes": [
+   "qwen",
+   "ds"
+  ],
+  "sources": [
+   "docs/pesquisa/pos-treino-sft-sistemas.md",
+   "docs/pesquisa/pos-treino-rm-rl-ppo.md",
+   "docs/pesquisa/pos-treino-dpo-familia.md",
+   "docs/pesquisa/pos-treino-grpo-cai-selfplay.md",
+   "docs/pesquisa/pos-treino-avaliacao-receita.md"
+  ],
+  "minutes": 45
+ },
+ {
+  "num": 53,
+  "id": "preferencias-reward-models",
+  "part": 11,
+  "title": "Preferências humanas e reward models",
+  "navTitle": "Preferências & RMs",
+  "scope": "Por que comparações (e não notas absolutas); formatos (pares, rankings, Likert, binário); coleta on/off-policy, diretrizes, concordância entre anotadores (κ de Cohen); datasets (HH-RLHF, UltraFeedback, HelpSteer…); o modelo de Bradley–Terry (derivação via Gumbel/Thurstone/Elo), Plackett–Luce e os C(K,2) pares do InstructGPT; perda do RM −log σ(r_w − r_l) com gradiente e figura interativa; arquitetura (LM + cabeça escalar, leitura no EOS), treino, calibração, viés de comprimento; reward hacking e sobre-otimização (leis de escala de Gao), ensembles/WARM; ORM vs PRM (PRM800K, Math-Shepherd); RMs generativos e LLM-as-judge; RLAIF; RewardBench.",
+  "prereqs": [
+   "pos-treino-mapa",
+   "sft"
+  ],
+  "recipes": [],
+  "sources": [
+   "docs/pesquisa/pos-treino-sft-sistemas.md",
+   "docs/pesquisa/pos-treino-rm-rl-ppo.md",
+   "docs/pesquisa/pos-treino-dpo-familia.md",
+   "docs/pesquisa/pos-treino-grpo-cai-selfplay.md",
+   "docs/pesquisa/pos-treino-avaliacao-receita.md"
+  ],
+  "minutes": 40
+ },
+ {
+  "num": 54,
+  "id": "rl-fundamentos",
+  "part": 11,
+  "title": "RL para LLMs: policy gradient, A3C e TRPO",
+  "navTitle": "Fundamentos de RL",
+  "scope": "O LLM como política: MDP no nível do token vs da sequência, estado/ação/recompensa, retorno; teorema do policy gradient e REINFORCE (derivação do log-derivative trick) com animação; variância e baselines; vantagem, função valor, TD, GAE(γ, λ) com exemplo numérico; on-policy vs off-policy e importance sampling (e por que divergência entre a política de treino e a do motor de inferência importa — ligar ao Módulo 1); atores assíncronos: A2C/A3C (Mnih 2016) e IMPALA/V-trace; região de confiança: TRPO (restrição de KL, gradiente natural, gradiente conjugado, busca em linha) e por que ela motivou o PPO; onde A3C/TRPO ainda importam hoje.",
+  "prereqs": [
+   "preferencias-reward-models",
+   "aprender-com-dados"
+  ],
+  "recipes": [],
+  "sources": [
+   "docs/pesquisa/pos-treino-sft-sistemas.md",
+   "docs/pesquisa/pos-treino-rm-rl-ppo.md",
+   "docs/pesquisa/pos-treino-dpo-familia.md",
+   "docs/pesquisa/pos-treino-grpo-cai-selfplay.md",
+   "docs/pesquisa/pos-treino-avaliacao-receita.md"
+  ],
+  "minutes": 45
+ },
+ {
+  "num": 55,
+  "id": "ppo-rlhf",
+  "part": 11,
+  "title": "PPO e o pipeline RLHF",
+  "navTitle": "PPO & RLHF",
+  "scope": "PPO: objetivo substituto com clipping (figura interativa da função clip), perda de valor, bônus de entropia, várias épocas por lote; o pipeline RLHF do InstructGPT (SFT → RM → PPO) e a recompensa com penalidade de KL r − β·KL(π‖π_ref), controle adaptativo de KL, PPO-ptx; os quatro modelos na memória (política, referência, recompensa, crítico) e a conta de memória; geração de rollouts com um motor de inferência no loop (vLLM/SGLang), sincronização de pesos, colocado vs desagregado, RL assíncrono (ligar ao Módulo 1); instabilidades e truques (normalização de recompensa/vantagem, clipping de valor, whitening), custo computacional; estado atual das ferramentas (TRL removeu o PPOTrainer na v1.13; OpenRLHF, verl) — com fontes.",
+  "prereqs": [
+   "rl-fundamentos",
+   "preferencias-reward-models"
+  ],
+  "recipes": [],
+  "sources": [
+   "docs/pesquisa/pos-treino-sft-sistemas.md",
+   "docs/pesquisa/pos-treino-rm-rl-ppo.md",
+   "docs/pesquisa/pos-treino-dpo-familia.md",
+   "docs/pesquisa/pos-treino-grpo-cai-selfplay.md",
+   "docs/pesquisa/pos-treino-avaliacao-receita.md"
+  ],
+  "minutes": 45
+ },
+ {
+  "num": 56,
+  "id": "grpo-rlvr",
+  "part": 11,
+  "title": "Reward model + RL customizado: GRPO, RLOO e recompensas verificáveis",
+  "navTitle": "GRPO & RLVR",
+  "scope": "RL além do PPO com reward models explícitos ou verificadores: ReMax, RLOO, REINFORCE++, GRPO (vantagem relativa ao grupo, sem crítico, termo de KL), Dr. GRPO, DAPO (clip-higher, amostragem dinâmica, perda por token), GSPO, CISPO e variantes 2025–2026 das fontes; RLVR (verificadores de matemática, testes de código), recompensas de processo vs resultado; a receita do DeepSeek-R1/R1-Zero (multi-estágio); colapso de entropia/comprimento e reward hacking em RLVR; descompasso treino↔inferência e estabilidade de MoE (TIS, IcePop do GLM-5, correções do DeepSeek-V3.2: KL corrigido, keep routing, R3, roteador congelado do MiMo, cabeça em FP32) — ponte direta com o Módulo 1; quando A3C/TRPO ainda entram; exemplos numéricos de vantagens de grupo.",
+  "prereqs": [
+   "ppo-rlhf",
+   "rl-fundamentos"
+  ],
+  "recipes": [
+   "glm",
+   "ds",
+   "qwen"
+  ],
+  "sources": [
+   "docs/pesquisa/pos-treino-sft-sistemas.md",
+   "docs/pesquisa/pos-treino-rm-rl-ppo.md",
+   "docs/pesquisa/pos-treino-dpo-familia.md",
+   "docs/pesquisa/pos-treino-grpo-cai-selfplay.md",
+   "docs/pesquisa/pos-treino-avaliacao-receita.md"
+  ],
+  "minutes": 45
+ },
+ {
+  "num": 57,
+  "id": "dpo",
+  "part": 12,
+  "title": "DPO: otimização direta de preferências",
+  "navTitle": "DPO",
+  "scope": "Do objetivo de RL com KL à solução fechada π* ∝ π_ref·exp(r/β) (desigualdade de Gibbs, passo a passo); inversão r = β·log(π/π_ref) + β·log Z e por que Z cancela no Bradley–Terry; a perda do DPO e seu gradiente (peso adaptativo) com figura interativa; recompensa implícita; papel de β e do modelo de referência (pré-computar log-probs, LoRA com adaptador desligado, referência móvel TR-DPO); offline vs online/iterativo; modos de falha com números das fontes (overfitting a preferências determinísticas, deslocamento de likelihood, verbosidade, sobre-otimização, OOD); hiperparâmetros publicados e o que monitorar (margens, acurácia de recompensa, log-probs escolhidas/rejeitadas); TRL DPOTrainer.",
+  "prereqs": [
+   "preferencias-reward-models",
+   "ppo-rlhf"
+  ],
+  "recipes": [],
+  "sources": [
+   "docs/pesquisa/pos-treino-sft-sistemas.md",
+   "docs/pesquisa/pos-treino-rm-rl-ppo.md",
+   "docs/pesquisa/pos-treino-dpo-familia.md",
+   "docs/pesquisa/pos-treino-grpo-cai-selfplay.md",
+   "docs/pesquisa/pos-treino-avaliacao-receita.md"
+  ],
+  "minutes": 45
+ },
+ {
+  "num": 58,
+  "id": "ipo-kto-simpo",
+  "part": 12,
+  "title": "IPO, KTO e SimPO: variações sobre o tema",
+  "navTitle": "IPO, KTO & SimPO",
+  "scope": "IPO — Identity Preference Optimization (o pedido o chamou de \"Identity Policy Optimization\"; explique o nome correto do paper de Azar et al. 2023): o framework ΨPO, por que o DPO superajusta preferências determinísticas, a perda quadrática em direção a 1/(2τ), τ; KTO (Ethayarajh et al. 2024): teoria do prospecto (função valor de Kahneman–Tversky, aversão à perda), HALOs, perda com ponto de referência z0 (estimativa de KL), λ_D/λ_U, feedback binário bom/ruim, desbalanceamento; SimPO (Meng et al. 2024): recompensa = log-prob média normalizada por comprimento, margem alvo γ, sem modelo de referência, faixas de β; também ORPO, CPO, R-DPO/DPO regularizado por comprimento, β-DPO; tabela comparativa (precisa de referência? pares ou binário? memória/compute, estabilidade, hiperparâmetros típicos, quando usar); exemplo numérico calculando DPO/IPO/KTO/SimPO no mesmo par (figura interativa).",
+  "prereqs": [
+   "dpo"
+  ],
+  "recipes": [],
+  "sources": [
+   "docs/pesquisa/pos-treino-sft-sistemas.md",
+   "docs/pesquisa/pos-treino-rm-rl-ppo.md",
+   "docs/pesquisa/pos-treino-dpo-familia.md",
+   "docs/pesquisa/pos-treino-grpo-cai-selfplay.md",
+   "docs/pesquisa/pos-treino-avaliacao-receita.md"
+  ],
+  "minutes": 45
+ },
+ {
+  "num": 59,
+  "id": "awr-contrastivo",
+  "part": 12,
+  "title": "AWR e aprendizado contrastivo",
+  "navTitle": "AWR & contrastivo",
+  "scope": "AWR (Peng et al. 2019): regressão ponderada por vantagem, objetivo E[log π(a|s)·exp(A/β)], relação com o ótimo do RL regularizado por KL (pesos exp(A/β)), RWR, AWAC; como essa ideia aparece no pós-treino de LLMs (SFT ponderado, behavior cloning filtrado, RAFT/ReST, rejection sampling); aprendizado contrastivo: intuição do InfoNCE, SLiC/SLiC-HF (perda de calibração com margem + regularização), Contrastive Preference Learning (CPL), unlikelihood training, e como todos se relacionam com o DPO (mapa de parentesco); quando escolher regressão/contraste em vez de RL; exemplos numéricos animados.",
+  "prereqs": [
+   "dpo",
+   "rl-fundamentos",
+   "sft"
+  ],
+  "recipes": [],
+  "sources": [
+   "docs/pesquisa/pos-treino-sft-sistemas.md",
+   "docs/pesquisa/pos-treino-rm-rl-ppo.md",
+   "docs/pesquisa/pos-treino-dpo-familia.md",
+   "docs/pesquisa/pos-treino-grpo-cai-selfplay.md",
+   "docs/pesquisa/pos-treino-avaliacao-receita.md"
+  ],
+  "minutes": 40
+ },
+ {
+  "num": 60,
+  "id": "constitutional-ai",
+  "part": 13,
+  "title": "Constitutional AI: princípios, autocrítica e RLAIF",
+  "navTitle": "Constitutional AI",
+  "scope": "Constitutional AI (Bai et al. 2022): a constituição (princípios explícitos), SL-CAI (gerar → criticar → revisar → SFT nas revisões) e RL-CAI (rótulos de preferência gerados por IA → modelo de preferência → RL = RLAIF); helpfulness vs harmlessness; como combinar com SFT e RL; desenvolvimentos posteriores (Collective CAI, deliberative alignment, treinamento baseado em especificação); relação com a abliteração do Módulo 1 (editar uma direção vs ensinar princípios) e com avaliação de segurança; limites e riscos; tratamento educativo e responsável.",
+  "prereqs": [
+   "preferencias-reward-models",
+   "ppo-rlhf",
+   "sft",
+   "abliteracao"
+  ],
+  "recipes": [],
+  "sources": [
+   "docs/pesquisa/pos-treino-sft-sistemas.md",
+   "docs/pesquisa/pos-treino-rm-rl-ppo.md",
+   "docs/pesquisa/pos-treino-dpo-familia.md",
+   "docs/pesquisa/pos-treino-grpo-cai-selfplay.md",
+   "docs/pesquisa/pos-treino-avaliacao-receita.md"
+  ],
+  "minutes": 35
+ },
+ {
+  "num": 61,
+  "id": "self-play-debate",
+  "part": 13,
+  "title": "Self-play e debate",
+  "navTitle": "Self-play & debate",
+  "scope": "Métodos em que modelos otimizam por interação competitiva ou comparativa: AI Safety via Debate (Irving et al. 2018) e trabalhos empíricos posteriores, debate multiagente para raciocínio (Du et al. 2023), SPIN (self-play fine-tuning), Self-Rewarding LMs, SPPO, self-play para raciocínio (tarefas autopropostas no estilo Absolute Zero), jogos de verificador; utilidade para alinhamento e raciocínio, riscos (colapso, recompensa autorreferente) e como avaliar; exemplos animados de rodadas de debate e de self-play.",
+  "prereqs": [
+   "grpo-rlvr",
+   "dpo",
+   "constitutional-ai"
+  ],
+  "recipes": [],
+  "sources": [
+   "docs/pesquisa/pos-treino-sft-sistemas.md",
+   "docs/pesquisa/pos-treino-rm-rl-ppo.md",
+   "docs/pesquisa/pos-treino-dpo-familia.md",
+   "docs/pesquisa/pos-treino-grpo-cai-selfplay.md",
+   "docs/pesquisa/pos-treino-avaliacao-receita.md"
+  ],
+  "minutes": 35
+ },
+ {
+  "num": 62,
+  "id": "avaliacao-pos-treino",
+  "part": 13,
+  "title": "Avaliando modelos pós-treinados",
+  "navTitle": "Avaliação",
+  "scope": "Quatro eixos: alvo, regressão de capacidades, segurança e deriva (KL da referência); win rate com intervalos de confiança por bootstrap e tamanhos de amostra; Bradley–Terry/Elo (Chatbot Arena) e crítica do \"Leaderboard Illusion\"; LLM-as-judge e vieses (posição, verbosidade, autopreferência) e painéis de juízes (usar as três famílias do Módulo 1 como painel); AlpacaEval com controle de comprimento, Arena-Hard, MT-Bench, IFEval, GSM8K/MATH/AIME, código (HumanEval/LiveCodeBench/SWE-bench), agentes/tools, segurança (recusas, jailbreak); contaminação; diagnósticos de reward hacking; lm-eval-harness; versões e benchmarks atuais (2026) das fontes.",
+  "prereqs": [
+   "pos-treino-mapa",
+   "medindo-qualidade",
+   "preferencias-reward-models"
+  ],
+  "recipes": [],
+  "sources": [
+   "docs/pesquisa/pos-treino-sft-sistemas.md",
+   "docs/pesquisa/pos-treino-rm-rl-ppo.md",
+   "docs/pesquisa/pos-treino-dpo-familia.md",
+   "docs/pesquisa/pos-treino-grpo-cai-selfplay.md",
+   "docs/pesquisa/pos-treino-avaliacao-receita.md"
+  ],
+  "minutes": 40
+ },
+ {
+  "num": 63,
+  "id": "receita-pos-treino",
+  "part": 13,
+  "title": "Receita: pós-treinar, quantizar e servir",
+  "navTitle": "Receita de pós-treino",
+  "scope": "Receita prática completa que fecha o ciclo com o Módulo 1: (a) no Mac M4 24 GB com MLX (mlx-lm / mlx-lm-lora: SFT com LoRA/QLoRA e DPO/ORPO se suportado — versões verificadas nas fontes); (b) em 2× DGX Spark: SFT com LoRA/QLoRA num modelo médio, depois DPO (ou GRPO com recompensa verificável), avaliação, merge, re-quantização (GPTQ/AWQ/NVFP4/EXL3 calibrados no modelo ajustado; medir KLD contra a base) e serviço com vLLM (multi-LoRA: --enable-lora, --max-loras, --max-lora-rank) ou merge — com comandos, configs, formatos de dados (JSONL de chat, pares de preferência, binário KTO), orçamentos de memória e tempos estimados (rotulados), versões de pacotes (TRL, PEFT, transformers, vLLM, OpenRLHF, verl, llm-compressor, ModelOpt, exllamav3, mlx-lm) e checklists; conexão com abliteração e com a receita do zero (cap. 46).",
+  "prereqs": [
+   "sft",
+   "dpo",
+   "grpo-rlvr",
+   "avaliacao-pos-treino",
+   "receita-do-zero"
+  ],
+  "recipes": [
+   "glm",
+   "qwen",
+   "ds"
+  ],
+  "sources": [
+   "docs/pesquisa/pos-treino-sft-sistemas.md",
+   "docs/pesquisa/pos-treino-rm-rl-ppo.md",
+   "docs/pesquisa/pos-treino-dpo-familia.md",
+   "docs/pesquisa/pos-treino-grpo-cai-selfplay.md",
+   "docs/pesquisa/pos-treino-avaliacao-receita.md"
+  ],
+  "minutes": 45
+ }
+]

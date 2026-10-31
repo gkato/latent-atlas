@@ -1,0 +1,341 @@
+<p class="la-lead">Before it can be served, a model had to be taught. GLM-5.3-Flash arrives at the recipe as 321,323,031,390 numbers. DeepSeek-V4-Flash arrives as 284 billion, and Qwen3.8-Flash-Next as 125 billion plus a 51-billion-parameter table. Nobody wrote those numbers by hand. All of them were <b>learned</b>: tiny knobs were turned, a little at a time, until the model got less and less wrong at predicting the next piece of text. This chapter tells that story from the beginning. You will see what a function with parameters is, how error is measured, how the gradient tells you which way to turn each knob and why optimizers like AdamW and Muon exist. The story ends at the boundary that organizes the whole platform: at inference, the knobs freeze. Knowing what training decided is what lets you say what a recipe may change and what it must never touch.</p>
+
+<section class="la-sec">
+  <h2>Learning is fitting a function</h2>
+  <p>Forget about LLMs for a moment. An ice cream shop wants to predict how many popsicles it will sell based on the day's temperature. It has a notebook with 12 days written down: the temperature \(x_i\) and the sales \(y_i\). A <b>model</b> is any rule that turns \(x\) into a prediction \(\hat y\). The simplest rule is a straight line:</p>
+  <div class="la-eq">
+    \[ \hat y \;=\; f_\theta(x) \;=\; w\,x + b, \qquad \theta = (w,\ b) \]
+    <ul class="la-eq-legend">
+      <li>\(x\): the input (temperature, in °C)</li>
+      <li>\(\hat y\): the model's prediction (popsicles sold)</li>
+      <li>\(w\): slope, how many extra popsicles per degree</li>
+      <li>\(b\): intercept, the line's “baseline sales”</li>
+      <li>\(\theta\): the vector with <b>all</b> the parameters, here just two numbers</li>
+    </ul>
+  </div>
+  <p>The numbers \(w\) and \(b\) are the model's <span class="la-term" data-term="pesos">parameters</span>, also called weights. <b>Learning</b> means choosing them from the data so that the predictions land close to what happened. Even more importantly, they need to land close to what <i>will</i> happen on days the notebook hasn't recorded yet. That is <span class="la-term" data-term="aprendizado-de-maquina">machine learning</span> in one sentence: fitting the parameters of a function to examples. In the figure below, turn the two knobs and try to fit the line to the points.</p>
+  <figure class="la-fig" id="fig-reta" data-title="The two-knob machine">
+    <div class="la-fig-stage" style="height:390px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Each cone is one day from the notebook. The springs connect each point to the line and show the <b>residual</b> \(\hat y_i - y_i\). With “show squares” on, each residual becomes a square whose side equals the error, and the mean of the areas is the MSE (the scoreboard below the machine). The dashed line is the optimal least-squares line. Illustrative data.</figcaption>
+  </figure>
+  <p>Look at the scoreboard. There is one setting of the knobs that makes the mean of the areas as small as possible: the optimal line. For a line there is even a closed-form formula that computes it in one go (least squares). For 300 billion knobs there is no formula at all. We will have to walk down a mountain in the dark, which is the subject of section 4.</p>
+
+  <h3>From popsicles to the next token</h3>
+  <p>An LLM follows exactly the same idea, with a richer input and many more knobs. The input \(x\) is a sequence of <a data-ch="tokens-embeddings">tokens</a>. The output is not a number but a probability distribution over the entire vocabulary, the answer to the question “what is the next token?”. The <span class="la-term" data-term="arquitetura">architecture</span> (attention, MoE, normalizations, Parts II and III) is the shape of the function \(f_\theta\). The weights are \(\theta\).</p>
+  <div class="la-table-wrap" style="position:relative"><table>
+    <thead><tr><th>Model</th><th>Parameters \(\theta\)</th><th>Active per token</th><th>Outputs per position (vocabulary)</th></tr></thead>
+    <tbody>
+      <tr><td><span class="la-rb glm"></span> GLM-5.3-Flash</td><td>321,323,031,390 (card: 320B)</td><td>~18B</td><td>154,880</td></tr>
+      <tr><td><span class="la-rb qwen"></span> Qwen3.8-Flash-Next</td><td>125B + 51B (N-gram table) + ~4B (MTP)</td><td>~6B</td><td>248,320</td></tr>
+      <tr><td><span class="la-rb ds"></span> DeepSeek-V4-Flash</td><td>284B (+ ~19.8B for the DSpark drafter, estimated from the shapes)</td><td>~13B</td><td>129,280</td></tr>
+    </tbody>
+  </table></div>
+  <div class="la-callout analogy"><b class="t">Analogy: a mixing console with 300 billion knobs</b><p>Picture a studio mixing console with hundreds of billions of knobs. No single knob means anything on its own (what does knob number 17,233,901 control?). The sound only comes out right from the combination of all of them. <b>Training</b> is adjusting all of them at once, listening to the result and correcting. <b>Serving</b> is playing the music with the knobs taped down. That is what the three recipes do.</p></div>
+  <p>It pays to separate two kinds of numbers right away. The knobs that training adjusts on its own are <b>parameters</b>. The choices a human makes before training are <span class="la-term" data-term="hiperparametro">hyperparameters</span>: the shape of the function (a line? a parabola? 45 layers?), the learning rate, the batch size, the weights of each term in the loss. Keep this distinction in mind. At the end of the chapter we will see that a checkpoint's <code>config.json</code> mixes both kinds, and that a recipe needs to know which fields still matter at inference.</p>
+</section>
+
+<section class="la-sec">
+  <h2>Where the examples come from</h2>
+  <p>To adjust knobs we need examples with answers: (input, desired output) pairs. In classic <span class="la-term" data-term="aprendizado-supervisionado">supervised learning</span>, the answer is supplied by a human. This photo is a cat, this email is spam, this review is positive. It works, but every label costs time and money, and nobody is going to label trillions of examples.</p>
+  <p>The trick that made LLMs possible is <span class="la-term" data-term="aprendizado-auto-supervisionado">self-supervised learning</span>, in which the sequence itself supplies the answer. Take any text, hide the next token and ask the model to guess it. A text with \(N\) tokens turns into \(N-1\) free examples, and the entire internet turns into an answer key. Compare the two modes in the figure.</p>
+  <figure class="la-fig" id="fig-esteira" data-title="The next-token conveyor belt">
+    <div class="la-fig-stage" style="height:380px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>In self-supervised mode, the context window (lilac) moves along the sentence and the following token (mint) is the target. Each position produces a (context → target) pair without anyone having to label it. In supervised mode, each pair depends on a human annotator. Turn on “all positions at once” to see the staircase a Transformer computes in a single forward. Illustrative sentence.</figcaption>
+  </figure>
+  <p>Look at the staircase that appears with “all positions at once”. Each row is a longer prefix, and the target of each row is the next token. A Transformer computes all of these rows in a single forward, as long as no position can peek at the future. That prohibition is the <span class="la-term" data-term="mascara-causal">causal mask</span>, which you will meet in <a data-ch="atencao">Attention</a>. It is also the same format as the <span class="la-term" data-term="teacher-forcing">teacher forcing</span> the recipes use to measure the damage done by a quantization.</p>
+  <div class="la-eq">
+    \[ \log p_\theta(x_1,\dots,x_N) \;=\; \sum_{t=1}^{N} \log p_\theta\big(x_t \mid x_{&lt;t}\big) \qquad\qquad \mathcal{L}(\theta) \;=\; -\frac{1}{N}\sum_{t=1}^{N} \log p_\theta\big(x_t \mid x_{&lt;t}\big) \]
+    <ul class="la-eq-legend">
+      <li>\(x_t\): the token at position \(t\)</li>
+      <li>\(x_{&lt;t}\): the prefix, all the tokens before \(t\)</li>
+      <li>\(p_\theta(\cdot \mid x_{&lt;t})\): the distribution the model assigns to the next token</li>
+      <li>\(\mathcal{L}(\theta)\): the mean loss per token, the number training tries to push down</li>
+    </ul>
+  </div>
+  <p>The first equality is just the chain rule of probability. The probability of a whole text is the product of the probabilities of each token given what came before, and the logarithm turns the product into a sum. Training to predict the next token is therefore training to give high probability to real texts. And a model that can evaluate the probability of a text can also generate text: just sample one token at a time from that distribution, as we will see in <a data-ch="geracao-amostragem">Generating text</a>.</p>
+
+  <h3>Pre-training, post-training and extra targets</h3>
+  <p>Training a frontier model happens in phases. <span class="la-term" data-term="pre-treino">Pre-training</span> is the giant self-supervised stage: according to its card, DeepSeek-V4 was pre-trained on more than 32 trillion tokens, and GLM-5.3-Flash, according to its own card, saw 30 trillion multimodal tokens. <span class="la-term" data-term="pos-treino">Post-training</span> turns that “text completer” into an assistant. For DeepSeek-V4, the card describes SFT (supervised fine-tuning on instruction → response pairs), reinforcement learning with GRPO (the “right answer” comes from a reward) and a final consolidation through on-policy distillation. The mechanics of every phase are the ones in this chapter: a loss, a gradient and an optimizer.</p>
+  <p>The self-supervised signal doesn't have to stop at the next token, either. The same text supplies the token <i>after</i> the next one. That is how the <span class="la-term" data-term="mtp">MTP</span> modules that become built-in drafters in GLM and Qwen are trained (<a data-ch="ngram-mtp">N-gram &amp; MTP</a>). And that is how DeepSeek's DSpark drafter learns to propose whole blocks of tokens, as we will see in section 8.</p>
+  <div class="la-callout why"><b class="t">Why this matters to people who serve models</b><p>The training objective defines what the forward knows how to do, and several inference parameters carry that memory. Qwen serves its MTP with <code>num_speculative_tokens: 3</code>, reapplying a single layer that was trained over several steps. GLM uses <code>DFLASH_TOKENS=7</code> because DFlash2 was trained with blocks of 8 (1 anchor + 7 drafts). DeepSeek should not draft fewer than 5 tokens, because DSpark's trained block is 5 (newer vLLM versions reject anything shorter outright). You will find parameters like these all over the platform.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Measuring error: loss functions</h2>
+  <p>The <span class="la-term" data-term="funcao-de-perda">loss function</span> \(\mathcal{L}(\theta)\) turns “how wrong the model is” into a single number. It is training's compass, and everything the optimizer does is try to bring it down. The right loss depends on the kind of answer.</p>
+  <h3>Continuous numbers: squared error</h3>
+  <div class="la-eq">
+    \[ \mathrm{MSE}(\theta) \;=\; \frac{1}{N}\sum_{i=1}^{N}\big(f_\theta(x_i) - y_i\big)^2 \]
+    <ul class="la-eq-legend">
+      <li>\(N\): number of examples</li>
+      <li>\(f_\theta(x_i) - y_i\): the residual of example \(i\)</li>
+      <li>the square: the area of the squares in the first figure</li>
+    </ul>
+  </div>
+  <p><span class="la-term" data-term="mse">Mean squared error</span> does three things by squaring the residual. It makes every error positive. It punishes large errors far more than small ones (missing by 10 costs 100 times as much as missing by 1). And it produces a smooth function, with no corners, which makes life easier for the gradient.</p>
+  <h3>Categories: probability and cross-entropy</h3>
+  <p>Predicting the next token is not predicting a number. It is picking one out of \(V\) items. The model produces a raw score per token, the <span class="la-term" data-term="logits">logits</span>, and the <span class="la-term" data-term="softmax">softmax</span> turns those scores into positive probabilities that add up to 1 (it gets a chapter of its own in <a data-ch="geracao-amostragem">Generating text</a>). The natural loss answers one question: <i>how much probability did the model give to the token that actually came?</i></p>
+  <div class="la-eq">
+    \[ p_v = \frac{e^{z_v}}{\sum_{j} e^{z_j}} \qquad\quad \ell \;=\; -\ln p_y \;=\; -z_y + \ln\sum_{j} e^{z_j} \qquad\quad H(P,Q) = -\sum_v P(v)\,\ln Q(v) \]
+    <ul class="la-eq-legend">
+      <li>\(z_v\): logit of token \(v\)</li>
+      <li>\(p_v\): probability the model gives to token \(v\)</li>
+      <li>\(y\): the token that actually came</li>
+      <li>\(\ell\): the loss at that position, the “surprise”</li>
+      <li>\(H(P,Q)\): cross-entropy between the true distribution \(P\) and the model's \(Q\). With \(P\) concentrated on the right token, it becomes \(-\ln Q(y)\)</li>
+    </ul>
+  </div>
+  <p>This is the <span class="la-term" data-term="entropia-cruzada">cross-entropy</span>. Its mean over positions is the <span class="la-term" data-term="nll">negative log-likelihood</span> (NLL) from the previous section, and maximizing the likelihood of the data is the same as minimizing it. Three names for the same calculation. In the figure, move the logit of the right token and watch the loss.</p>
+  <figure class="la-fig" id="fig-ce" data-title="The surprise ruler">
+    <div class="la-fig-stage" style="height:380px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>On the left, the next-token distribution for “The cat got up on the ___”. The right token, “roof”, has a star. On the right, the curve \(-\ln p\) with the current point, and a face that looks more astonished as the loss grows. The dashed curve is the squared error \((1-p)^2\), for comparison. Illustrative logits.</figcaption>
+  </figure>
+  <p>Look at the shape of the curve. With \(p_y = 1\), the loss is zero. With \(p_y = 0.5\), it is \(\ln 2 \approx 0.69\) nat, which is exactly 1 bit. As \(p_y \to 0\), it shoots off to infinity. Cross-entropy is merciless with <i>confident</i> errors: giving 1% to the right token costs 4.6 nats, and 0.01% costs 9.2. Squared error applied to the probability (the dashed curve), on the other hand, never goes above 1. It can barely tell “I missed badly” from “I missed really badly”.</p>
+  <div class="la-callout math"><b class="t">The prettiest gradient in deep learning</b><p>Differentiate \(\ell = -z_y + \ln\sum_j e^{z_j}\) with respect to each logit and what is left is \(\dfrac{\partial \ell}{\partial z_v} = p_v - \mathbb{1}[v = y]\): <b>predicted probability minus desired probability</b>. The right token gets an upward push of size \(1 - p_y\). Each wrong token gets a downward push equal to the probability it stole. The signal does not saturate: as long as there is error, there is gradient.</p></div>
+  <h3>Nats, bits and the uniform guess</h3>
+  <p>With the natural logarithm, the unit of information is the <span class="la-term" data-term="nats">nat</span>. With the base-2 logarithm, it is the bit, and 1 nat \(= 1/\ln 2 \approx 1.443\) bit. PyTorch uses \(\ln\), which is why training losses and the recipes' <span class="la-term" data-term="kld">KLDs</span> show up in nats. The KLD (Kullback–Leibler divergence) measures how far one distribution strays from another; it comes back at the end of this section. One way to get a feel for the scale: a freshly initialized model, which spreads probability evenly across the vocabulary, has loss \(\ln V\).</p>
+  <div class="la-table-wrap" style="position:relative"><table>
+    <thead><tr><th>Model</th><th>\(V\)</th><th>\(\ln V\) (nats)</th><th>\(\log_2 V\) (bits)</th></tr></thead>
+    <tbody>
+      <tr><td><span class="la-rb glm"></span> GLM-5.3-Flash</td><td>154,880</td><td>11.95</td><td>17.24</td></tr>
+      <tr><td><span class="la-rb qwen"></span> Qwen3.8-Flash-Next</td><td>248,320</td><td>12.42</td><td>17.92</td></tr>
+      <tr><td><span class="la-rb ds"></span> DeepSeek-V4-Flash</td><td>129,280</td><td>11.77</td><td>16.98</td></tr>
+    </tbody>
+  </table></div>
+  <p>Training knocks that starting point down to somewhere in the 1.5 to 2 nats per token range on general text (a typical order of magnitude). A real number helps. In the Qwen3.8-Next technical report, 25B-parameter ablation models (3B active), trained on 560B tokens, finish with a loss (in nats, the usual convention) between 1.617 and 1.590. The 1.617 comes from the classic pre-norm residual, the standard block that normalizes the input of each sublayer and adds the output back to the token's vector. The 1.590 comes from the <span class="la-term" data-term="gated-residual">Gated Residual</span>, a gate-controlled variant of that sum, which section 6 introduces. Differences of hundredths of a nat decide architectures. <span class="la-term" data-term="perplexidade">Perplexity</span> \(e^{\mathcal{L}}\) translates this into an “effective number of options”: \(e^{1.59}\approx 4.9\). On average, the model hesitates as if it were choosing among five tokens.</p>
+  <div class="la-callout recipe" data-recipe="glm"><b class="t"><span class="la-rb glm"></span> The same ruler in the recipe</b><p>The unit that measures learning also measures quantization damage. In the GLM recipe, the 4 bpw EXL3 checkpoint sits 0.0246 nat of KLD away from the BF16 teacher (on par with the official FP8), versus 0.0605 for NVFP4. Nats again, now measuring the distance between two distributions instead of the surprise at the text. The <a data-ch="medindo-qualidade">Measuring quality</a> chapter details this ruler.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>The loss landscape and gradient descent</h2>
+  <p>Fix the data. The loss becomes a function of the parameters alone: every combination of knobs gives a number. With two parameters you can draw this function as a relief map, the <span class="la-term" data-term="superficie-de-perda">loss surface</span>, and training turns into a geography problem: find the lowest point. With 321 billion parameters the map has 321 billion dimensions and nobody can see it, but the math is the same.</p>
+  <p>Imagine we are in the dark, at some point on the mountain. We can't see the valley, but we can feel the slope of the ground under our feet. That slope is the <span class="la-term" data-term="gradiente">gradient</span>, the vector of partial derivatives, one per parameter. It points to where the loss <i>rises</i> fastest. Taking a step in the opposite direction is <span class="la-term" data-term="descida-do-gradiente">gradient descent</span>:</p>
+  <div class="la-eq">
+    \[ \nabla_\theta \mathcal{L} = \Big(\frac{\partial \mathcal{L}}{\partial \theta_1},\ \dots,\ \frac{\partial \mathcal{L}}{\partial \theta_P}\Big) \qquad\qquad \theta_{t+1} \;=\; \theta_t \;-\; \eta\,\nabla_\theta \mathcal{L}(\theta_t) \]
+    <ul class="la-eq-legend">
+      <li>\(\partial\mathcal{L}/\partial\theta_j\): how much the loss changes per unit of \(\theta_j\), with the other knobs held still</li>
+      <li>\(P\): number of parameters</li>
+      <li>\(\eta\): learning rate, the step size</li>
+      <li>\(t\): the training step number</li>
+    </ul>
+  </div>
+  <p>The partial derivative has a very physical reading. Nudge knob \(j\) by a tiny \(\epsilon\) and watch the loss change: \(\partial\mathcal{L}/\partial\theta_j \approx [\mathcal{L}(\theta + \epsilon\, e_j) - \mathcal{L}(\theta)]/\epsilon\). In the figure, the ball follows exactly the rule above. Change the <span class="la-term" data-term="taxa-de-aprendizado">learning rate</span> and click the map to drop it somewhere else.</p>
+  <figure class="la-fig" id="fig-descida" data-title="The ball that rolls down in the dark">
+    <div class="la-fig-stage" style="height:400px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Relief map of a loss with two parameters: the lighter (in the dark theme) or darker (in the light theme), the lower the loss. The arrow is the next step \(-\eta\nabla\mathcal{L}\): it points along \(-\nabla\mathcal{L}\) and grows with \(\eta\) (with a size cap, so it fits on the map). The trail shows the path. In the corner, the training curve (loss × step). There is a global minimum and a shallow pocket in the lower-left corner. The readouts give the maximum stable \(\eta\) in each valley. Illustrative surface.</figcaption>
+  </figure>
+  <p>Three lessons come out of this toy. <b>A step that is too small</b> descends safely but takes forever. <b>A step that is too large</b> crosses the valley and climbs the wall on the other side. A little larger still and each step is worse than the one before, until the loss blows up. There is a formula for this: in a quadratic valley with maximum curvature \(\lambda_{\max}\), descent is only stable if \(\eta &lt; 2/\lambda_{\max}\). The steepest direction dictates the step for all the others. And curvature is <i>local</i>. In the figure's global-minimum bowl, the largest curvature is 5, and the limit is \(\eta &lt; 0.40\). The pocket in the corner is much tighter (maximum curvature ≈ 20.6), and there the limit drops to \(\eta \approx 0.10\). Try it with the “drop near the local minimum” button. With \(\eta = 0.05\), the ball settles into the pocket in a few steps. With \(\eta = 0.2\), it keeps bouncing around in there without ever stopping. With \(\eta = 0.3\), it gets flung out and ends up at the global minimum, where that same step is stable. Finally, <b>the starting point matters</b>. Drop the ball near the corner pocket and it can get stuck in a local minimum.</p>
+  <div class="la-callout deep"><b class="t">Going deeper: local minima in billions of dimensions</b><p>In very high dimensions, a point with zero gradient is rarely a minimum in <i>every</i> direction. It is far more common for it to be a saddle, which goes down in some directions and up in others. In practice, large networks rarely get stuck in bad local minima. The villains of LLM training are different: narrow, ill-conditioned valleys, unstable steps and sudden loss spikes. Those are what motivate the optimizers in section 6.</p></div>
+  <h3>Who computes 321 billion derivatives?</h3>
+  <p>The finite-difference formula would require one forward per parameter, which is impractical. The solution is to apply the chain rule backward through the network: <b>backpropagation</b> (backprop). It gets all the derivatives at once, at a cost of roughly two forwards. That is the subject of the next chapter, <a data-ch="redes-neurais">Neural networks</a>. For now it is enough to know that the gradient exists and is cheap.</p>
+  <div class="la-callout deep"><b class="t">The gradient even lives inside the architecture</b><p>Some layers of GLM (<span class="la-term" data-term="kda">KDA</span>) and Qwen (<span class="la-term" data-term="gdn">Gated DeltaNet</span>) use <i>linear attention</i>. They store the past in a memory matrix \(S\), which works like a dictionary: each token produces a key \(k_t\) and a value \(v_t\) (two vectors), and the read \(S^\top k_t\) should return \(v_t\). The rule that updates this memory has two parts. First, the memory forgets a little: \(S' = \alpha_t \odot S\), with \(\alpha_t \in (0, 1]\) computed by the model (one scalar per head in Gated DeltaNet, one factor per channel in KDA). Then comes a gradient descent step taken <i>during inference</i>, the delta rule:</p>
+    <div class="la-eq">\[ S_t \;=\; S' - \beta_t\,\nabla_{S'}\,\tfrac12\big\lVert S'^\top k_t - v_t\big\rVert^2 \;=\; S' - \beta_t\,k_t\big(S'^\top k_t - v_t\big)^\top \]</div>
+    <p>The rate \(\beta_t\) is also computed by the model itself at every token. The \(\alpha_t\) is a form of forgetting related to the weight decay of section 7, which pulls weights toward zero. The weights stay frozen; what “learns” is the layer's memory (<a data-ch="atencao-linear">Linear attention</a>).</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Minibatches and SGD: descending with a blurry map</h2>
+  <p>The previous section hid a detail: the loss is an average over <i>all</i> the examples. The exact gradient would require running DeepSeek-V4's 32 trillion tokens through the network at every step. Nobody does that. Instead, you sample a <span class="la-term" data-term="minibatch">minibatch</span>, a handful of examples, and use its mean gradient as an estimate. That is stochastic gradient descent, <span class="la-term" data-term="sgd">SGD</span>.</p>
+  <div class="la-eq">
+    \[ g_B = \frac{1}{B}\sum_{i \in \mathcal{B}} \nabla_\theta\, \ell_i(\theta), \qquad \mathbb{E}\big[g_B\big] = \nabla_\theta \mathcal{L}(\theta), \qquad \operatorname{Var}\big[g_B\big] = \frac{\sigma^2}{B} \]
+    <ul class="la-eq-legend">
+      <li>\(B\): minibatch size</li>
+      <li>\(\mathcal{B}\): the examples sampled at this step</li>
+      <li>\(\ell_i\): the loss of example \(i\)</li>
+      <li>\(\sigma^2\): the variance of a single example's gradient</li>
+    </ul>
+  </div>
+  <p>The estimate is <b>unbiased</b>: on average, it points to the right place. Its noise falls as \(1/\sqrt{B}\), so quadrupling the batch cuts the noise in half, at the price of four times as much computation per step. In the figure, the problem is the ice cream shop line again, now with 64 days and normalized temperature. The thin arrows are gradients of different minibatches at the same point; the thick arrow is the exact gradient.</p>
+  <figure class="la-fig" id="fig-sgd" data-title="The fan of noisy gradients">
+    <div class="la-fig-stage" style="height:390px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>The map is the true loss (all 64 points) as a function of \(w\) and \(b\). At each step, SGD samples \(B\) points and moves in the direction of <i>their</i> gradient (pink arrow). The gray fan shows other possible draws at the same spot. In the panel, the measured spread of the gradient for each batch size.</figcaption>
+  </figure>
+  <p>With \(B = 1\), the fan of arrows is huge and the trajectory looks drunk, but it still reaches the valley, and each step cost 1/64 of the price. With the full batch, the trajectory is clean but expensive. Real training sits in between: batches large enough to keep the GPUs busy and small enough to take many steps. In LLMs the batch is counted in tokens, typically in the millions per step (order of magnitude). One full pass over the data is an <span class="la-term" data-term="epoca">epoch</span>, and in LLM pre-training it is common to see each token only once, or a few times.</p>
+  <h3>The learning rate has a script too</h3>
+  <p>In practice, \(\eta\) doesn't stay constant. It starts small and ramps up over a few thousand steps (the <i>warmup</i>), stays high while the model learns the bulk of things and decays at the end, so the model can settle at the bottom of the valley. SGD's noise looks like a defect, but it often helps: it shakes the model out of valleys that are too narrow.</p>
+  <div class="la-callout warn"><b class="t">False friends: warmup and batch at inference</b><p>Two words from this chapter come back in vLLM with a different meaning. <i>Warmup</i>, in training, is the learning rate ramp. On the server, it is the round that compiles kernels and captures CUDA graphs before serving the first request (<a data-ch="cuda-graphs-warmup">CUDA graphs &amp; warmup</a>). <i>Batch</i>, in training, is the minibatch that estimates the gradient. On the server, it is the set of requests processed together in one step, with no gradient at all (<a data-ch="scheduler-batching">Scheduler &amp; batching</a>). Same name, different worlds.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Optimizers: momentum, Adam/AdamW and Muon</h2>
+  <p>The rule \(\theta \leftarrow \theta - \eta\, g\) is the simplest <span class="la-term" data-term="otimizador">optimizer</span>. The ones used for real keep a memory of the past and rescale the step. There are three ideas, in historical order.</p>
+  <h3>Momentum: the heavy ball</h3>
+  <div class="la-eq">
+    \[ v_{t} = \beta\, v_{t-1} + g_t, \qquad \theta_{t+1} = \theta_t - \eta\, v_t \]
+    <ul class="la-eq-legend">
+      <li>\(v\): the “velocity”, a sum of recent gradients that decays over time</li>
+      <li>\(\beta\): the memory, typically 0.9</li>
+      <li>\(g_t\): the (minibatch) gradient at step \(t\)</li>
+    </ul>
+  </div>
+  <p>With <span class="la-term" data-term="momentum">momentum</span>, the parameter doesn't just obey the current slope: it builds up speed. In the directions where the gradient flips sign at every step (the walls of a narrow valley), the contributions cancel out. In the direction where it always points the same way (the valley floor), they add up. The effect is to run where it matters and oscillate less where it gets in the way.</p>
+  <h3>Adam and AdamW: a made-to-measure step for each knob</h3>
+  <div class="la-eq">
+    \[ m_t = \beta_1 m_{t-1} + (1-\beta_1)\,g_t, \quad s_t = \beta_2 s_{t-1} + (1-\beta_2)\,g_t^{2}, \quad \hat m_t = \frac{m_t}{1-\beta_1^{t}},\ \ \hat s_t = \frac{s_t}{1-\beta_2^{t}} \]
+    \[ \theta_{t+1} \;=\; \theta_t \;-\; \eta\Big(\frac{\hat m_t}{\sqrt{\hat s_t} + \epsilon} \;+\; \lambda\,\theta_t\Big) \]
+    <ul class="la-eq-legend">
+      <li>\(m\): moving average of the gradient (the 1st-order moment)</li>
+      <li>\(s\): moving average of the squared gradient, coordinate by coordinate (2nd order)</li>
+      <li>\(\beta_1, \beta_2\): the memories, typically 0.9 and 0.95–0.999</li>
+      <li>\(\hat m, \hat s\): bias correction, because the averages start at zero</li>
+      <li>\(\epsilon\): avoids division by zero</li>
+      <li>\(\lambda\): decoupled weight decay, the “W” in AdamW</li>
+    </ul>
+  </div>
+  <p><span class="la-term" data-term="adam">Adam</span> divides the momentum by the typical (root-mean-square) gradient size of <i>each coordinate</i>. A knob with huge gradients moves in restrained steps. A knob with tiny gradients gets proportionally larger steps. In practice, each parameter moves something on the order of \(\eta\) per step, whatever the scale of its gradient. <span class="la-term" data-term="adamw">AdamW</span> fixes one detail. <span class="la-term" data-term="weight-decay">Weight decay</span> (pulling every weight a little toward zero, a form of regularization that comes back in section 7) is applied <i>outside</i> the division by \(\sqrt{\hat s}\). If it stayed inside, knobs with large gradients would barely be regularized. AdamW was the standard for training Transformers for a decade. In the race below, three runners start from the same point in a ravine: plain descent, momentum and Adam.</p>
+  <figure class="la-fig" id="fig-corrida" data-title="Optimizer race in the ravine">
+    <div class="la-fig-stage" style="height:390px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>A ravine whose wall has 160 times the curvature of its floor (40 versus 0.25). Plain descent (amber) zigzags between the walls, momentum (lilac) builds up speed and Adam (pink) normalizes each coordinate. The “rates ×” control multiplies all three rates; above ~1.1×, plain descent crosses the \(2/\lambda_{\max}\) limit and diverges. Switch to the rotated ravine and compare.</figcaption>
+  </figure>
+  <p>In the axis-aligned ravine, Adam takes off. The steep wall and the flat floor correspond to different coordinates, and per-coordinate division evens them out. Now rotate the ravine by 45°. The difficulty is the same (the same curvatures), but it is no longer aligned with the axes: each coordinate sees a piece of the wall and a piece of the floor, and Adam's advantage vanishes. With a fixed rate, it keeps oscillating at the bottom of the valley. Adam only sees <i>coordinates</i>. The weights of an LLM, however, are <i>matrices</i>, and the important directions of a matrix almost never coincide with its axes. That is where Muon comes from.</p>
+
+  <h3>Muon: orthogonalizing the update</h3>
+  <p><span class="la-term" data-term="muon">Muon</span> (<i>MomentUm Orthogonalized by Newton–Schulz</i>) treats each weight matrix \(W\in\mathbb{R}^{m\times n}\) as a whole object. It accumulates the momentum \(M\) as usual. Before applying the step, however, it replaces \(M\) with the nearest <span class="la-term" data-term="matriz-ortogonal">orthogonal matrix</span>. An orthogonal matrix only rotates (or reflects) vectors, without stretching or shrinking any direction. To find the nearest one, you use the <span class="la-term" data-term="svd">SVD</span>, the <span class="la-term" data-term="valores-singulares">singular value</span> decomposition: every matrix can be written as \(M = U\Sigma V^\top\), a rotation \(V^\top\), a different stretch \(\Sigma\) along each axis and another rotation \(U\) (<a data-ch="tensores-algebra">Tensors &amp; algebra</a> shows this with figures). Muon's step uses \(UV^\top\): the same directions, with every stretch (the singular values) replaced by 1.</p>
+  <div class="la-eq">
+    \[ M_t = \mu\, M_{t-1} + G_t, \qquad O_t = \operatorname{orth}(M_t) \approx U V^\top, \qquad W_{t+1} = W_t - \eta\, O_t \]
+    <ul class="la-eq-legend">
+      <li>\(G_t\): the gradient of matrix \(W\) at step \(t\)</li>
+      <li>\(M_t\): the momentum (\(\mu \approx 0.95\))</li>
+      <li>\(U, V\): the singular directions (rotations) of \(M_t\)</li>
+      <li>\(\Sigma\): the singular values, how much \(M\) stretches each direction</li>
+      <li>\(O_t\): the orthogonalized update</li>
+    </ul>
+  </div>
+  <p>Why does this help? The gradient of a matrix tends to be dominated by a few directions: one or two huge singular values and a long tail of small ones. An SGD or Adam step spends almost its entire budget on those few directions. Orthogonalizing gives the same importance to every direction the gradient points to, and the rare directions stop being drowned out by the dominant ones. Geometrically, the update stops being a cigar and becomes a sphere, oriented by the gradient.</p>
+  <p>Computing a singular value decomposition at every step would be expensive. Muon uses the <span class="la-term" data-term="newton-schulz">Newton–Schulz</span> iteration, which gets close to \(UV^\top\) using only matrix multiplications, a GPU's favorite dish:</p>
+  <div class="la-eq">
+    \[ X_0 = \frac{M}{\lVert M\rVert_F}, \qquad X_{k+1} = a\,X_k + b\,(X_kX_k^\top)\,X_k + c\,(X_kX_k^\top)^2X_k \quad\Longrightarrow\quad \sigma \;\mapsto\; a\sigma + b\sigma^3 + c\sigma^5 \]
+    <ul class="la-eq-legend">
+      <li>\(\lVert M\rVert_F = \sqrt{\sum_{ij} M_{ij}^2} = \sqrt{\sum_i \sigma_i^2}\): Frobenius norm, the “length” of the whole matrix. It is always greater than or equal to the largest singular value, so dividing by it guarantees \(\sigma \le 1\) at the start</li>
+      <li>\(a, b, c\): the polynomial's coefficients. Each iteration applies the same polynomial to every singular value, without touching \(U\) and \(V\)</li>
+      <li>\((3.4445,\ -4.7750,\ 2.0315)\): Muon's coefficients, which bring small values close to 1 very quickly</li>
+      <li>\((2,\ -1.5,\ 0.5)\): the “polishing” polynomial, with an exact fixed point at 1</li>
+    </ul>
+  </div>
+  <p>In the figure, the matrix on the left is a 5×5 toy momentum dominated by one direction. The one on the right is the result after \(k\) iterations. Below, each dot is a singular value being carried along by the polynomial.</p>
+  <figure class="la-fig wide" id="fig-muon" data-title="Muon: from ellipse to sphere">
+    <div class="la-fig-stage" style="height:430px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>On the left, the momentum \(M\) (5×5, actual computed values) and the matrix \(X_k\) after \(k\) Newton–Schulz iterations. On the right, the current iteration's polynomial applied to the singular values (dots) and the ellipses of the two strongest directions before and after. Below each ellipse, the ratio of the major axis to the minor one (1 = circle). The “deviation of \(X X^\top\) from \(I\)” readout measures how far \(X_k\) still is from being orthogonal. With Muon's fast coefficients, the sphere is only approximate: at \(k = 5\) the ratio drops from 2.5 to ~1.5 and the axes swap roles, because each \(\sigma\) oscillates inside the 0.7–1.2 band. Switch to “DeepSeek-V4 (8 + 2)” and go up to \(k = 10\) to see the circle. The matrix is illustrative; the coefficients are the real ones.</figcaption>
+  </figure>
+  <p>With Muon's coefficients, tiny singular values grow about 3.4 times per iteration (the polynomial's derivative at zero is \(a = 3.4445\)). In five iterations, the number used in the original implementation, they all fall into a band between ~0.7 and ~1.2. They don't converge exactly to 1, because the polynomial was chosen to be <i>fast</i>, not exact. The polishing polynomial \(2\sigma - 1.5\sigma^3 + 0.5\sigma^5\) does the opposite. It is exactly 1 at \(\sigma = 1\) and has zero derivative there, which gives quadratic convergence, but it grows slowly from small values. DeepSeek-V4's hybrid scheme combines the two: 8 fast iterations and 2 polishing ones.</p>
+
+  <h3>Who trains with which optimizer</h3>
+  <p>The Qwen3.8 and DeepSeek-V4 technical reports say <i>which</i> weights each optimizer updates. To read that split, and the stability argument that comes right after it, you need a minimal architecture vocabulary. Each piece gets its own chapter later on; here the idea is enough.</p>
+  <div class="la-cards">
+    <div class="la-card"><h4>Embeddings and prediction head</h4><p>The <span class="la-term" data-term="embedding">embeddings</span> are the input table: one row (one vector) per vocabulary token, looked up by the token's id. The prediction head (<code>lm_head</code>) is the output matrix, which turns the last vector into \(V\) logits. They sit at the two ends of the network (<a data-ch="tokens-embeddings">Tokens &amp; embeddings</a>).</p></div>
+    <div class="la-card"><h4>Router</h4><p>In an MoE, the <span class="la-term" data-term="roteador">router</span> is a small layer that gives each expert a score and picks the few experts that will process each token (<a data-ch="mixture-of-experts">Mixture of Experts</a>).</p></div>
+    <div class="la-card"><h4>RMSNorm</h4><p><span class="la-term" data-term="rmsnorm">RMSNorm</span> divides the vector by the square root of the mean of its squared coordinates, \(x/\sqrt{\operatorname{mean}(x_i^2)+\varepsilon}\), so that it has a typical size of ~1, and multiplies it by a learned per-coordinate gain (the RMSNorm “weights”). The <i>weightless</i> version skips the gain. It is the blocks' volume regulator (<a data-ch="redes-neurais">Neural networks</a>, <a data-ch="bloco-transformer">Transformer block</a>).</p></div>
+    <div class="la-card"><h4>Sigmoid and gates</h4><p>The <span class="la-term" data-term="sigmoide">sigmoid</span> \(\sigma(z) = 1/(1+e^{-z})\) squeezes any number into the interval (0, 1). Multiplying a signal by it makes a <b>gate</b>: the model itself decides, at every token, how much to let through (<a data-ch="redes-neurais">Neural networks</a>).</p></div>
+    <div class="la-card"><h4>GatedNorm and Gated Residual</h4><p>Qwen3.8's <span class="la-term" data-term="gatednorm">GatedNorm</span> is an RMSNorm followed by a sigmoid gate computed from the vector itself. The Gated Residual uses that gated read on the residual stream (the “road” on which each layer adds its contribution to the token's vector), widened to 4 branches. The gate goes through <b>low-rank projections</b>: two thin matrices that squeeze the vector through a narrow bottleneck (rank 320) and make the computation cheaper (<a data-ch="hiperconexoes">Hyper-connections</a>).</p></div>
+    <div class="la-card"><h4><span style="text-transform:none;letter-spacing:0">mHC</span></h4><p><span class="la-term" data-term="mhc">mHC</span> is GLM's and DeepSeek's solution for widening the same road: 4 residual streams mixed at every layer by a tamed 4×4 matrix (doubly stochastic, which limits the signal gain). Some of the coefficients are computed from the token; the <b>static part</b> is made of the biases and scale factors learned as constants, the same for every token (<a data-ch="hiperconexoes">Hyper-connections</a>).</p></div>
+  </div>
+  <p>Notice the pattern in the two columns below (the reading is ours, not the reports'). Muon takes the large matrices that transform vectors inside the blocks, where “orthogonalizing the update” makes sense. AdamW takes the pieces that don't behave like that: tables looked up by row, gain vectors (orthogonalizing a vector means nothing) and small or special matrices, like the router and the mHC coefficients.</p>
+  <div class="la-compare">
+    <div data-recipe="qwen"><h4>Qwen3.8-Flash-Next</h4><p>Muon with the momentum orthogonalized by 8 Newton–Schulz iterations on the “linear” matrices, and AdamW on the embeddings, the router and the Gated Residual's low-rank projections (technical report). In the stress test at 4× the optimal learning rate, AdamW + the Qwen3.5 architecture had 183 loss spikes per 10,000 steps; Muon + Gated Residual had zero. The comparison mixes optimizer and architecture: GatedNorm alone cuts spikes from 32.0 to 3.2 per 10,000 steps.</p></div>
+    <div data-recipe="ds"><h4>DeepSeek-V4-Flash</h4><p>Muon with a hybrid 10-iteration Newton–Schulz: 8 with (3.4445, −4.7750, 2.0315) and 2 with (2, −1.5, 0.5). AdamW only for the embeddings, the prediction heads, the static part of mHC and the RMSNorm weights (technical report). The card sums up the reason: faster convergence and greater training stability. It doesn't use QK-Clip, because it applies RMSNorm directly to the queries and the KV inputs.</p></div>
+    <div data-recipe="glm"><h4>GLM-5.3-Flash</h4><p>The checkpoint and recipe inventory doesn't document the training optimizer, so we won't guess. From training, the <code>config.json</code> only carries fields such as <code>initializer_range: 0.02</code> and <code>router_aux_loss_coef: 0.001</code>, which have no effect at inference (section 9).</p></div>
+  </div>
+  <div class="la-callout deep"><b class="t">Loss spikes and QK-Clip</b><p>A <span class="la-term" data-term="loss-spike">loss spike</span> is a sudden jump in the loss in the middle of training, sometimes unrecoverable. One known mechanism comes from attention (<a data-ch="atencao">Attention</a>). There, each token compares its question vector, the query \(q\), with the label vector of each earlier token, the key \(k\), and the score is the dot product \(q\cdot k\). Those scores are the attention logits. If \(q\) and \(k\) grow without bound during training, the scores explode, the softmax saturates (all the attention goes to a single token) and the gradient goes haywire. One remedy used in other Muon training runs is <span class="la-term" data-term="qk-clip">QK-Clip</span>: when the largest attention logit crosses a threshold, the matrices \(W_Q\) and \(W_K\) that produce \(q\) and \(k\) are scaled down. (Source outside the recipe inventories: QK-Clip was described in the Kimi K2 technical report.) DeepSeek-V4 and Qwen3.8 do without the trick thanks to an <i>architecture</i> choice. Qwen normalizes \(q\) and \(k\) per head with an RMSNorm before the product, the <span class="la-term" data-term="qk-norm">QK-Norm</span>. DeepSeek-V4 applies a weightless RMSNorm to each head of \(q\) and a <code>kv_norm</code> to the single KV latent, which all heads share. In both cases, the size of the logits is bounded by construction.</p></div>
+  <div class="la-callout why"><b class="t">Why this matters at inference</b><p>The optimizer doesn't exist at inference. It doesn't go into the checkpoint, and no recipe loads it. What remains are the architecture choices that kept training stable, and those must be executed exactly as in training: DeepSeek's weightless RMSNorm on each Q head and its <code>kv_norm</code>, Qwen's QK-Norm, the sigmoid gates of GatedNorm and Gated Residual, the mHC mixing. A kernel that “simplifies” one of these normalizations or gates (changing the \(\varepsilon\) or skipping the gain, for example) changes the model.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Generalize, don't memorize</h2>
+  <p>Driving down the loss on the training examples is all too easy. With enough knobs, a model can simply memorize every example. What we want is <span class="la-term" data-term="generalizacao">generalization</span>: getting right answers on data it has never seen. To measure that, the data is split into <span class="la-term" data-term="treino-validacao-teste">training, validation and test</span> sets. The training set fits the parameters. The validation set picks the hyperparameters and says when to stop. The test set stays locked away until the end and gives the honest grade.</p>
+  <p>In the figure, we fit a polynomial to noisy points. The polynomial's degree is the model's capacity: a polynomial of degree \(d\) has \(d+1\) knobs.</p>
+  <figure class="la-fig" id="fig-overfit" data-title="Memorize the noise or learn the curve">
+    <div class="la-fig-stage" style="height:380px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Training points (filled) and validation points (hollow) come from the same true curve (dashed) plus noise. The polynomial (pink) is fitted to the training points only. On the right, the training and validation error for each degree; the star marks the validation sweet spot. Illustrative data.</figcaption>
+  </figure>
+  <p>With a low degree, the model is too rigid and misses on both training and validation. That is <span class="la-term" data-term="underfitting">underfitting</span>. As the degree goes up, both losses fall together, until a sweet spot. From there on the training loss keeps falling, but the validation loss climbs. The polynomial starts stitching through the noise, contorting itself between the points: that is <span class="la-term" data-term="overfitting">overfitting</span>. The controls show three remedies. <b>More data</b>: with more training points, the noise gets hard to memorize. <b>Regularization</b>: penalizing large weights smooths the curve. <b>Early stopping</b>: keep the model from the validation sweet spot.</p>
+  <div class="la-eq">
+    \[ \mathcal{L}_{\text{reg}}(\theta) = \mathcal{L}(\theta) + \frac{\lambda}{2}\lVert\theta\rVert^2 \quad\Longrightarrow\quad \nabla\mathcal{L}_{\text{reg}} = \nabla\mathcal{L} + \lambda\,\theta \]
+    <ul class="la-eq-legend">
+      <li>\(\lambda\): strength of the <span class="la-term" data-term="regularizacao">regularization</span></li>
+      <li>\(\lVert\theta\rVert^2\): sum of the squares of the weights</li>
+      <li>\(\lambda\,\theta\): the term that pulls each weight toward zero at every step, which is AdamW's weight decay</li>
+    </ul>
+  </div>
+  <p>Frontier LLMs live in a curious regime. They are huge, but pre-training sees each token only a few times, so memorizing the corpus is not the dominant risk, and the validation loss usually tracks the training loss closely. The risk that does show up is subtler: <b>leakage</b>. If a benchmark's questions were in the text used for training, the “test” score measures memory, not capability.</p>
+  <div class="la-callout warn"><b class="t">The same discipline applies to whoever measures recipes</b><p>When a recipe compares quantizations or kernels, it is doing validation: fixed texts, frozen answer keys, the same seed. Tuning parameters while looking at the same handful of prompts on which the result is reported is the inference engineer's version of overfitting. The <a data-ch="medindo-qualidade">Measuring quality</a> chapter shows the <span class="la-term" data-term="protocolo-congelado">frozen protocols</span> that avoid this trap.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Custom losses: how DSpark learned to draft</h2>
+  <p>Real losses rarely come alone. When we want the model to learn several things at once, we add up losses with weights: \(\mathcal{L} = \sum_i \lambda_i\, \mathcal{L}_i\). The weights \(\lambda_i\) are hyperparameters and tell the gradient what to prioritize. The DSpark drafter, which DeepSeek uses for speculative decoding, is a perfect example, and each term of its loss explains a recipe parameter.</p>
+  <p>A preview of DSpark (the details are in <a data-ch="dflash-dspark">DFlash2 &amp; DSpark</a>): it is a drafter with a light per-token cost. It has ~19.8B parameters in total, in 3 MoE stages, but only ≈0.84B (3 × ~0.28B) work on each draft token; both numbers are estimates derived from the tensor shapes. DSpark reads internal states of the main model and proposes, all at once, a block of future tokens. The big model verifies the whole block in a single forward and accepts a prefix of it. A draft is only worth anything if it is accepted. On average, the acceptance of a position is \(\sum_x \min(p, q) = 1 - \mathrm{TV}(p, q)\), where \(q\) is the draft distribution and \(p\) the target's (<a data-ch="especulacao-fundamentos">Speculation: fundamentals</a>). The DSpark paper describes this training loss:</p>
+  <div class="la-eq">
+    \[ \mathcal{L}_{\text{DSpark}} = \sum_{k} w_k\Big[\,0.1\,\mathcal{L}^{(k)}_{\text{CE}} \;+\; 0.9\,\mathcal{L}^{(k)}_{\text{TV}} \;+\; 1.0\,\mathcal{L}^{(k)}_{\text{conf}}\Big], \qquad w_k = e^{-(k-1)/\gamma} \]
+    \[ \mathcal{L}_{\text{TV}} = \tfrac12\sum_x \big|\,p(x) - q(x)\,\big|, \qquad \mathcal{L}_{\text{conf}} = -\big[c^*\ln c + (1-c^*)\ln(1-c)\big], \qquad c^* = 1 - \mathrm{TV}(p,q) \]
+    <ul class="la-eq-legend">
+      <li>\(k\): position in the draft block (1 = right after the last accepted token)</li>
+      <li>\(q,\ p\): draft and target distributions at that position</li>
+      <li>\(\mathcal{L}_{\text{CE}}\): cross-entropy of the draft against the reference token</li>
+      <li>\(\mathcal{L}_{\text{TV}}\): <span class="la-term" data-term="distancia-tv">total variation distance</span></li>
+      <li>\(c\): output of the confidence head, a sigmoid, and therefore always between 0 and 1</li>
+      <li>\(c^*\): the analytical acceptance probability, the target for \(c\)</li>
+      <li>\(w_k\): per-position weight, which decays with \(k\)</li>
+    </ul>
+  </div>
+  <p>Read it term by term. The <b>cross-entropy</b> (weight 0.1) is the good old “get the next token right”, graded one reference token at a time. The <b>TV distance</b> (weight 0.9, the larger of the two terms that train the draft distributions) compares whole distributions at once, and \(1 - \mathrm{TV}\) is exactly the expected acceptance. Of the weights that shape \(q\), DSpark puts 90% on what verification will demand. <span class="la-term" data-term="bce">Binary cross-entropy</span> (BCE, weight 1.0) trains the <span class="la-term" data-term="confidence-head">confidence head</span>, a sigmoid that estimates each position's chance of being accepted. Since the target \(c^*\) comes out of a calculation, this term is self-supervised as well. One detail the figure shows: the target \(c^*\) is a number between 0 and 1, not an exact 0 or 1, and that is why the BCE never reaches zero. Its minimum, reached when \(c = c^*\), is the entropy \(H(c^*) = -[c^*\ln c^* + (1-c^*)\ln(1-c^*)]\), the uncertainty the target itself carries. Only what goes above that floor is error the gradient can fix. Finally, the weight \(w_k\), which decays with position, reflects the math of acceptance: position 4 only counts if positions 1, 2 and 3 were accepted first, so getting it wrong early costs more. After training, a per-position temperature calibration adjusts the confidences (STS is the acronym the DSpark paper uses for this stage).</p>
+  <figure class="la-fig wide" id="fig-dspark" data-title="The DSpark loss mixing desk">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Five positions of a draft block. In each card, the lilac bars are the target \(p\) and the mint ones are the draft \(q\), over a toy vocabulary; below them, the target \(c^*\) (tick) and the predicted confidence \(c\) (dot). The “ref” mark points to the reference token, the one CE grades against. The chart shows the weighted contribution of each term per position and, dashed, the prefix survival \(\prod c^*\). BCE against a soft target \(c^*\) never reaches zero: its minimum is the entropy \(H(c^*)\) (hatched), reached when \(c = c^*\). Only the solid green part is fixable error. That is why the BCE bar looks like the biggest of all: nearly all of its height is floor, not error. The 0.1/0.9/1.0 weights are DSpark's; distributions and confidences are illustrative. The value of γ in the weighting is not in the sources (the inventory uses the same letter for the trained block size, 5), and the control starts at 5 only as an illustration.</figcaption>
+  </figure>
+  <p>Move γ and watch training nearly give up on the last positions (small γ) or treat them almost like the first ones (large γ). Raise the draft “quality” and watch the mint bars close in on the lilac ones: TV drops, the confidence target rises and the prefix survival stretches across the block. That is what training chases, gradient by gradient.</p>
+  <div class="la-inrecipe" data-recipe="ds"><div class="la-inrecipe-h"><span class="la-rb ds"></span><span class="k">Parameters</span><code>dspark_block_size: 5</code> · <code>MTP_NUM_TOKENS=6</code></div><div class="la-inrecipe-b"><p>The <code>dspark_block_size = 5</code> in <code>config.json</code> is the block size DSpark was trained with. Drafting fewer than 5 positions truncates the block: in vLLM 0.25.2 this passes silently, and from 0.26 on it is rejected. In the Vision-Exp lane, an MTP module reuse rule still requires \(k\) to be divisible by 3, which is why the recipe uses <code>MTP_NUM_TOKENS=6</code> (one extra noise query). The optional <i>block-k</i> hotfix removes the rule for DSpark and unlocks \(k = 5\), for a 2–10% gain with a single stream. The right \(k\) is the one that respects training.</p></div></div>
+
+  <h3>QAT: training while already seeing the rounding</h3>
+  <p>One last variation doesn't touch the loss formula but the forward: <span class="la-term" data-term="qat">QAT</span> (<i>quantization-aware training</i>). During training, certain tensors go through a quantize → dequantize pair, <span class="la-term" data-term="quantizacao-simulada">simulated quantization</span>. The forward already sees the rounded values that inference will see, and the loss charges for the error that rounding causes. The catch is that rounding is a staircase, with zero derivative almost everywhere. That is why the backward uses the <span class="la-term" data-term="ste">straight-through estimator</span>: it pretends the staircase is the identity and lets the gradient through. The model learns to tolerate rounding.</p>
+  <div class="la-eq">
+    \[ \text{forward: } \hat w = s\cdot \operatorname{round}(w/s) \qquad\qquad \text{backward (STE): } \frac{\partial \hat w}{\partial w} \approx 1 \]
+    <ul class="la-eq-legend">
+      <li>\(s\): the scale of the quantized block</li>
+      <li>\(\operatorname{round}\): round to the nearest representable value</li>
+      <li>STE: treat the staircase as if it were the line \(\hat w = w\) when differentiating</li>
+    </ul>
+  </div>
+  <p>In the recipes, almost everything is post-training quantization (PTQ): the model was trained in high precision and compressed afterward (EXL3 for GLM, NVFP4 for Qwen). The exception is DeepSeek-V4. The KV cache of the non-RoPE dimensions was trained with FP8 simulation, in blocks of 64 and with scale \(2^{\lceil \log_2(\text{amax}/448)\rceil}\). That is why the FP8 KV layout is not a degradation: it is the regime in which the model learned. The recipe uses it via <code>--kv-cache-dtype nvfp4_ds_mla</code>, which, despite the name, is byte-identical to <code>fp8_ds_mla</code> (<a data-ch="kv-cache-quantizado">Quantized KV cache</a>). The same goes for the <span class="la-term" data-term="lightning-indexer">indexer</span> of DeepSeek-V4's sparse attention, the cheap scorer that picks which old tokens each query will read (<a data-ch="atencao-esparsa">Sparse attention</a>). The indexer's Q and K were trained seeing simulated FP4, in blocks of 32, after a Hadamard rotation (an orthogonal matrix that spreads extreme values across the coordinates before rounding). That is why the indexer cache in <span class="la-term" data-term="mxfp4">MXFP4</span>, which the recipe turns on with <code>DSPARK_ENABLE_MXFP4_INDEXER_CACHE=1</code> (optional, default 0), is also a native format of the model, and not a new approximation. And even smart PTQ minimizes a loss. EXL3 picks the codes that minimize the error at each layer's <i>output</i>, \(\operatorname{tr}\big((\hat W - W)\,H\,(\hat W - W)^\top\big)\), only without retraining the model (<a data-ch="hadamard-trelica-exl3">Hadamard, trellises &amp; EXL3</a>).</p>
+</section>
+
+<section class="la-sec">
+  <h2>Training vs inference: what freezes and what the recipe chooses</h2>
+  <p>Putting it all together, the training loop is this: sample a minibatch, run the forward, compute the loss, run the backward to get the gradients and let the optimizer update the weights. Repeat that for tens or hundreds of thousands of steps (order of magnitude). <span class="la-term" data-term="inferencia">Inference</span> is what is left when you strip away everything but the <span class="la-term" data-term="forward-pass">forward</span>. There is no loss, because there is no right answer to compare against. There is no gradient and no optimizer. The <span class="la-term" data-term="pesos-congelados">weights are frozen</span>. Step through the figure.</p>
+  <figure class="la-fig wide" id="fig-laco" data-title="The training loop and the inference assembly line">
+    <div class="la-fig-stage" style="height:420px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Steps 1 to 5 are one turn of the training loop: data → forward → loss → backward → optimizer. At step 6 the weights get a padlock, and at step 7 only the forward remains, generating one token at a time and storing the KV cache. The “QAT” toggle inserts quantize/dequantize into the training forward. The bottom bar compares bytes per parameter for training and for serving the selected model (the training one follows a rule of thumb).</figcaption>
+  </figure>
+  <p>The memory gap is brutal. Training with AdamW in mixed precision typically takes about 16 bytes per parameter just for state: BF16 weights (2), BF16 gradients (2), the FP32 master copy (4) and Adam's two FP32 moments (4 + 4). That is the classic rule of thumb, and it doesn't even count the activations kept for the backward. For GLM's 321 billion parameters, the tally goes past 5 TB. Serving the same model in the recipe fits in ~164 GiB of EXL3 weights (about 4.4 bits per parameter), plus the <span class="la-term" data-term="kv-cache">KV cache</span>. Muon saves one buffer, because it only keeps the momentum, but that doesn't change the order of magnitude. That is why two DGX Sparks can serve a model whose training required a datacenter.</p>
+  <h3>What the recipe inherits and what it chooses</h3>
+  <p>Frozen weights draw the boundaries of a recipe's job. It <b>cannot</b> change what the model learned. It <b>can</b> change how the forward is computed: the numeric format of the weights and the KV (quantization), the kernels that do the math, how the work is split across machines, how requests are scheduled, how tokens are sampled and whether there is a drafter proposing tokens for verification. Each of these choices approximates or reorganizes the same forward. That is why every recipe measures whether the result still matches the reference.</p>
+  <p>Even abliteration, which changes the model's behavior, respects the boundary. In the GLM recipe, <code>ABLIT=1</code> edits the <code>o_proj</code> matrices (attention's output projections) at load time, and nothing is written back to disk. It is linear algebra on frozen weights, not training (<a data-ch="abliteracao">Abliteration</a>).</p>
+  <div class="la-table-wrap" style="position:relative"><table class="la-params">
+    <thead><tr><th>Parameter</th><th>Value</th><th>Recipe</th><th>What it does</th><th>Why it matters at inference</th></tr></thead>
+    <tbody>
+      <tr><td><code>router_aux_loss_coef</code></td><td>0.001</td><td><span class="la-rb glm"></span> <span class="la-rb qwen"></span></td><td>Weight of the auxiliary loss that, during training, penalizes uneven load across experts</td><td>No effect at inference. Explains why the experts arrive balanced (<a data-ch="mixture-of-experts">MoE</a>)</td></tr>
+      <tr><td><code>initializer_range</code></td><td>0.02</td><td><span class="la-rb glm"></span> <span class="la-rb qwen"></span> <span class="la-rb ds"></span></td><td>Standard deviation of the initial random draw of the weights</td><td>No effect: it only mattered before the first training step</td></tr>
+      <tr><td><code>topk_method</code></td><td><code>noaux_tc</code></td><td><span class="la-rb glm"></span> <span class="la-rb ds"></span></td><td>Balancing without an auxiliary loss: one bias per expert, adjusted outside the gradient during training</td><td>The bias (<span class="la-term" data-term="e-score-correction-bias">e_score_correction_bias</span>) arrives frozen in the checkpoint and only enters the top-k selection</td></tr>
+      <tr><td><code>num_experts_per_tok</code></td><td>8</td><td><span class="la-rb glm"></span></td><td>How many experts each token uses, fixed in training</td><td>Without the config aliases (already present in the vLLM the recipe image pins), the default of 7 applied: “routing 7 experts/token instead of the trained 8”</td></tr>
+      <tr><td><code>rms_norm_eps</code> (vision)</td><td>1e-6 (the checkpoint says 1e-5)</td><td><span class="la-rb glm"></span></td><td>The \(\varepsilon\) added to the mean of the squares under the RMSNorm's square root, in the vision tower (the part of GLM that reads images)</td><td>The tower was trained with 1e-6. With 1e-5, descriptions come out repetitive or degraded, so the model code in the recipe's vLLM forces 1e-6</td></tr>
+      <tr><td><code>DFLASH_TOKENS</code></td><td>7</td><td><span class="la-rb glm"></span></td><td>Tokens proposed per step by DFlash2</td><td>The trained block is 8 = 1 anchor + 7 drafts</td></tr>
+      <tr><td><code>num_speculative_tokens</code> (MTP)</td><td>3</td><td><span class="la-rb qwen"></span></td><td>Reapplies the single MTP layer, trained over several steps, 3 times</td><td>Per-position acceptance of 89 / 74.5 / 60% (batch 1, greedy). vLLM itself warns that reapplying the same MTP layer can reduce acceptance</td></tr>
+      <tr><td><code>dspark_block_size</code></td><td>5</td><td><span class="la-rb ds"></span></td><td>Block size DSpark was trained with</td><td><i>k</i> &lt; 5 truncates blocks; the Vision-Exp lane uses <i>k</i> = 6 because of the divisibility rule</td></tr>
+      <tr><td>NoPE KV in FP8 (QAT)</td><td>blocks of 64, power-of-2 scale</td><td><span class="la-rb ds"></span></td><td>Training simulated the KV quantization</td><td>Serving the KV in FP8 is the model's native regime, not an approximation</td></tr>
+      <tr><td>Indexer Q/K in FP4 (QAT) · <code>DSPARK_ENABLE_MXFP4_INDEXER_CACHE</code></td><td>blocks of 32, after Hadamard · optional flag (default 0)</td><td><span class="la-rb ds"></span></td><td>Training simulated FP4 on the indexer inputs; with the flag at 1, the recipe passes <code>use_fp4_indexer_cache</code> to vLLM and stores the indexer's K in MXFP4</td><td>The MXFP4 cache is the format in which the indexer learned to score, and, according to the recipe, it should read half the K bytes per scored key (expected effect)</td></tr>
+      <tr><td>Optimizer</td><td>Muon + AdamW</td><td><span class="la-rb qwen"></span> <span class="la-rb ds"></span></td><td>How the weights were updated</td><td>Doesn't go into the checkpoint. What remains are the normalizations that made training stable (QK-Norm in Qwen; Q RMSNorm and <code>kv_norm</code> in DeepSeek), which must be executed exactly</td></tr>
+    </tbody>
+  </table></div>
+  <div class="la-inrecipe" data-recipe="glm"><div class="la-inrecipe-h"><span class="la-rb glm"></span><span class="k">Adaptation in vLLM</span><code>glm5_next.py</code> · config aliases</div><div class="la-inrecipe-b"><p>The GLM checkpoint uses SGLang field names (<code>num_experts_per_tok</code>, <code>hc_mult</code>, <code>mla_use_nope</code>…), and vLLM's config class expected different names. In the vLLM commit the recipe image pins (<code>487ecf187</code>), <code>glm5_next.py</code> reads both. Without that, the model came up without a single error and routed 7 experts per token instead of the 8 from training. It is the chapter's lesson in bug form: the inference forward has to be <i>the same function</i> that was trained, and a single number out of place silently changes the model.</p></div></div>
+  <div class="la-callout tip"><b class="t">To carry into the next parts</b><p>Faced with any field, flag or patch in a recipe, ask: does this change the <b>function</b> that training fitted, or only the <b>way of computing it</b>? In the first case, it is only acceptable if it reproduces training (eps, number of experts, block size, QAT format). In the second, it has to be measured against the reference (KLD, numerical parity, acceptance).</p></div>
+  <p>One piece is still missing: how do you compute the gradient of 321 billion knobs in one go? And, before that, what exactly are the layers that turn tokens into probabilities? The next chapter opens the box, with neurons, layers, activation functions and the backpropagation that makes it all work (<a data-ch="redes-neurais">Neural networks</a>).</p>
+</section>

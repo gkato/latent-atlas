@@ -1,0 +1,373 @@
+<p class="la-lead">Dois capítulos atrás (<a data-ch="ppo-rlhf">capítulo 55</a>), alinhar um modelo a preferências exigia uma pequena fábrica: um <span class="la-term" data-term="reward-model">modelo de recompensa</span> treinado com pares, um laço de RL que gera texto com um motor de inferência, um crítico, uma cópia congelada da referência e uma penalidade de KL para segurar tudo. Com <i>full fine-tuning</i> de um modelo de 8B, só os estados desses quatro modelos somam ~288 GB. O <a data-ch="grpo-rlvr">capítulo anterior</a> tirou o crítico da fábrica, mas manteve os rollouts e a recompensa. Em maio de 2023, Rafailov e colegas mostraram que, para o objetivo que o RLHF de fato otimiza, a fábrica inteira cabe numa única perda supervisionada, calculada sobre pares fixos e com só dois modelos. O título do paper resume a ideia: <i>“Your Language Model is Secretly a Reward Model”</i>. Neste capítulo você vai derivar o DPO linha a linha, da solução fechada do RL com KL até o cancelamento do \(Z(x)\). Vai ver o gradiente agir token a token, entender o papel de \(\beta\) e do modelo de referência, conhecer os modos de falha com números das fontes e sair sabendo configurar, monitorar e diagnosticar um treino de DPO no TRL.</p>
+
+<section class="la-sec">
+  <h2>Do RLHF ao atalho: duas fábricas de alinhamento</h2>
+  <p>Relembre o pipeline do <a data-ch="ppo-rlhf">capítulo 55</a>. Um <span class="la-term" data-term="sft">SFT</span> ensina formato. Depois, pessoas (ou um juiz) comparam pares de respostas, e um modelo de recompensa \(r_\phi\) aprende notas compatíveis com essas comparações pelo modelo de <span class="la-term" data-term="bradley-terry">Bradley–Terry</span> (<a data-ch="preferencias-reward-models">capítulo 53</a>). Por fim, o <span class="la-term" data-term="ppo">PPO</span> faz a política gerar respostas, pontua cada uma com \(r_\phi\), desconta uma penalidade de KL até a referência e atualiza os pesos. Foi assim que nasceu o InstructGPT. Funciona, mas é caro de três maneiras:</p>
+  <ol class="la-steps">
+    <li><b>Muitos modelos na memória.</b> A política e o crítico treinam; a referência e a recompensa ficam congeladas. Com Adam em precisão mista, cada modelo treinado custa ~16 bytes por parâmetro (pesos, gradientes, cópia mestre e dois momentos), e cada congelado em BF16 custa 2. Com quatro modelos de \(N\) parâmetros, são \(2\times16N+2\times2N=36N\) bytes: ~288 GB para \(N=8\)B, sem ativações e sem o motor de inferência.</li>
+    <li><b>Gerar texto no meio do treino.</b> Toda iteração começa com <i>rollouts</i>: a política escreve respostas inteiras, token a token. O decode é serial, e é aqui que o <span class="la-term" data-term="vllm">vLLM</span> do Módulo 1 entra no laço.</li>
+    <li><b>Muitas peças para afinar.</b> Clipping, vantagem com GAE, normalizações, coeficiente de KL, épocas por lote. Cada peça traz a sua instabilidade.</li>
+  </ol>
+  <p>O <a data-ch="grpo-rlvr">capítulo 56</a> já cortou o crítico: GRPO e RLOO tiram a vantagem da comparação entre as respostas de um mesmo grupo e guardam política (16N) + referência (2N) + RM (2N) = 20N ≈ 160 GB para 8B (conta nossa; 18N com recompensa verificável, cujo verificador roda fora da GPU). Mas ainda geram rollouts e ainda precisam de uma recompensa. O DPO corta as duas coisas.</p>
+  <p>O <span class="la-term" data-term="dpo">DPO</span> (<i>Direct Preference Optimization</i>; Rafailov, Sharma, Mitchell, Ermon, Manning e Finn, NeurIPS 2023) parte da mesma pergunta: como maximizar a recompensa sem se afastar demais da referência? E descobre que, para esse objetivo específico, a resposta sai <b>sem treinar um modelo de recompensa e sem RL</b>. Sobram dois modelos (a política, que treina, e a referência, congelada), um dataset fixo de pares e uma perda que é uma regressão logística. Cada par custa quatro forwards (política e referência, na resposta preferida e na preterida), e só a política faz backward. Com <i>full fine-tuning</i> de 8B, os estados caem para ~144 GB, ou ≈134 GiB (\(16N+2N\)), e para ~128 GB (≈119 GiB) se os log-probs da referência forem pré-computados. Em memória, a cópia congelada empata com o GRPO de recompensa verificável (18N); o ganho do DPO está em não gerar texto e não precisar de recompensa nenhuma.</p>
+  <figure class="la-fig" id="fig-pipeline" data-title="Duas fábricas de alinhamento">
+    <div class="la-fig-stage" style="height:410px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Alterne entre as três fábricas. No RLHF, a política gera rollouts (o decode serial do motor de inferência), três modelos os avaliam e o PPO atualiza a política e o crítico. No GRPO (<a data-ch="grpo-rlvr">capítulo 56</a>), o crítico sai (a caixa riscada) e a vantagem vem de comparar as respostas de um mesmo grupo, mas os rollouts e a recompensa continuam. No DPO, nada é gerado: cada par do dataset passa pela política e pela referência, a margem vira uma perda e o gradiente volta só para a política. Caixas com borda tracejada estão congeladas. A memória é a contabilidade do ZeRO (16 B/parâmetro treinado, 2 B/parâmetro congelado), sem ativações.</figcaption>
+  </figure>
+  <div class="la-callout analogy"><b class="t">Analogia: o mapa e o atalho</b><p>O RLHF clássico desenha um mapa de relevo (o modelo de recompensa) a partir de relatos como “o caminho A foi melhor que o B”. Depois manda um explorador (o PPO) andar pelo terreno consultando o mapa, preso por uma coleira (o KL) a um ponto de partida. O DPO repara que, com a coleira de comprimento fixo, o destino final do explorador é uma função conhecida do mapa, e inverte a conta: ajusta o destino direto a partir dos relatos. O mapa nunca é desenhado. Ele fica <i>implícito</i> em quanto o explorador se afastou do ponto de partida.</p></div>
+  <div class="la-callout warn"><b class="t">Mesmo ótimo não quer dizer mesmo treino</b><p>A equivalência é exata para o ótimo de um problema idealizado: uma política que pode ser qualquer distribuição, preferências de Bradley–Terry e dados que cobrem as respostas. Na prática, o DPO treina offline sobre um dataset finito, e isso abre modos de falha que o PPO não tem (e vice-versa). Xu e colegas (2024, Teorema 4.1) provam que as políticas alcançáveis por “RM + PPO” formam um <b>subconjunto próprio</b> dos minimizadores da perda do DPO. O DPO aceita todas as soluções do PPO <b>e outras</b>, algumas com massa em respostas fora da distribuição dos dados. A seção 7 volta a isso com números.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>A política ótima tem forma fechada</h2>
+  <p>Comece pelos três ingredientes do RLHF, todos no §3 do paper do DPO. O primeiro é o modelo de preferências. Supõe-se uma recompensa latente \(r^*(x,y)\) e que a chance de alguém preferir \(y_1\) a \(y_2\) seja (DPO, Eq. 1):</p>
+  <div class="la-eq">
+    \[ p^*(y_1\succ y_2\mid x)=\frac{e^{r^*(x,y_1)}}{e^{r^*(x,y_1)}+e^{r^*(x,y_2)}}=\sigma\big(r^*(x,y_1)-r^*(x,y_2)\big) \]
+    <ul class="la-eq-legend">
+      <li>\(x\): o prompt; \(y_1,y_2\): duas respostas completas para ele</li>
+      <li>\(r^*(x,y)\): a recompensa latente (“quão boa” é a resposta), que ninguém observa diretamente</li>
+      <li>\(\sigma(z)=1/(1+e^{-z})\): a <span class="la-term" data-term="sigmoide">sigmoide</span></li>
+      <li>\(y_1\succ y_2\): “\(y_1\) é preferida a \(y_2\)”</li>
+    </ul>
+  </div>
+  <p>Só a <b>diferença</b> de recompensas entra. Somar a mesma função \(f(x)\) às notas de todas as respostas de um prompt não muda nenhuma preferência. Guarde esse detalhe, porque é ele que faz o DPO funcionar. O segundo ingrediente é o modelo de recompensa ajustado por máxima verossimilhança sobre pares \((x,y_w,y_l)\), com \(y_w\) a preferida (<i>winner</i>) e \(y_l\) a preterida (<i>loser</i>): \(\mathcal L_R=-\mathbb E\big[\log\sigma\big(r_\phi(x,y_w)-r_\phi(x,y_l)\big)\big]\) (Eq. 2), uma regressão logística binária. O terceiro é o objetivo que o RL maximiza (Eq. 3):</p>
+  <div class="la-eq">
+    \[ \max_{\pi_\theta}\ \mathbb E_{x\sim\mathcal D,\ y\sim\pi_\theta(\cdot\mid x)}\big[r_\phi(x,y)\big]\;-\;\beta\,\mathbb D_{\text{KL}}\big[\pi_\theta(y\mid x)\,\big\|\,\pi_{\text{ref}}(y\mid x)\big] \]
+    <ul class="la-eq-legend">
+      <li>\(\pi_\theta\): a política que treina (o LLM); \(\pi_\theta(y\mid x)\) é a probabilidade da resposta inteira</li>
+      <li>\(\pi_{\text{ref}}\): a <span class="la-term" data-term="politica-de-referencia">política de referência</span>, congelada (em geral o modelo SFT)</li>
+      <li>\(\mathbb D_{\text{KL}}\): a <span class="la-term" data-term="divergencia-kl">divergência KL</span>, \(\mathbb E_{y\sim\pi_\theta}\big[\log\frac{\pi_\theta(y\mid x)}{\pi_{\text{ref}}(y\mid x)}\big]\), em <span class="la-term" data-term="nats">nats</span></li>
+      <li>\(\beta&gt;0\): o preço de cada nat de afastamento da referência</li>
+    </ul>
+  </div>
+  <p>O KL tem dois papéis. Ele impede a política de sair da região em que \(r_\phi\) é confiável (fora dela o modelo de recompensa erra, e a política aprenderia a explorar os erros) e preserva diversidade, evitando o <span class="la-term" data-term="colapso-de-modo">colapso de modo</span>. Como a geração é discreta, esse objetivo não é diferenciável diretamente, e por isso o RLHF precisa de RL.</p>
+  <h3>A derivação, passo a passo</h3>
+  <p>O truque do DPO é perguntar: <i>se a política pudesse ser qualquer distribuição</i>, qual seria o máximo? (Apêndice A.1 do paper.) Fixe um prompt \(x\) e siga:</p>
+  <ol class="la-steps">
+    <li><b>Abra o KL.</b> Como \(\mathbb D_{\text{KL}}(\pi\|\pi_{\text{ref}})=\mathbb E_{y\sim\pi}\big[\log\frac{\pi(y\mid x)}{\pi_{\text{ref}}(y\mid x)}\big]\), o objetivo vira uma única esperança: \(\mathbb E_{y\sim\pi}\big[r(x,y)-\beta\log\frac{\pi(y\mid x)}{\pi_{\text{ref}}(y\mid x)}\big]\).</li>
+    <li><b>Troque max por min.</b> Dividir por \(-\beta\) inverte o sentido: maximizar o objetivo é minimizar \(\mathbb E_{y\sim\pi}\big[\log\frac{\pi(y\mid x)}{\pi_{\text{ref}}(y\mid x)}-\frac1\beta r(x,y)\big]\).</li>
+    <li><b>Engula a recompensa no denominador.</b> Como \(\frac1\beta r=\log e^{r/\beta}\), o integrando é \(\log\frac{\pi(y\mid x)}{\pi_{\text{ref}}(y\mid x)\,e^{r(x,y)/\beta}}\). O denominador é quase uma distribuição; só falta normalizar. Multiplique e divida por \(Z(x)=\sum_y\pi_{\text{ref}}(y\mid x)\,e^{r(x,y)/\beta}\): o integrando vira \(\log\frac{\pi(y\mid x)}{\pi^*(y\mid x)}-\log Z(x)\), com \(\pi^*=\pi_{\text{ref}}\,e^{r/\beta}/Z\).</li>
+    <li><b>Reconheça um KL.</b> A esperança de \(\log(\pi/\pi^*)\) sob \(\pi\) é \(\mathbb D_{\text{KL}}(\pi\|\pi^*)\). O problema ficou \(\min_\pi\ \mathbb D_{\text{KL}}(\pi\|\pi^*)-\log Z(x)\), e \(Z(x)\) não depende de \(\pi\).</li>
+    <li><b>Aplique Gibbs.</b> Pela <span class="la-term" data-term="desigualdade-de-gibbs">desigualdade de Gibbs</span>, um KL é sempre \(\ge0\) e só vale zero quando as duas distribuições coincidem. O mínimo é atingido em \(\pi=\pi^*\) e em nenhum outro lugar.</li>
+  </ol>
+  <div class="la-eq">
+    \[ \boxed{\ \pi^*(y\mid x)=\frac{1}{Z(x)}\,\pi_{\text{ref}}(y\mid x)\,\exp\!\Big(\frac{r(x,y)}{\beta}\Big),\qquad Z(x)=\sum_y\pi_{\text{ref}}(y\mid x)\,\exp\!\Big(\frac{r(x,y)}{\beta}\Big)\ } \]
+    <ul class="la-eq-legend">
+      <li>\(\pi^*\): a política ótima do objetivo com KL (DPO, Eq. 4) para uma classe de políticas não paramétrica</li>
+      <li>\(e^{r/\beta}\): o fator que multiplica a probabilidade de cada resposta</li>
+      <li>\(Z(x)\): a <span class="la-term" data-term="funcao-de-particao">função de partição</span>, a soma que renormaliza; depende só do prompt. Escrita como esperança, \(Z(x)=\mathbb E_{y\sim\pi_{\text{ref}}}\big[e^{r(x,y)/\beta}\big]\): uma média ponderada por \(\pi_{\text{ref}}\), que vale 1 se \(r\equiv0\)</li>
+    </ul>
+  </div>
+  <div class="la-callout deep"><b class="t">Aprofundamento: por que um KL nunca é negativo</b><p>Some só sobre o suporte de \(p\). Como o log é côncavo, a desigualdade de Jensen dá \(-\mathbb D_{\text{KL}}(p\|q)=\sum_y p(y)\log\frac{q(y)}{p(y)}\le\log\sum_y p(y)\frac{q(y)}{p(y)}=\log\sum_y q(y)\le\log1=0\). A igualdade exige que \(q/p\) seja constante no suporte de \(p\) e que \(q\) não ponha massa fora dele, ou seja, \(p=q\). É uma linha, mas sustenta o capítulo inteiro: ela garante que \(\pi^*\) é o <i>único</i> máximo.</p></div>
+  <p>Leia a fórmula como uma operação sobre barras. Cada resposta começa com a probabilidade que a referência lhe dá. Essa probabilidade é multiplicada por \(e^{r/\beta}\), um fator maior que 1 se a recompensa é positiva e menor se é negativa, e tudo é renormalizado por \(Z\). Isso se chama <span class="la-term" data-term="inclinacao-exponencial">inclinação exponencial</span> (<i>exponential tilting</i>) da referência pela recompensa. A mesma forma reaparece no AWR, no RWR e no ReST-EM (<a data-ch="awr-contrastivo">capítulo 59</a>); é o fio condutor desta parte do módulo.</p>
+  <figure class="la-fig" id="fig-inclinacao" data-title="Inclinação exponencial: a referência curvada pela recompensa">
+    <div class="la-fig-stage" style="height:410px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Seis respostas possíveis para um prompt. Em cima, a recompensa de cada uma: arraste as bolinhas. No meio, o fator \(e^{r/\beta}\). Embaixo, \(\pi_{\text{ref}}\) (contorno tracejado) e \(\pi^*\) (barra cheia); os grãos que voam são a massa de probabilidade mudando de dono. Probabilidades e recompensas <b>ilustrativas</b>.</figcaption>
+  </figure>
+  <p>Três consequências saltam da figura. <b>\(\beta\) é a temperatura da inclinação.</b> Com \(\beta\) grande, os fatores \(e^{r/\beta}\) ficam todos perto de 1 e \(\pi^*\approx\pi_{\text{ref}}\); com \(\beta\) pequeno, o fator da melhor resposta esmaga os outros e \(\pi^*\) colapsa no argmax da recompensa. <b>A inclinação é multiplicativa.</b> Se \(\pi_{\text{ref}}(y\mid x)=0\), então \(\pi^*(y\mid x)=0\) para qualquer recompensa: o ótimo herda o suporte da referência. <b>O ótimo depende de \(r\) só através de \(e^{r/\beta}\).</b> Somar uma constante a todas as recompensas de um prompt multiplica todos os fatores pelo mesmo número, que some na normalização. Repare também que a resposta “longa ✓” ganha da “curta ✓” só porque a recompensa ilustrativa a favorece um pouco; guarde isso para a seção sobre verbosidade.</p>
+  <h3>A paisagem: toda política paga exatamente β·KL até o ótimo</h3>
+  <p>A derivação dá de brinde uma identidade bonita. Juntando os passos 4 e 5, o valor do objetivo para uma política qualquer \(\pi\) é</p>
+  <div class="la-eq">
+    \[ J(\pi)=\mathbb E_{y\sim\pi}[r(x,y)]-\beta\,\mathbb D_{\text{KL}}(\pi\|\pi_{\text{ref}})\;=\;\beta\log Z(x)\;-\;\beta\,\mathbb D_{\text{KL}}(\pi\|\pi^*) \]
+    <ul class="la-eq-legend">
+      <li>\(J(\pi)\): o objetivo do RL com KL (Eq. 3) para um prompt fixo</li>
+      <li>\(\beta\log Z(x)\): o valor máximo, atingido só em \(\pi^*\)</li>
+      <li>\(\beta\,\mathbb D_{\text{KL}}(\pi\|\pi^*)\): quanto \(\pi\) fica abaixo do máximo</li>
+    </ul>
+  </div>
+  <p>O máximo é \(\beta\log Z(x)\), e qualquer outra política fica abaixo dele por <b>exatamente</b> \(\beta\) vezes a sua distância em KL até \(\pi^*\). A figura desenha essa paisagem para um prompt com só três respostas possíveis. Cada ponto do triângulo é uma política: os cantos dão 100% a uma resposta, e o centro distribui igualmente.</p>
+  <figure class="la-fig" id="fig-paisagem" data-title="A paisagem do objetivo com KL">
+    <div class="la-fig-stage" style="height:430px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Cor = \(J(\pi)\), na escala da barra “J baixo → J alto”: no tema escuro, quanto mais clara, maior; no tema claro, quanto mais escura. O anel vazado é \(\pi_{\text{ref}}=(0{,}6;\ 0{,}3;\ 0{,}1)\), a estrela âmbar é \(\pi^*\) e o ponto lilás é a sua política. Arraste o ponto ou solte a bolinha, que sobe a encosta por ascensão de gradiente exponenciada e termina sempre na estrela. As leituras confirmam \(J(\pi)+\beta\,\mathbb D_{\text{KL}}(\pi\|\pi^*)=\beta\log Z\). Recompensas \(r=(0;\ 1;\ 2)\) <b>ilustrativas</b>.</figcaption>
+  </figure>
+  <p>Arraste o ponto para o canto C: ele maximiza \(\mathbb E[r]\), mas paga muito KL. Ficar em \(\pi_{\text{ref}}\) não paga KL nenhum, mas desperdiça recompensa. A estrela é o meio-termo exato. Diminua \(\beta\) e ela escorrega para o canto da melhor resposta; aumente e ela volta para perto do anel.</p>
+  <h3>Por que não usar π* diretamente?</h3>
+  <p>Porque \(Z(x)\) é uma soma sobre <i>todas</i> as respostas possíveis. Com o vocabulário de 151.936 tokens do Qwen3-4B e respostas de 100 tokens, são \(151.936^{100}\approx10^{518}\) sequências (conta nossa). Não dá para avaliar \(r\) em todas, nem para amostrar de \(\pi^*\) sem conhecer \(Z\). O RLHF contorna isso aproximando \(\pi^*\) por RL, com amostras. O DPO contorna de outro jeito: fazendo \(Z\) desaparecer.</p>
+</section>
+
+<section class="la-sec">
+  <h2>A inversão: a recompensa escondida na política</h2>
+  <p>Agora vem a jogada que dá nome ao paper. Tire o log da Eq. 4 e isole \(r\) (DPO, Eq. 5):</p>
+  <div class="la-eq">
+    \[ r(x,y)=\beta\log\frac{\pi^*(y\mid x)}{\pi_{\text{ref}}(y\mid x)}+\beta\log Z(x) \]
+    <ul class="la-eq-legend">
+      <li>\(\beta\log\frac{\pi^*}{\pi_{\text{ref}}}\): \(\beta\) vezes a log-razão entre a política ótima e a referência; depende da resposta</li>
+      <li>\(\beta\log Z(x)\): um termo que depende <b>só do prompt</b>, igual para todas as respostas de \(x\)</li>
+    </ul>
+  </div>
+  <p>Leia de trás para frente: <b>toda recompensa pode ser escrita como \(\beta\) vezes a log-razão da sua própria política ótima, mais um termo que só depende do prompt</b>. Quem conhece \(\pi^*\) conhece \(r\), a menos de \(\beta\log Z(x)\). E esse “a menos de” é justamente o que o Bradley–Terry não enxerga. Substitua a Eq. 5 no BT e escreva a diferença de recompensas:</p>
+  <div class="la-eq">
+    \[ r(x,y_w)-r(x,y_l)=\beta\log\frac{\pi^*(y_w\mid x)}{\pi_{\text{ref}}(y_w\mid x)}+\cancel{\beta\log Z(x)}-\beta\log\frac{\pi^*(y_l\mid x)}{\pi_{\text{ref}}(y_l\mid x)}-\cancel{\beta\log Z(x)} \]
+    \[ \Rightarrow\quad p^*(y_w\succ y_l\mid x)=\sigma\Big(\beta\log\frac{\pi^*(y_w\mid x)}{\pi_{\text{ref}}(y_w\mid x)}-\beta\log\frac{\pi^*(y_l\mid x)}{\pi_{\text{ref}}(y_l\mid x)}\Big) \]
+    <ul class="la-eq-legend">
+      <li>os dois \(\beta\log Z(x)\) são idênticos porque as duas respostas são para o <b>mesmo</b> \(x\)</li>
+      <li>a segunda linha é a Eq. 6 do DPO (Apêndice A.2): a preferência escrita só com \(\pi^*\) e \(\pi_{\text{ref}}\)</li>
+    </ul>
+  </div>
+  <p>O termo intratável some <b>porque o Bradley–Terry só compara respostas do mesmo prompt</b>. A probabilidade de preferência fica escrita sem recompensa explícita e sem \(Z\). A figura encena o cancelamento e mostra que, mexendo no termo que só depende do prompt, a balança das preferências nem pisca.</p>
+  <figure class="la-fig" id="fig-cancela" data-title="A balança de Bradley–Terry e o Z que evapora">
+    <div class="la-fig-stage" style="height:400px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>As setas são as recompensas \(r(x,y_w)\) e \(r(x,y_l)\), montadas pela Eq. 5: um pedaço colorido \(\beta\log\frac{\pi^*}{\pi_{\text{ref}}}\) sobre um pedaço cinza \(\beta\log Z(x)\). A balança converte a diferença em \(P(y_w\succ y_l)\). Mova o slider: as setas sobem e descem juntas, e a balança fica parada. Valores <b>ilustrativos</b> (\(\beta h_w=0{,}6\), \(\beta h_l=-0{,}4\)).</figcaption>
+  </figure>
+  <h3>Não perdemos nada com isso?</h3>
+  <p>Uma dúvida honesta: ao escrever recompensas como log-razões, não estamos restringindo quais recompensas o modelo consegue representar? O paper responde com uma pequena teoria. Duas recompensas são <span class="la-term" data-term="classe-de-equivalencia">equivalentes</span> se diferem por uma função só do prompt, \(r(x,y)-r'(x,y)=f(x)\) (Definição 1). Recompensas equivalentes induzem as mesmas preferências (Lema 1) e a mesma política ótima com KL (Lema 2: o fator \(e^{f(x)/\beta}\) sai do numerador e do denominador da Eq. 4). O Teorema 1 garante que, se \(\pi_{\text{ref}}(y\mid x)&gt;0\) para todo par e \(\beta&gt;0\), <b>toda</b> classe de equivalência compatível com Bradley–Terry (ou Plackett–Luce) tem um representante da forma \(r=\beta\log\frac{\pi(y\mid x)}{\pi_{\text{ref}}(y\mid x)}\), e ele é único (Proposição 1 do apêndice). A reparametrização escolhe, em cada classe, a recompensa cujo \(Z(x)\) vale exatamente 1 (Eq. 9). Por isso a política correspondente fica tratável, e não se perde generalidade.</p>
+  <div class="la-callout deep"><b class="t">Aprofundamento: mais de duas respostas</b><p>Com um ranking completo de \(K\) respostas, o modelo de <span class="la-term" data-term="plackett-luce">Plackett–Luce</span> dá a versão geral da perda (Apêndice A.3, Eq. 20). Cada fator do produto é um softmax da recompensa implícita da resposta da posição \(k\) contra todas as que ficaram abaixo dela. Para \(K=2\), volta exatamente à perda da próxima seção. Para \(K&gt;2\), cada termo tem a forma do InfoNCE, a perda contrastiva que o <a data-ch="awr-contrastivo">capítulo 59</a> usa para costurar o DPO aos métodos de contraste.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>A perda do DPO e o seu gradiente</h2>
+  <p>Falta um passo. A Eq. 6 vale para a política ótima \(\pi^*\), que não conhecemos. Faça então o que se faz com qualquer modelo probabilístico: troque \(\pi^*\) por uma política parametrizada \(\pi_\theta\) e maximize a verossimilhança dos pares observados. O resultado é a perda do DPO (Eq. 7):</p>
+  <div class="la-eq">
+    \[ \boxed{\ \mathcal L_{\text{DPO}}(\pi_\theta;\pi_{\text{ref}})=-\,\mathbb E_{(x,y_w,y_l)\sim\mathcal D}\Big[\log\sigma\Big(\beta\log\frac{\pi_\theta(y_w\mid x)}{\pi_{\text{ref}}(y_w\mid x)}-\beta\log\frac{\pi_\theta(y_l\mid x)}{\pi_{\text{ref}}(y_l\mid x)}\Big)\Big]=-\,\mathbb E\big[\log\sigma(\beta\,\Delta h)\big]\ } \]
+    <ul class="la-eq-legend">
+      <li>\(\mathcal D\): o dataset fixo de triplas (prompt, preferida, preterida)</li>
+      <li>\(h_\theta(x,y)=\log\frac{\pi_\theta(y\mid x)}{\pi_{\text{ref}}(y\mid x)}\): a log-razão política/referência de uma resposta, em nats</li>
+      <li>\(\Delta h=h_\theta(x,y_w)-h_\theta(x,y_l)\): a <span class="la-term" data-term="margem-de-log-razoes">margem de log-razões</span></li>
+      <li>\(\beta\): o mesmo \(\beta\) do objetivo com KL, agora como escala do logit</li>
+    </ul>
+  </div>
+  <p>Compare com a perda do modelo de recompensa (Eq. 2). É <b>a mesma regressão logística</b>, com \(r_\phi\) trocado por \(\hat r_\theta(x,y)=\beta\log\frac{\pi_\theta(y\mid x)}{\pi_{\text{ref}}(y\mid x)}\), a <span class="la-term" data-term="recompensa-implicita">recompensa implícita</span>. Treinar o DPO é treinar um modelo de recompensa cuja “cabeça” é a própria log-razão da política. Quando a perda é minimizada, a política que define essa recompensa é, por construção, a ótima para ela. Daí o título: o seu modelo de linguagem é, secretamente, um modelo de recompensa.</p>
+  <p>Dois detalhes de implementação importam desde já. Primeiro, \(\log\pi(y\mid x)\) é a <b>soma</b> dos <span class="la-term" data-term="logprob">log-probs</span> dos tokens da resposta, \(\sum_t\log\pi(y_t\mid x,y_{&lt;t})\), com uma máscara que exclui os tokens do prompt (o mesmo mascaramento do SFT, <a data-ch="sft">capítulo 52</a>). Segundo, a política começa igual à referência. No passo zero, \(h=0\) para todas as respostas, a perda vale \(\log2\approx0{,}6931\) e todos os pares pesam igual.</p>
+  <h3>Um par de brinquedo</h3>
+  <p>Para ter números na mão, use um par <b>ilustrativo</b> (exemplo nosso). A resposta preferida é mais longa, o caso típico de viés de verbosidade:</p>
+  <table>
+    <thead><tr><th></th><th>\(y_w\) (preferida)</th><th>\(y_l\) (preterida)</th></tr></thead>
+    <tbody>
+      <tr><td>comprimento \(\lvert y\rvert\)</td><td>20 tokens</td><td>10 tokens</td></tr>
+      <tr><td>\(\log\pi_{\text{ref}}(y\mid x)\)</td><td>−26,0</td><td>−15,0</td></tr>
+      <tr><td>\(\log\pi_\theta(y\mid x)\), após alguns passos</td><td>−25,0</td><td>−17,0</td></tr>
+      <tr><td>\(h=\log\pi_\theta-\log\pi_{\text{ref}}\)</td><td><b>+1,0</b></td><td><b>−2,0</b></td></tr>
+    </tbody>
+  </table>
+  <p>A margem é \(\Delta h=1-(-2)=3\). Com \(\beta=0{,}1\), o logit é \(u=\beta\Delta h=0{,}30\) e a perda é \(-\log\sigma(0{,}30)=0{,}5544\). Ela continua caindo enquanto a margem cresce: com \(\beta=0{,}1\), vale 0,3133 em \(\Delta h=10\), 0,1269 em 20 e 0,0067 em 50, mas nunca chega a zero. <b>Sempre há incentivo para aumentar a margem.</b> Note também que o DPO “desconta” o comprimento: a preferida tem log-prob somada muito menor (−25 contra −17), mas o que entra na perda é quanto cada uma <i>mudou</i> em relação à referência.</p>
+  <figure class="la-fig" id="fig-perda" data-title="A rampa do DPO e a bolinha que nunca para">
+    <div class="la-fig-stage" style="height:400px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Curva menta: a perda em função da margem \(\Delta h\). Curva âmbar tracejada: a força que o gradiente faz sobre a margem, proporcional a \(p-\sigma(\beta\Delta h)\) (o gradiente traz ainda o fator \(\beta\)), que com \(p=1\) é o peso \(\sigma(-\beta\Delta h)\). As leituras abaixo usam o \(p\) escolhido. A bolinha desce a rampa por descida de gradiente na própria margem (tempo reescalado, uma caricatura). O eixo de \(\Delta h\) se ajusta a \(\beta\), porque \(\beta\) é só a escala do logit. Com \(p&lt;1\), a curva é a perda média quando uma fração \(p\) dos anotadores prefere \(y_w\) (derivação nossa a partir do §4.2 do IPO).</figcaption>
+  </figure>
+  <p>Brinque com \(p\). Com \(p=1\), o que um dataset com um único rótulo por par efetivamente diz, a bolinha desacelera mas nunca para: o ótimo está em \(\Delta h\to+\infty\). Com \(p=0{,}8\), a curva ganha um fundo em \(\Delta h^*=\operatorname{logit}(0{,}8)/\beta\), e a bolinha estaciona ali. Essa diferença é o germe de um dos modos de falha da seção 7, e é a motivação do IPO no próximo capítulo.</p>
+  <h3>O gradiente: quem empurra o quê</h3>
+  <p>Derive a Eq. 7 (DPO §4 e Apêndice A.4). Use \(\frac{d}{dz}[-\log\sigma(z)]=-\sigma(-z)\) e \(\nabla_\theta h_\theta(x,y)=\nabla_\theta\log\pi_\theta(y\mid x)\), porque a referência não depende de \(\theta\):</p>
+  <div class="la-eq">
+    \[ \nabla_\theta\mathcal L_{\text{DPO}}=-\beta\,\mathbb E_{(x,y_w,y_l)\sim\mathcal D}\Big[\underbrace{\sigma\big(\hat r_\theta(x,y_l)-\hat r_\theta(x,y_w)\big)}_{\text{peso: maior quando a recompensa implícita erra}}\Big(\underbrace{\nabla_\theta\log\pi_\theta(y_w\mid x)}_{\text{sobe }y_w}-\underbrace{\nabla_\theta\log\pi_\theta(y_l\mid x)}_{\text{desce }y_l}\Big)\Big] \]
+    <ul class="la-eq-legend">
+      <li>\(\sigma(\hat r_l-\hat r_w)=\sigma(-\beta\Delta h)\): o <span class="la-term" data-term="peso-adaptativo">peso adaptativo</span> de cada par</li>
+      <li>\(\nabla_\theta\log\pi_\theta(y\mid x)\): o mesmo gradiente da log-verossimilhança do SFT, aplicado à resposta inteira</li>
+      <li>o sinal de menos na frente: descer a perda é subir \(y_w\) e descer \(y_l\)</li>
+    </ul>
+  </div>
+  <p>Há quatro leituras importantes:</p>
+  <ol class="la-steps">
+    <li><b>Peso adaptativo.</b> \(\sigma(-\beta\Delta h)\) vale 0,5 no início (\(\pi_\theta=\pi_{\text{ref}}\)) e cai para perto de 0 quando o par já está bem ordenado. O DPO gasta gradiente nos pares que ainda estão errados ou apertados. O paper mostra que, <b>sem esse peso</b>, o modelo degenera: é o baseline “Unlikelihood”, que só sobe \(\log\pi(y_w)\) e desce \(\log\pi(y_l)\) (DPO, Apêndice, Tabela 3). No par de brinquedo com \(\beta=0{,}1\), o peso é 0,4256 e o coeficiente total, \(\beta\cdot\) peso, é 0,0426.</li>
+    <li><b>Só a margem importa.</b> A perda depende apenas de \(\Delta h\). Ela é indiferente a subir \(y_w\) ou a descer \(y_l\), e não impede que <b>ambas</b> caiam, desde que \(y_l\) caia mais. É a raiz do deslocamento de verossimilhança da seção 7.</li>
+    <li><b>O sinal mora no primeiro token divergente.</b> Como \(\nabla\log\pi(y\mid x)=\sum_t\nabla\log\pi(y_t\mid x,y_{&lt;t})\), se \(y_w\) e \(y_l\) têm um prefixo comum, os termos desse prefixo são idênticos (mesmo contexto, mesmo token) e se cancelam na diferença (derivação nossa). Em pares com pouca distância de edição, quase todo o gradiente cai em poucos tokens. Isso é consistente com o Smaug/DPOP, que observa falhas justamente nesses pares.</li>
+    <li><b>\(\beta\) escala tudo.</b> O fator \(\beta\) multiplica o gradiente inteiro. Um \(\beta\) pequeno dá passos pequenos por unidade de \(\Delta h\), mas deixa a política ir mais longe da referência antes de o peso saturar.</li>
+  </ol>
+  <p>A figura abaixo acompanha um par de três tokens do começo ao fim: os quatro forwards, a máscara, as somas, a margem, a perda e o gradiente voltando para os tokens.</p>
+  <figure class="la-fig wide" id="fig-tokens" data-title="Do token à perda e de volta">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Cada célula é um log-prob por token, \(\log\pi(y_t\mid x,y_{&lt;t})\). As linhas da política (lilás) são calculadas com gradiente; as da referência (cinza), sem. O prompt fica mascarado. No último passo, as setas âmbar mostram o gradiente subindo os tokens de \(y_w\) e descendo os de \(y_l\); no token comum “É” (mesmo contexto, mesmo token) as duas setas se anulam. Valores <b>ilustrativos</b>.</figcaption>
+  </figure>
+  <h3>Em código</h3>
+  <p>A implementação mínima cabe em poucas linhas (pseudocódigo PyTorch nosso). A função <code>seq_logps</code> transforma logits de forma <code>[B, T, V]</code> em log-probs dos tokens observados, <code>[B, T]</code>, e soma só onde a máscara marca a resposta. Escolhidas e rejeitadas podem ir no mesmo lote ou em forwards separados, que reduzem o pico de memória (Tülu 3, Fig. 17).</p>
+  <pre data-lang="python"><code>import torch
+import torch.nn.functional as F
+
+def seq_logps(logits, labels, mask):
+    # logits: [B,T,V] já deslocados; labels: [B,T]; mask=1 nos tokens da RESPOSTA
+    lp = torch.gather(logits.log_softmax(-1), 2, labels.unsqueeze(-1)).squeeze(-1)
+    return (lp * mask).sum(-1), mask.sum(-1)          # soma e comprimento |y|
+
+def dpo_loss(pw, pl, rw, rl, beta=0.1):               # p*: política, r*: referência (somas)
+    delta = (pw - rw) - (pl - rl)                      # Δh
+    loss = -F.logsigmoid(beta * delta)
+    return loss.mean(), (beta * (pw - rw)).detach(), (beta * (pl - rl)).detach()</code></pre>
+  <p>Dois cuidados: use <code>logsigmoid</code> (estável numericamente) em vez de <code>log(sigmoid(·))</code>, e lembre que <code>rw</code> e <code>rl</code> vêm de um forward sem gradiente. O tensor de logits é o vilão da memória. Com o vocabulário de 248.320 tokens do Qwen3.8-27B e <code>max_length</code> 2048, só os logits de uma escolhida e uma rejeitada ocupam \(2\times2048\times248.320\times4\) B ≈ 4,1 GB em FP32 (estimativa nossa, por fórmula).</p>
+</section>
+
+<section class="la-sec">
+  <h2>β, a recompensa implícita e o modelo de referência</h2>
+  <h3>Os dois empregos de β</h3>
+  <p>No objetivo (Eq. 3), \(\beta\) é o <b>preço do KL</b>: maior \(\beta\), ótimo mais perto de \(\pi_{\text{ref}}\). Na perda (Eq. 7), \(\beta\) é a <b>escala do logit</b>. As duas leituras se encontram quando se pergunta onde a perda tem mínimo. Se, na população, uma fração \(p&lt;1\) dos anotadores prefere \(y_w\), a perda média tem mínimo onde \(\sigma(\beta\Delta h)=p\):</p>
+  <div class="la-eq">
+    \[ \Delta h^*=\frac{\operatorname{logit}(p)}{\beta}=\frac1\beta\log\frac{p}{1-p}\qquad\xrightarrow{\ p\to1\ }\qquad+\infty\ \text{ para qualquer }\beta \]
+    <ul class="la-eq-legend">
+      <li>\(p\): a probabilidade verdadeira de \(y_w\succ y_l\) para aquele par</li>
+      <li>\(\operatorname{logit}(p)\): o inverso da sigmoide</li>
+      <li>\(\Delta h^*\): a margem que o ótimo exige; um \(\beta\) menor exige um afastamento maior da referência</li>
+    </ul>
+  </div>
+  <p>Para \(p=1\), uma preferência determinística, o ótimo exige margem infinita, <b>qualquer que seja \(\beta\)</b>, e zera a probabilidade da preterida. Com dados finitos, \(\hat p=1\) é a regra: quase todo dataset traz um único rótulo por par. Esse é o argumento central do IPO, e o <a data-ch="ipo-kto-simpo">próximo capítulo</a> mostra como trocar a sigmoide por um alvo finito. A tabela usa o par de brinquedo (\(\Delta h=3\)) com vários \(\beta\):</p>
+  <table>
+    <thead><tr><th>\(\beta\)</th><th>\(\hat r_w\)</th><th>\(\hat r_l\)</th><th>logit \(u=\beta\Delta h\)</th><th>perda \(-\log\sigma(u)\)</th><th>peso \(\sigma(-u)\)</th><th>\(\beta\cdot\) peso</th></tr></thead>
+    <tbody>
+      <tr><td>0,01</td><td>0,010</td><td>−0,020</td><td>0,03</td><td>0,6783</td><td>0,4925</td><td>0,00493</td></tr>
+      <tr><td>0,05</td><td>0,050</td><td>−0,100</td><td>0,15</td><td>0,6210</td><td>0,4626</td><td>0,02313</td></tr>
+      <tr><td><b>0,1</b></td><td><b>0,100</b></td><td><b>−0,200</b></td><td><b>0,30</b></td><td><b>0,5544</b></td><td><b>0,4256</b></td><td><b>0,04256</b></td></tr>
+      <tr><td>0,5</td><td>0,500</td><td>−1,000</td><td>1,50</td><td>0,2014</td><td>0,1824</td><td>0,09121</td></tr>
+      <tr><td>1,0</td><td>1,000</td><td>−2,000</td><td>3,00</td><td>0,0486</td><td>0,0474</td><td>0,04743</td></tr>
+    </tbody>
+  </table>
+  <p>Leia a tabela de cima para baixo. Com \(\beta\) 10× maior (0,1 → 1,0), o logit vai de 0,3 a 3,0, a perda de 0,554 a 0,049 e o peso de 0,426 a 0,047: o par fica “resolvido” com pouco afastamento da referência. É a leitura “\(\beta\) grande = fica perto de \(\pi_{\text{ref}}\)”. Repare também na última coluna. O coeficiente do gradiente, \(\beta\sigma(-\beta\Delta h)\), não é monotônico em \(\beta\): para uma margem fixa, ele é máximo em valores intermediários.</p>
+  <p>Valores publicados, todos “como reportados”: \(\beta=0{,}1\) é o padrão do paper e do TRL, e o paper usa 0,5 no TL;DR. No sweep do SimPO (\(\beta\in\{0{,}01;\,0{,}05;\,0{,}1\}\)), o melhor DPO no UltraFeedback com modelos de 7–9B foi \(\beta=0{,}01\). O HelpSteer2 reporta uma “KL penalty” de \(10^{-3}\) no DPO. O Tülu 3 usou \(\beta=5\), mas com DPO <b>normalizado por comprimento</b>.</p>
+  <div class="la-callout warn"><b class="t">β não viaja entre variantes</b><p>No DPO normalizado por comprimento, a log-razão é dividida pelo número de tokens. Ela fica ~\(\lvert y\rvert\) vezes menor, e o \(\beta\) precisa ser ~\(\lvert y\rvert\) vezes maior para dar o mesmo logit; daí o \(\beta=5\) do Tülu 3. No par de brinquedo, a margem normalizada é \(1/20-(-2)/10=0{,}25\): com \(\beta=5\), logit 1,25 e perda 0,2519. Não copie \(\beta\) de uma variante para outra sem refazer essa conta.</p></div>
+  <h3>A recompensa implícita como instrumento</h3>
+  <p>Como \(\hat r_\theta=\beta h_\theta\) é uma recompensa de verdade, dá para medi-la durante o treino. O TRL loga exatamente isso: <code>rewards/chosen</code> \(=\beta h_\theta(x,y_w)\), <code>rewards/rejected</code> \(=\beta h_\theta(x,y_l)\), <code>rewards/margins</code> (a média da diferença) e <code>rewards/accuracies</code> (a fração de pares com \(\hat r_w&gt;\hat r_l\)), além de <code>logps/chosen</code> e <code>logps/rejected</code>. Use esses números como termômetro, não como placar, por dois motivos documentados:</p>
+  <ul>
+    <li><b>A recompensa implícita não é a métrica de geração.</b> Ela depende de \(\pi_{\text{ref}}\); a decodificação, não. O SimPO (§2.2) mediu que, depois do DPO, só ~50% dos triplos de treino têm log-prob <b>média</b> da preferida maior que a da preterida.</li>
+    <li><b>Acurácia alta não prevê qualidade.</b> No estudo de sobre-otimização de Rafailov e colegas (NeurIPS 2024), a acurácia da recompensa implícita praticamente não se correlaciona com a qualidade final no DPO e no SLiC. No IPO há uma correlação fraca.</li>
+  </ul>
+  <h3>O modelo de referência na prática</h3>
+  <p>A escolha canônica é \(\pi_{\text{ref}}=\pi_{\text{SFT}}\), o mesmo ponto de partida de \(\pi_\theta\). Se os pares vieram de outro modelo e não existe um SFT seu, o paper recomenda criar a referência com um SFT nas respostas preferidas (“Preferred-FT”), para reduzir a mudança de distribuição entre os dados e a referência. O custo é fixo: quatro forwards por par (política e referência, em \(y_w\) e \(y_l\)), dois deles sem gradiente. Há quatro jeitos de pagar a referência:</p>
+  <div class="la-cards">
+    <div class="la-card"><span class="ic">🧊</span><h4>Cópia congelada</h4><p>Uma segunda cópia em BF16: +2 bytes por parâmetro e dois forwards extras por par. É o caso padrão com <i>full fine-tuning</i>, e o do <code>mlx-lm-lora</code> no Mac, que carrega uma segunda cópia completa.</p></div>
+    <div class="la-card"><span class="ic">💾</span><h4>Log-probs pré-computados</h4><p>A referência não muda, então \(\log\pi_{\text{ref}}(y_w)\) e \(\log\pi_{\text{ref}}(y_l)\) podem ser calculados uma vez para o dataset inteiro: <code>precompute_ref_log_probs=True</code> no TRL. O Tülu 3 “cacheia” esses valores em vez de manter o modelo na GPU.</p></div>
+    <div class="la-card"><span class="ic">🔌</span><h4>LoRA com adaptador desligado</h4><p>Com <span class="la-term" data-term="lora">LoRA</span>, a base congelada <i>é</i> a referência: basta desligar os adaptadores no forward da referência. O TRL faz isso sozinho quando <code>ref_model=None</code> e o modelo é PEFT. Custo extra de memória: zero.</p></div>
+    <div class="la-card"><span class="ic">🧲</span><h4>Referência móvel (TR-DPO)</h4><p>Atualizar \(\pi_{\text{ref}}\) durante o treino mitiga a sobre-otimização. No TRL: <code>sync_ref_model=True</code>, <code>ref_model_mixup_alpha=0.6</code>, <code>ref_model_sync_steps=512</code>, com \(\theta_{\text{ref}}\leftarrow\alpha\,\theta+(1-\alpha)\,\theta_{\text{ref}}\): uma média dos <i>pesos</i>, não das distribuições. Com PEFT, exige um <code>ref_model</code> separado.</p></div>
+  </div>
+  <p>Faça as contas com a figura. Com <i>full fine-tuning</i> de 8B, os estados do Adam em precisão mista somam ~128 GB (≈119 GiB) mesmo com a referência pré-computada. Um DGX Spark mostra ~121,7 GiB, mas o teto prático fica em ~105 GiB, o meio da faixa de 100–110 GiB do <a data-ch="treino-memoria-lora">capítulo 51</a>. Para comparar, o vLLM da receita GLM orça \(0{,}85\times121{,}69\approx103{,}4\) GiB, e com 0,88 (107,09 GiB) bootou só 1 de 4 vezes (<a data-ch="receita-glm">capítulo 42</a>). Os estados sozinhos já passam desse teto, antes de qualquer ativação. Com LoRA, a base em BF16 ocupa ~16 GB e serve também de referência. Por fórmula (estimativa nossa), um DPO LoRA BF16 do Qwen3.8-27B com <code>max_length</code> 2048 fica em ~70–80 GB por Spark, já contando ativações e os ~4,1 GB de logits (que <code>use_liger_kernel=True</code> evita materializar).</p>
+  <figure class="la-fig" id="fig-memoria" data-title="Quem guarda a referência? Memória e forwards por passo">
+    <div class="la-fig-stage" style="height:430px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Em cima, a memória dos pesos e estados (sem ativações nem logits), contra os tetos práticos: ~19 GB (17,8 GiB) que o MLX recomenda como memória de trabalho no Mac M4 de 24 GB; ~105 GiB num DGX Spark, o teto prático do capítulo 51; e o dobro, ~210 GiB, em dois Sparks com ZeRO-3/FSDP. Linha verde: sobram mais de 15% para ativações e logits; âmbar: só os estados cabem; vermelha: nem eles. No modo LoRA, a linha do Mac soma a segunda cópia completa que o <code>mlx-lm-lora</code> carrega como referência (contorno tracejado). Contabilidade do ZeRO: 2 B de pesos + 2 B de gradientes + 12 B de Adam e cópia mestre por parâmetro treinado; 2 B por parâmetro congelado. O LoRA usa a proporção de uma conta nossa para o Qwen3.8-27B (r = 32 em todas as lineares: 217,6 M parâmetros, ~3,5 GB). Embaixo, os quatro forwards de um passo: lilás com backward, cinza sem. Todos os valores são <b>estimativas por fórmula</b>.</figcaption>
+  </figure>
+  <div class="la-callout tip"><b class="t">Funda o SFT antes do DPO</b><p>Se o SFT foi feito com LoRA e o DPO também será, não empilhe adaptadores. Com PEFT, a referência é o modelo com o adaptador <i>desligado</i>; se o adaptador do SFT estiver separado, ele também seria desligado, e a referência viraria o modelo base, não o SFT. Funda o SFT nos pesos primeiro, e só então treine o adaptador do DPO por cima, tanto no Mac quanto no DGX Spark. No Mac, funda num checkpoint de 8 bits, não de 4: o <code>mlx_lm.fuse</code> re-quantiza a camada com arredondamento simples (RTN), e o delta pequeno do LoRA some num passo de quantização de 4 bits.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Offline, iterativo, online: de onde vêm os pares</h2>
+  <p>O DPO “puro” é <b>offline</b>: o dataset é fixo e foi gerado por outra política, que o paper do OAIF (Guo e colegas, 2024) chama de \(\rho\). Esse trabalho separa dois desvios. O inicial: \(\rho\neq\pi_{\theta_0}\), porque os pares não vieram do seu modelo. E o gradual: \(\pi_{\theta_0}\neq\pi_{\theta_t}\), porque o modelo muda enquanto treina. O DPO offline é, portanto, <span class="la-term" data-term="off-policy">off-policy</span>. A perda só vê as respostas que estão no dataset. Sobre todas as outras, as que a política passa a gerar à medida que se afasta, ela não diz nada.</p>
+  <p>O <span class="la-term" data-term="online-dpo">DPO online</span> fecha esse buraco (OAIF, Algoritmo 1):</p>
+  <ol class="la-steps">
+    <li><b>Amostrar.</b> Pegue um prompt \(x\) e gere duas respostas \(y_1,y_2\sim\pi_{\theta_t}(\cdot\mid x)\) com a política <i>atual</i>.</li>
+    <li><b>Julgar.</b> Peça a um <span class="la-term" data-term="llm-juiz">LLM juiz</span> qual é melhor, avaliando nas duas ordens e tirando a média, contra o viés de posição.</li>
+    <li><b>Atualizar.</b> Dê um passo da perda (DPO, IPO ou SLiC). O gradiente para no amostrador e no juiz (<i>stop_gradient</i>).</li>
+  </ol>
+  <p>Resultados reportados pelo OAIF: a versão online vence a offline em ~66% das avaliações humanas (média sobre DPO, IPO e SLiC), e o DPO online vence SFT, RLHF e RLAIF 58,00% das vezes numa comparação de quatro vias no TL;DR. O juiz também é uma alavanca: pedir a ele respostas curtas reduziu o comprimento médio de ~120 para ~40 tokens, mantendo o ganho sobre o SFT. Num estudo de RL assíncrono, Noukhovitch e colegas (ICLR 2025) acharam o DPO online a perda mais robusta a dados off-policy entre as testadas.</p>
+  <p>Entre os dois extremos ficam as variantes <span class="la-term" data-term="dpo-iterativo">iterativas</span>, em lotes: gerar, rotular (com um RM ou um juiz), treinar o DPO, repetir. Exemplos: o Iterative DPO/GSHF (Xiong e colegas); os Self-Rewarding LMs (Yuan e colegas), em que o próprio modelo julga; o RSO, que amostra pares da política ótima estimada por rejeição; e o IRPO (Pang e colegas), para raciocínio. Neste, os pares são (cadeia de raciocínio correta, cadeia errada), a referência de cada iteração é o modelo da iteração anterior e a perda soma um termo de NLL do vencedor normalizado por comprimento, \(\mathcal L=\mathcal L_{\text{DPO}}+\alpha\frac{-\log M_\theta(c_w,y_w\mid x)}{\lvert c_w\rvert+\lvert y_w\rvert}\), que os autores chamam de “crucial”. Nem tudo são flores: no estudo de Xu e colegas, o “DPO-Iter” reduziu o desvio de distribuição e melhorou segurança, mas ficou bem abaixo do PPO em utilidade.</p>
+  <figure class="la-fig" id="fig-online" data-title="Quem gera os pares? Offline, iterativo e online">
+    <div class="la-fig-stage" style="height:420px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>O plano é um “espaço de respostas”; o fundo claro é a recompensa verdadeira. Os pontinhos são o dataset de pares, e a bolha lilás é \(\pi_\theta\), presa por uma coleira (KL) à referência. Offline: os pares nunca mudam, e a política continua andando quando sai do suporte deles. Iterativo: a cada rodada o dataset é regerado onde a política está. Online: cada passo amostra da política atual e consulta o juiz. Caricatura <b>ilustrativa</b>; os números reais estão no texto.</figcaption>
+  </figure>
+  <div class="la-callout recipe" data-recipe="all"><b class="t"><span class="la-rb all"></span> Ponte com o Módulo 1</b><p>Gerar rápido é o gargalo dos métodos online e iterativos, e aqui a engenharia de inferência volta inteira. O <code>OnlineDPOTrainer</code> do TRL (em <code>trl.experimental.online_dpo</code>) aceita <code>loss_type</code> <code>sigmoid</code> ou <code>ipo</code>, um <code>reward_model_path</code> ou um juiz, <code>missing_eos_penalty</code>, <code>temperature=0.9</code> e <code>max_new_tokens=64</code> por padrão, e <code>use_vllm</code> com <code>vllm_mode</code> <code>colocate</code> (o vLLM divide a GPU com o treino) ou <code>server</code> (um servidor separado). O Tülu 3 descreve um RL assíncrono em que a inferência roda no vLLM enquanto os <i>learners</i> atualizam os pesos. KV cache, batching contínuo e decodificação especulativa (<a data-ch="especulacao-fundamentos">capítulo 35</a>) aceleram diretamente cada rodada.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Modos de falha: quando a margem mente</h2>
+  <p>O DPO é estável e simples, mas a perda mede uma coisa (a margem relativa à referência, nos pares do dataset) e nós queremos outra (boas gerações). Cinco desencontros estão documentados.</p>
+  <h3>1. Preferências determinísticas</h3>
+  <p>Já visto na figura da rampa: se \(p^*(y\succ y')=1\), o BT exige \(r(y)-r(y')\to\infty\), e a política ótima zera \(\pi(y')\) para qualquer \(\beta\). Com um único rótulo por par, \(\hat p=1\) é comum. O paper do IPO (Azar e colegas, §4.2) explica por que o RLHF clássico sofre menos: o modelo de recompensa é <b>subajustado</b> (recompensas infinitas nunca são atingidas, e há regularização e parada antecipada no RM), e esse subajuste regulariza a política. Ao eliminar o RM, o DPO perde essa regularização implícita.</p>
+  <h3>2. Deslocamento de verossimilhança</h3>
+  <p>Durante o DPO, \(\log\pi_\theta(y_w\mid x)\) frequentemente <b>cai</b>, junto com \(\log\pi_\theta(y_l\mid x)\). A massa vai para <i>outras</i> respostas, às vezes de sentido oposto. Razin e colegas (ICLR 2025) chamam isso de <span class="la-term" data-term="deslocamento-de-verossimilhanca">deslocamento de verossimilhança</span> (<i>likelihood displacement</i>) e dão exemplos: treinar para preferir <i>No</i> a <i>Never</i> pode aumentar muito a probabilidade de <i>Yes</i>. Num alinhamento para <b>recusar</b> prompts inseguros (SORRY-Bench), a taxa de recusa do Llama-3-8B-Instruct caiu de <b>74,4% para 33,4%</b>, um “desalinhamento não intencional”.</p>
+  <p>O mecanismo aparece no caso de um token (o Teorema 1 deles). A queda de \(\ln\pi(y^+\mid x)\) é maior quanto mais parecidas são as <i>unembeddings</i> das duas respostas (\(\langle W_{y^+},W_{y^-}\rangle\) grande) e quanto mais os outros tokens se alinham com \(W_{y^+}-W_{y^-}\). Treinar a margem empurra o estado oculto na direção da <b>diferença</b> entre as duas linhas do <span class="la-term" data-term="lm-head">lm_head</span>. Se as linhas são quase iguais, essa diferença é pequena, aponta para um lado “estranho” do espaço e pode apontar justamente para um terceiro token. A figura monta uma miniatura desse efeito, com o produto matriz-vetor à vista.</p>
+  <figure class="la-fig" id="fig-deslocamento" data-title="Preferir No a Never e acabar no Yes">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Vocabulário de 3 tokens com unembeddings 2D: \(W_{\text{No}}=(1;\,0{,}2)\), \(W_{\text{Never}}=(1;\,-0{,}2)\), quase iguais, e \(W_{\text{Yes}}=(0;\,1)\), alinhado com \(W_{\text{No}}-W_{\text{Never}}=(0;\,0{,}4)\). Treinar só o estado oculto \(h=(2;\,s)\) com DPO (No ≻ Never) move \(h\) na direção \((0;1)\). À esquerda, o plano; à direita, \(W\,h\) = logits, o softmax e as curvas ao longo de \(s\). Miniatura <b>ilustrativa</b> nossa, inspirada no Teorema 1 de Razin e colegas (no teorema, as unembeddings também treinam).</figcaption>
+  </figure>
+  <p>Leia as curvas: a perda do DPO só cai (a margem No/Never cresce linearmente, \(0{,}4s\)), mas p(No) sobe um pouco, de 0,468 para 0,507 em \(s=1\), e depois despenca. Em \(s=5\), p(Yes) já é 0,867. Para o caso geral, Razin e colegas definem o escore <span class="la-term" data-term="ches">CHES</span> (<i>centered hidden embedding similarity</i>):</p>
+  <div class="la-eq">
+    \[ \mathrm{CHES}_x(y^+,y^-)=\Big\langle\sum_k h_{x,y^+_{&lt;k}},\ \sum_{k'}h_{x,y^-_{&lt;k'}}\Big\rangle-\Big\|\sum_k h_{x,y^+_{&lt;k}}\Big\|^2 \]
+    <ul class="la-eq-legend">
+      <li>\(h_{x,y_{&lt;k}}\): o estado oculto da última camada ao prever o \(k\)-ésimo token da resposta</li>
+      <li>\(y^+,y^-\): a preferida e a preterida</li>
+      <li>CHES alto: as duas respostas “parecem iguais” por dentro, e o par tende a causar deslocamento</li>
+    </ul>
+  </div>
+  <p><b>Filtrar os pares de CHES alto</b> (na versão normalizada por comprimento) mitigou o problema melhor do que adicionar um termo de SFT à perda. O Smaug/DPOP (Pal e colegas) mostra teoricamente que o DPO pode reduzir a verossimilhança das preferidas, sobretudo em pares de <b>baixa distância de edição</b>, e propõe uma penalidade que só liga quando \(\pi_\theta(y_w)\) cai abaixo de \(\pi_{\text{ref}}(y_w)\).</p>
+  <h3>3. Verbosidade</h3>
+  <p>Park e colegas (2024) acharam um pequeno viés de preferência por respostas mais longas nos datasets HH e TL;DR. O DPO sem regularização produz respostas <b>~2× mais longas</b> em média, fora da distribuição do dataset. No HH com \(\beta=0{,}1\), já nos primeiros 10% da época as respostas ficam quase 2× mais longas que as do SFT. O pico de <span class="la-term" data-term="win-rate">win rate</span> (com GPT-4 como juiz, que tem viés de verbosidade) ocorre aí; depois, só o KL e o comprimento continuam subindo. O SimPO (Apêndice F) aponta a raiz mecânica: o gradiente do DPO não é normalizado por comprimento, então sequências longas recebem atualizações maiores e dominam o treino. As correções (R-DPO, DPO normalizado, SimPO) são o assunto do próximo capítulo. Um alerta das fontes: corrigir o comprimento muda a fronteira entre KL e win rate, mas <b>não</b> elimina a sobre-otimização.</p>
+  <h3>4. Sobre-otimização</h3>
+  <p>Rafailov, Chittepu, Park e colegas (NeurIPS 2024) testaram os <span class="la-term" data-term="daa">algoritmos de alinhamento direto</span> (DPO, IPO, SLiC) no TL;DR com Pythia de 1B, 2,8B e 6,9B. O padrão é uma <b>corcova</b>: o win rate sobe e depois cai à medida que o orçamento de KL cresce. Com KL mais folgado, o melhor ponto ocorre após apenas <b>~25% de uma época</b>. A lei de Gao e colegas para o RLHF clássico, \(R(d)=d(a-b\log d)\) com \(d=\sqrt{\mathbb D_{\text{KL}}(\pi\|\pi_{\text{ref}})}\) e \(a,b\) coeficientes ajustados (não é o \(\beta\) do DPO), também descreve as DAAs. O IPO pareceu menos propenso à <span class="la-term" data-term="sobre-otimizacao">sobre-otimização</span>, sobretudo a 6,9B. A explicação proposta é que o problema é sub-determinado: há muito mais respostas possíveis do que pares no dataset, então existem infinitos minimizadores da perda que põem massa em respostas <b>fora da distribuição</b>.</p>
+  <h3>5. Fora da distribuição: DPO contra PPO</h3>
+  <p>Xu e colegas (2024) formalizam o ponto (Teorema 4.1): a classe de políticas de “RM + PPO” é subconjunto próprio da classe de minimizadores do DPO. No estudo deles, o PPO bem configurado (normalização de vantagem, batch grande, EMA da referência) superou o DPO em todos os testes, inclusive em código competitivo: o PPO com 34B superou o AlphaCode-41B no CodeContest, com 10@1k indo de 16,4% (AlphaCode-41B) para 22,4%. Interpretação nossa: isso não invalida o DPO. Mostra que a escolha depende de quanto o dataset cobre a distribuição da política, e é por isso que as versões online e iterativas existem.</p>
+  <div class="la-cards">
+    <div class="la-card"><span class="ic">🎯</span><h4>Determinístico</h4><p><b>Sintoma:</b> margens crescendo sem parar, probabilidade das preteridas indo a zero. <b>Remédio:</b> IPO, rótulos suavizados (<code>robust</code>), mais anotações por par.</p></div>
+    <div class="la-card"><span class="ic">🫥</span><h4>Deslocamento</h4><p><b>Sintoma:</b> <code>logps/chosen</code> caindo enquanto <code>rewards/margins</code> sobe. <b>Remédio:</b> filtrar pares de CHES alto, DPOP, NLL nas preferidas, \(\beta\) maior.</p></div>
+    <div class="la-card"><span class="ic">📜</span><h4>Verbosidade</h4><p><b>Sintoma:</b> comprimento médio das gerações crescendo. <b>Remédio:</b> R-DPO, DPO normalizado (<code>sigmoid_norm</code>), <code>ld_alpha</code>, SimPO.</p></div>
+    <div class="la-card"><span class="ic">🐫</span><h4>Corcova</h4><p><b>Sintoma:</b> win rate sobe e cai com o KL. <b>Remédio:</b> avaliar por checkpoint, parar cedo, IPO, referência móvel.</p></div>
+    <div class="la-card"><span class="ic">🧭</span><h4>Fora da distribuição</h4><p><b>Sintoma:</b> o modelo melhora no dataset e piora no que gera de fato. <b>Remédio:</b> pares on-policy (iterativo ou online), Preferred-FT na referência.</p></div>
+  </div>
+</section>
+
+<section class="la-sec">
+  <h2>Na prática: hiperparâmetros, painel e o DPOTrainer</h2>
+  <p>A tabela reúne os hiperparâmetros publicados. Trate-os como faixas, não como constantes: o “LR padrão do DPO” diverge entre as fontes. O paper do DPO usa \(10^{-6}\) com RMSprop (batch 64, modelos de até 6B); a versão 5 do KTO afirma que o padrão a 8B é \(5\times10^{-7}\), citando o DPO; e o SimPO achou \(5\times10^{-7}\) a \(7\times10^{-7}\) como ótimos com \(\beta=0{,}01\).</p>
+  <table class="la-params">
+    <thead><tr><th>Parâmetro</th><th>Valores publicados</th><th>Fonte</th><th>O que faz e por que importa</th></tr></thead>
+    <tbody>
+      <tr><td><code>beta</code></td><td>0,1 (padrão); 0,5 (TL;DR); 0,01 (melhor no UltraFeedback, 7–9B); 5 (normalizado por comprimento)</td><td>DPO App. B; README do SimPO; Tülu 3 Tab. 20</td><td>Preço do KL e escala do logit. Maior = mais perto da referência e saturação mais cedo. Não compare entre variantes.</td></tr>
+      <tr><td><code>learning_rate</code></td><td>\(10^{-6}\) RMSprop (DPO); \(3\times10^{-7}\) a \(10^{-6}\) AdamW (sweep do SimPO; melhor \(5\times10^{-7}\), \(7\times10^{-7}\) no Llama-3-Instruct); \(5\times10^{-7}\) (8B) e \(2\times10^{-7}\) (70B) no Tülu 3; ~\(10^{-5}\) com LoRA no PEFT, alpha/r = 1 (dica do TRL); ~\(10^{-6}\) no <code>mlx-lm-lora</code>, scale 10 (conversão nossa)</td><td>idem; doc do TRL</td><td>O DPO roda com LR bem menor que o SFT: no Tülu 3, \(5\times10^{-7}\) contra \(5\times10^{-6}\) do SFT no mesmo 8B; nos padrões do TRL, \(10^{-6}\) contra \(2\times10^{-5}\). Adaptadores toleram LRs maiores.</td></tr>
+      <tr><td>batch efetivo</td><td>64 (DPO); 128 (SimPO e Tülu 3)</td><td>idem</td><td>Reduz o ruído da estimativa da margem média.</td></tr>
+      <tr><td>épocas</td><td>1 é o mais comum; o melhor ponto pode vir antes (~25% de uma época com KL folgado)</td><td>SimPO App. B; Tülu 3; DAAs</td><td>Com rótulos determinísticos, mais épocas só empurram as margens para cima; a corcova recomenda avaliar antes do fim.</td></tr>
+      <tr><td>warmup</td><td>150 passos lineares (DPO); 10% com cosseno (SimPO); razão 0,1 linear (Tülu 3)</td><td>idem</td><td>Evita passos grandes enquanto o otimizador ainda não estimou os momentos.</td></tr>
+      <tr><td><code>max_length</code></td><td>1024 (padrão do TRL); 2048 (Tülu 3)</td><td>doc do TRL; Tülu 3</td><td>A memória dos logits cresce linearmente com o comprimento. Truncar a preferida e a preterida de modo diferente distorce a margem (interpretação nossa).</td></tr>
+    </tbody>
+  </table>
+  <h3>O painel: o que vigiar</h3>
+  <p>A lista mínima sai das métricas que o TRL loga e dos modos de falha da seção anterior. Acompanhe a margem e a acurácia de recompensa (normal, numa heurística nossa: acurácia entre 0,6 e 0,8; suspeito: ir a 1,0 rápido demais, sinal de pares fáceis ou de viés de comprimento explorado). Acompanhe <code>logps/chosen</code>, que <b>caindo</b> denuncia deslocamento; o comprimento médio das gerações, que denuncia verbosidade; o KL até a referência; e o win rate por checkpoint, não só no fim, por causa da corcova. A figura simula os quatro cenários mais comuns.</p>
+  <figure class="la-fig wide" id="fig-painel" data-title="O painel do DPO em quatro cenários">
+    <div class="la-fig-stage" style="height:520px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Quatro painéis com os nomes das métricas do TRL e uma avaliação por checkpoint (win rate contra o SFT e comprimento relativo). O cursor percorre uma época. A faixa verde em <code>rewards/accuracies</code> é a zona normal (0,6–0,8, heurística nossa); o KL até a referência (também sintético) aparece numa leitura nos controles; o pico de win rate a ~10% da época (verbosidade) e a ~25% (sobre-otimização) segue as fontes. As curvas em si são <b>sintéticas e ilustrativas</b>: servem para reconhecer a assinatura de cada problema.</figcaption>
+  </figure>
+  <h3>O DPOTrainer do TRL</h3>
+  <p>O formato recomendado é conversacional, com prompt explícito e uma resposta preferida e uma preterida por linha. O exemplo abaixo (nosso) usa o próprio Módulo 1 como matéria:</p>
+  <pre data-lang="json"><code>{"prompt": [{"role": "user", "content": "Por que o GLM não usa NVFP4 nos experts?"}],
+ "chosen": [{"role": "assistant", "content": "Porque o KLD medido do NVFP4 (0,0605 nats) foi 2,5× o do EXL3 4 bpw (0,0246) e os kernels NVFP4 do SM12x são só de MHA denso, sem fp8_ds_mla."}],
+ "rejected": [{"role": "assistant", "content": "Porque o GB10 não suporta FP4."}],
+ "chat_template_kwargs": {"enable_thinking": false}}</code></pre>
+  <p>Repare no par: a preterida é curta e plausível, mas está factualmente errada. Pares assim ensinam conteúdo, não estilo. O treino, com LoRA sobre um SFT já fundido, fica assim (configuração nossa, conferida contra a documentação do TRL 1.14):</p>
+  <pre data-lang="python"><code>from datasets import load_dataset
+from peft import LoraConfig
+from trl import DPOConfig, DPOTrainer
+
+ds = load_dataset("json", data_files={"train": "data/pref_train.jsonl",
+                                      "validation": "data/pref_valid.jsonl"})
+
+args = DPOConfig(
+    output_dir="ckpt/dpo",
+    loss_type=["sigmoid"],          # DPO clássico (Bradley–Terry)
+    beta=0.1,                       # padrão; ↑beta = fica mais perto da referência
+    max_length=2048,                # padrão 1024
+    per_device_train_batch_size=1,
+    gradient_accumulation_steps=16,
+    num_train_epochs=1,
+    learning_rate=5e-6,             # PEFT com alpha/r = 1: a dica do TRL é ~1e-5; comece abaixo
+    lr_scheduler_type="cosine",
+    gradient_checkpointing=True,
+    logging_steps=5, eval_strategy="steps", eval_steps=50, save_steps=100,
+)
+trainer = DPOTrainer(model="models/sft-fundido-bf16", args=args,
+                     train_dataset=ds["train"], eval_dataset=ds["validation"],
+                     peft_config=LoraConfig(r=32, lora_alpha=32, task_type="CAUSAL_LM"))
+trainer.train()                     # ref_model=None + PEFT: referência = adaptador desligado</code></pre>
+  <p>O que conhecer do <code>DPOConfig</code> (TRL 1.14–1.15, conferido nas fontes): <code>loss_type</code> virou uma <b>lista</b> (padrão <code>["sigmoid"]</code>), combinável por <code>loss_weights</code>. Para ancorar a verossimilhança das preferidas, use <code>["sigmoid","sft"]</code>; o antigo <code>rpo_alpha</code> não existe mais. Outros tipos: <code>hinge</code>, <code>ipo</code>, <code>robust</code> (com <code>label_smoothing</code> = probabilidade de o rótulo estar invertido, em [0; 0,5)), <code>sigmoid_norm</code> (DPO normalizado por comprimento), <code>apo_zero</code>, <code>bco_pair</code>, entre outros. Há ainda <code>precompute_ref_log_probs</code> (padrão False), <code>sync_ref_model</code> (TR-DPO, incompatível com PEFT sem <code>ref_model</code> separado), <code>use_weighting</code> (WPO, que repondera pares off-policy pela probabilidade sob a política atual), <code>ld_alpha</code> (LD-DPO) e <code>f_divergence_type</code>. O <code>padding_free</code> está temporariamente indisponível desde a refatoração. CPO, ORPO e DPO online moram em <code>trl.experimental.*</code> e não têm garantia de API.</p>
+  <p>No Mac, o <code>mlx-lm</code> puro não faz DPO; o pacote <code>mlx-lm-lora</code> 3.1.3 faz, com <code>--train-mode dpo</code> e <code>--dpo-cpo-loss-type</code> ∈ {<code>sigmoid</code>, <code>hinge</code>, <code>ipo</code>, <code>dpop</code>}, sem KTO nem SimPO. A referência é uma segunda cópia completa: por fórmula (estimativa nossa), um Qwen3-4B em 8 bits fica em ~11–14 GB (duas cópias de ~4,3 GB, mais adaptador, ativações e logits):</p>
+  <pre data-lang="bash"><code>mlx_lm_lora.train --model models/sft_8bit --train --train-mode dpo \
+  --data data/mlx_dpo --beta 0.1 --dpo-cpo-loss-type sigmoid \
+  --reference-model-path models/sft_8bit \
+  --num-layers 16 --batch-size 1 --gradient-accumulation-steps 8 \
+  --learning-rate 1e-6 --lora-parameters '{"rank": 16, "dropout": 0.0, "scale": 10.0}' \
+  --max-seq-length 1024 --grad-checkpoint --epochs 1 \
+  --steps-per-eval 50 --save-every 100 --adapter-path adapters/mac_dpo</code></pre>
+  <div class="la-callout warn"><b class="t">O LR do LoRA não viaja entre frameworks</b><p>Repare no <code>--learning-rate 1e-6</code>, dez vezes menor que a dica do TRL. No <code>mlx-lm-lora</code>, o LoRA soma \(\text{scale}\cdot(x\,A\,B)\) com <code>scale</code> = 10 aplicado direto; no PEFT, a escala é <code>lora_alpha/r</code> (= 1 na configuração do TRL acima). Com Adam, o passo efetivo do produto cresce com scale × LR, então 1e-6 aqui ≈ 1e-5 no PEFT (inferência nossa). O padrão do <code>mlx-lm-lora</code>, 1e-5 com scale 10, equivale a ~1e-4 no PEFT, alto para DPO. Não copie LR entre frameworks sem converter.</p></div>
+  <h3>Do treino ao vLLM</h3>
+  <p>Servir um modelo pós-treinado com DPO não muda a receita de inferência. O DPO produz pesos com a mesma arquitetura, e todo o Módulo 1 vale como está. Se o treino foi com LoRA, o adaptador pode ser fundido antes da quantização (calibre o GPTQ, AWQ ou NVFP4 no modelo <i>ajustado</i>, não no base), ou servido em runtime para comparar checkpoints lado a lado. Um elo mais sutil é o comportamento de recusa. A receita GLM do Módulo 1 tem <span class="la-term" data-term="abliteracao">abliteração</span> em tempo de carga (<code>ABLIT=1</code>), que ortogonaliza o <code>o_proj</code> contra uma “direção de recusa”, \(W'=(I-\alpha rr^\top/\lVert r\rVert^2)W\): uma edição de pesos <b>sem treino</b>. O deslocamento de verossimilhança mostra o lado oposto: um DPO feito para <i>aumentar</i> recusas pode reduzi-las sem querer (74,4% → 33,4%). Comportamentos de alinhamento vivem em direções do espaço residual, e a otimização de preferências mexe nelas de forma nem sempre intencional. E se você fizer DPO sobre um base abliterado, a referência passa a ser o modelo sem recusas, e o KL ancora a política nesse comportamento.</p>
+  <h3>Roteiro: o seu primeiro DPO</h3>
+  <ol class="la-steps">
+    <li><b>Parta de um SFT bom e funda-o.</b> Ele será a referência; com LoRA, o adaptador do SFT precisa estar dentro dos pesos.</li>
+    <li><b>Monte pares limpos.</b> Use o mesmo template de chat do SFT, prefira pares que diferem em conteúdo (não só em estilo ou comprimento) e descontamine contra os conjuntos de avaliação.</li>
+    <li><b>Comece conservador.</b> \(\beta=0{,}1\), LR baixo (\(5\times10^{-7}\) a \(10^{-6}\) em full FT; ~\(10^{-5}\) com LoRA no PEFT, alpha/r = 1; ~\(10^{-6}\) no <code>mlx-lm-lora</code>, scale 10), 1 época, avaliação por checkpoint.</li>
+    <li><b>Vigie o painel.</b> Margens, acurácia, <code>logps/chosen</code>, comprimento, KL e win rate. Cada sintoma tem um remédio nos cartões da seção anterior.</li>
+    <li><b>Se puder gerar e julgar, vá de iterativo ou online.</b> É o maior salto estrutural documentado (~66% contra o offline no OAIF), e é onde o seu vLLM paga a conta.</li>
+    <li><b>Funda, quantize e sirva.</b> Meça o KLD do modelo quantizado contra o ajustado, como no Módulo 1.</li>
+  </ol>
+  <p>O DPO trocou o RL por uma regressão logística, mas herdou o \(\log\sigma\) do Bradley–Terry, com sua sede de margens infinitas, e herdou a necessidade de pares. O <a data-ch="ipo-kto-simpo">próximo capítulo</a> mostra o que acontece quando se mexe nessas duas peças: o IPO troca a sigmoide por um alvo finito, o KTO aprende com 👍/👎 sem pares e o SimPO dispensa a referência.</p>
+</section>

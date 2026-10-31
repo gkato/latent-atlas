@@ -1,0 +1,381 @@
+<p class="la-lead">O SFT ensinou o modelo a copiar demonstrações, e o capítulo anterior construiu um juiz: um reward model que olha uma resposta inteira e devolve um número. Falta a peça que transforma nota em comportamento, o <b>aprendizado por reforço</b> (RL). Para quem vem do treino supervisionado, o problema é estranho: não existe gabarito token a token, só um placar que chega no fim da resposta, e o modelo precisa descobrir sozinho quais das centenas de escolhas mereceram o crédito. Neste capítulo você vai montar a caixa de ferramentas do RL de políticas a partir do zero: o LLM como agente num MDP de tokens, o teorema do policy gradient derivado à mão, o REINFORCE e a guerra contra a variância (baselines, crítico, TD, GAE), o problema de aprender com dados de outra política (e por que importa que o vLLM e o treinador discordem nos últimos bits), os atores assíncronos do A3C e do IMPALA e a região de confiança do TRPO. São os tijolos do PPO e do GRPO, e quase todos reaparecem, com outro nome, nos relatórios de 2025–2026 do GLM, do Qwen e do DeepSeek.</p>
+
+<section class="la-sec">
+  <h2>O LLM como agente: estado, ação e recompensa</h2>
+  <p>No <a data-ch="sft">SFT</a>, cada token da resposta tinha um gabarito. A demonstração dizia qual era o próximo token, e a <span class="la-term" data-term="entropia-cruzada">entropia cruzada</span> empurrava a probabilidade dele para cima. O <a data-ch="preferencias-reward-models">capítulo anterior</a> trouxe outra coisa: um modelo que olha a resposta <i>inteira</i> e devolve um número. Não há gabarito por token, só um placar no fim. O aprendizado por reforço é a matemática de transformar esse placar em mudança de comportamento.</p>
+  <p>O vocabulário vem da robótica e dos videogames. Um <b>agente</b> observa um <b>estado</b>, escolhe uma <b>ação</b> seguindo a sua <span class="la-term" data-term="politica">política</span>, e o <b>ambiente</b> responde com um novo estado e, às vezes, uma <b>recompensa</b>. O objetivo é ajustar a política para colher o máximo de recompensa somada. O cenário formal é um <span class="la-term" data-term="mdp">processo de decisão de Markov</span> (MDP), a tupla \((\mathcal S, \mathcal A, P, r, \rho_0, \gamma)\). Para um LLM gerando uma resposta, cada peça tem uma tradução concreta:</p>
+  <table>
+    <thead><tr><th>Elemento</th><th>No LLM</th><th>Detalhe</th></tr></thead>
+    <tbody>
+      <tr><td>Estado \(s_t\)</td><td>prompt + prefixo gerado, \((x, y_1, \dots, y_{t-1})\)</td><td>tudo em que o modelo condiciona; na implementação, é o <span class="la-term" data-term="kv-cache">KV cache</span> (<a data-ch="prefill-decode-kv">capítulo 10</a>)</td></tr>
+      <tr><td>Ação \(a_t\)</td><td>o próximo token \(y_t \in \mathcal V\)</td><td>\(\lvert\mathcal V\rvert\) da ordem de \(10^5\): o vocabulário do GLM-5.3, com o pad para TP=3, tem 154.944 entradas</td></tr>
+      <tr><td>Política \(\pi_\theta(a_t \mid s_t)\)</td><td>\(\mathrm{softmax}(z_t/T)_{a_t}\), com \(z_t\) = <span class="la-term" data-term="logits">logits</span></td><td>a <span class="la-term" data-term="temperatura">temperatura</span> faz parte da política: amostrar com \(T \ne 1\) muda \(\pi\)</td></tr>
+      <tr><td>Transição \(P(s_{t+1} \mid s_t, a_t)\)</td><td>determinística: \(s_{t+1} = s_t \oplus a_t\)</td><td>não há ambiente estocástico, exceto em agentes que chamam ferramentas</td></tr>
+      <tr><td>Estado inicial \(\rho_0\)</td><td>a distribuição de prompts \(\mathcal D\)</td><td>cada episódio começa com um prompt sorteado</td></tr>
+      <tr><td>Recompensa \(r_t\)</td><td><span class="la-term" data-term="recompensa-esparsa">esparsa</span>: 0 em todo \(t &lt; T\), e \(r_\phi(x,y)\) no token final (EOS)</td><td>no RLHF soma-se uma pequena penalidade de <span class="la-term" data-term="kld">KL</span> em cada token, a coleira do <a data-ch="pos-treino-mapa" data-sec="s3-a-coleira-kl-ao-modelo-de-referencia">capítulo 50</a> (detalhes no <a data-ch="ppo-rlhf">capítulo 55</a>)</td></tr>
+      <tr><td>Horizonte e desconto</td><td>\(T \le\) <code>max_tokens</code>; \(\gamma\) quase sempre 1</td><td>Stiennon et al. (2020) usam \(\gamma = 1\); o InstructGPT não desconta no GAE</td></tr>
+    </tbody>
+  </table>
+  <p>O InstructGPT resume a tradução numa frase: o RL roda num ambiente <i>bandit</i> que apresenta um prompt aleatório, espera uma resposta, produz uma recompensa dada pelo RM e encerra o episódio. O que se quer maximizar é a recompensa esperada:</p>
+  <div class="la-eq">
+    \[ \begin{gathered} J(\theta) = \mathbb E_{x\sim\mathcal D,\ y\sim\pi_\theta(\cdot\mid x)}\big[R(x,y)\big] \\[4pt] \log\pi_\theta(y\mid x) = \sum_{t=1}^{T}\log\pi_\theta(y_t\mid x, y_{&lt;t}) \end{gathered} \]
+    <ul class="la-eq-legend">
+      <li>\(J(\theta)\): desempenho da política de parâmetros \(\theta\)</li>
+      <li>\(x\sim\mathcal D\): prompt sorteado do conjunto de RL</li>
+      <li>\(y\sim\pi_\theta\): resposta <i>amostrada</i> do próprio modelo (um <span class="la-term" data-term="rollout">rollout</span>)</li>
+      <li>\(R(x,y)\): nota da resposta inteira (RM, verificador, testes de código…)</li>
+      <li>\(\log\pi_\theta(y\mid x)\): a probabilidade da sequência é o produto das probabilidades dos tokens, então o log vira soma</li>
+    </ul>
+  </div>
+  <p>Há duas maneiras de enxergar o mesmo problema. Na <b>visão por token</b> (PPO clássico, InstructGPT), cada token é uma ação, e o algoritmo precisa decidir quanto do placar final cada token merece. Na <span class="la-term" data-term="visao-bandit">visão bandit</span> (Ahmadian et al., 2024, o paper do RLOO), a resposta inteira é <b>uma</b> ação, com probabilidade \(\pi_\theta(y\mid x)\). Como a recompensa só chega no fim, eles argumentam que “pode ser mais apropriado modelar a geração inteira como uma única ação”. Com \(\gamma = 1\), recompensa só no fim e sem KL por token, as duas visões têm o mesmo gradiente esperado; diferem no <i>estimador</i> (um crítico por token contra um baseline por sequência) e, portanto, em variância e viés (interpretação a partir das fontes). A figura gera uma resposta de brinquedo, token a token.</p>
+  <figure class="la-fig" id="fig-mdp" data-title="Um episódio no MDP de tokens">
+    <div class="la-fig-stage" style="height:450px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Em cima, o estado: o prompt mais os tokens já escolhidos, guardados no KV cache. No meio, a política naquele estado (as 4 candidatas mais prováveis) e o sorteio da ação. Embaixo, a recompensa por token \(r_t\) e o retorno \(G_t\), que só se acendem quando o verificador dá a nota no EOS. Na visão bandit, a resposta inteira vira uma ação só, com \(\log\pi(y\mid x)\) igual à soma dos logs. Probabilidades, KL por token e a nota 1 são <b>ilustrativos</b>.</figcaption>
+  </figure>
+  <p>Repare em três coisas. O estado <b>cresce</b>: cada ação vira parte do próximo estado, e o “ambiente” é o próprio modelo relendo o que escreveu. A recompensa é <b>esparsa</b>: oito tokens passam sem sinal nenhum, e só o EOS recebe o placar. Ligue a penalidade de KL e cada token passa a pagar um pedágio pequeno, mas o grosso do sinal continua no fim. E o <span class="la-term" data-term="retorno">retorno</span> \(G_t\), o que cada token “ganha” somando tudo que vem depois dele, sai praticamente igual para todos. Esse é o problema central do capítulo, a <span class="la-term" data-term="atribuicao-de-credito">atribuição de crédito</span>: qual dos 9 tokens fez a resposta acertar? Note também o primeiro passo: a política sorteou “Primeiro” com probabilidade 0,33, embora “É” fosse a favorita. Rollouts são <i>amostrados</i>, não gulosos, porque o RL precisa explorar.</p>
+  <div class="la-callout analogy"><b class="t">Analogia: o videogame que só mostra o placar nos créditos</b><p>Imagine jogar uma fase inteira sem ver a pontuação. Só nos créditos aparece “1.000 pontos”. Para jogar melhor da próxima vez, você precisa adivinhar quais dos seus 500 movimentos ajudaram. Uma partida não diz quase nada. Mil partidas, com movimentos um pouco diferentes, começam a mostrar quais escolhas andam junto com placares altos. O RL faz exatamente isso, de forma estatística, e o resto do capítulo é sobre fazer essa estatística com o mínimo de partidas.</p></div>
+  <div class="la-callout why"><b class="t">Ponte com o Módulo 1: a política inclui o amostrador</b><p>As escolhas de amostragem do <a data-ch="geracao-amostragem">capítulo 9</a> não são detalhe de serving, são parte da política. O InstructGPT gera rollouts com temperatura 1, e a reprodução “N+ implementation details” usa 0,7. Top-p e top-k cortam o espaço de ações, e por isso o DeepSeek-V3.2 aplica no treino a mesma máscara de amostragem usada no rollout (“Keep Sampling Mask”), para que a política treinada e a que gerou os dados vivam no mesmo subespaço. E o estado, na prática, é um KV cache: gerar rollouts é o decode do Módulo 1, o que explica por que motores como o vLLM entram no laço de RL (seção 7).</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Retorno, valor e vantagem: quem merece o crédito?</h2>
+  <p>Para falar de crédito precisamos de três funções. O retorno soma (com desconto) o que vem pela frente. O valor é o retorno <i>esperado</i>. A vantagem compara uma ação com a média da política.</p>
+  <div class="la-eq">
+    \[ \begin{aligned} G_t &amp;= \sum_{k=0}^{T-t}\gamma^k\,r_{t+k} \\ V^\pi(s) &amp;= \mathbb E_\pi\big[G_t \mid s_t = s\big] \\ Q^\pi(s,a) &amp;= \mathbb E_\pi\big[G_t \mid s_t = s,\ a_t = a\big] \\ A^\pi(s,a) &amp;= Q^\pi(s,a) - V^\pi(s) \end{aligned} \]
+    <ul class="la-eq-legend">
+      <li>\(G_t\): <span class="la-term" data-term="retorno">retorno</span>, a soma descontada das recompensas a partir de \(t\)</li>
+      <li>\(\gamma\): <span class="la-term" data-term="fator-de-desconto">fator de desconto</span>, entre 0 e 1</li>
+      <li>\(V^\pi(s)\): <span class="la-term" data-term="funcao-valor">valor</span> de estar em \(s\) e seguir \(\pi\)</li>
+      <li>\(Q^\pi(s,a)\): <span class="la-term" data-term="funcao-q">valor-ação</span>, idem depois de tomar \(a\)</li>
+      <li>\(A^\pi(s,a)\): <span class="la-term" data-term="vantagem">vantagem</span>, quanto \(a\) é melhor que a média da política em \(s\)</li>
+    </ul>
+  </div>
+  <p>A vantagem tem uma propriedade que vamos usar o tempo todo: na média da própria política, ela é zero, \(\mathbb E_{a\sim\pi}[A^\pi(s,a)] = 0\). Ela não diz se uma ação é boa em absoluto. Diz se a ação é <b>melhor do que o que a política costuma fazer ali</b>. As <b>equações de Bellman</b> amarram as três funções: \(V^\pi(s) = \mathbb E_{a\sim\pi}\big[r(s,a) + \gamma\,\mathbb E_{s'}V^\pi(s')\big]\). No MDP de tokens, com transição determinística e recompensa só no fim, elas ficam ainda mais simples: \(Q^\pi(s_t, y_t) = V^\pi(s_t \oplus y_t)\) para \(t &lt; T\). O valor de escolher um token é o valor do prefixo que ele cria.</p>
+  <p>Em linguagem de LLM, \(V^\pi(x, y_{&lt;t})\) responde à pergunta “se eu continuar amostrando deste prefixo, que nota final devo esperar?”. É o mesmo objeto que o Math-Shepherd estima por Monte Carlo para rotular passos de raciocínio (capítulo anterior), e é o que o <span class="la-term" data-term="critico">crítico</span> do PPO tenta prever em cada posição. O relatório “N+ implementation details” observa que o crítico treinado parece um RM por token. A figura monta uma árvore minúscula para você calcular essas funções à mão.</p>
+  <figure class="la-fig" id="fig-valor" data-title="Valor e vantagem numa árvore de continuações">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>No estado “…logo, 2+3×4 =”, a política escolhe entre responder “14” (certo, nota 1), “20” (errado, nota 0) ou “vou conferir”, que leva a acertar 70% das vezes. A espessura das arestas é \(\pi(a\mid s)\); cada nó filho mostra \(Q\) e a vantagem \(A = Q - V\). As bolinhas são rollouts Monte Carlo caindo pela árvore: a média das notas que elas colhem converge para \(V(s)\). Na tabela, a última linha confere que \(\sum_a \pi(a)A(a) = 0\). Números <b>ilustrativos</b>.</figcaption>
+  </figure>
+  <p>Faça o experimento da temperatura. Em \(T = 1\), a política escolhe “14” metade das vezes, e \(V(s) = 0{,}5\cdot 1 + 0{,}3\cdot 0 + 0{,}2\cdot 0{,}7 = 0{,}64\). “Vou conferir” acerta 70% das vezes, acima da média, então tem vantagem \(+0{,}06\). Esfrie a política para \(T = 0{,}5\): ela fica mais confiante em “14”, o valor do estado sobe para ~0,73, e o mesmo “vou conferir” passa a ter vantagem <b>negativa</b>, ~\(-0{,}03\). Nada mudou na ação; mudou a régua. (Para isolar o efeito, a figura mantém fixo o que acontece depois de “vou conferir”, os 70% de acerto; na vida real \(Q^\pi\) também muda com \(\pi\), porque a continuação é amostrada pela mesma política.) Os números da árvore são de brinquedo, mas a lição vale em escala: <b>a vantagem é sempre relativa à política atual</b>, e por isso o RL persegue um alvo móvel. Os rollouts que caem pela árvore mostram como se estima \(V\) sem conhecer probabilidade nenhuma: jogando muitas vezes e tirando a média, o que se chama estimativa <span class="la-term" data-term="monte-carlo">Monte Carlo</span>.</p>
+  <div class="la-callout analogy"><b class="t">Analogia: a nota relativa à média da turma</b><p>Tirar 7 numa prova vale pouco se a média da turma foi 9, e muito se foi 4. A vantagem é essa nota relativa. O RL reforça o que ficou acima da média da própria política e enfraquece o que ficou abaixo. Quando a turma melhora (a política aprende), a média sobe, e o mesmo 7 vira notícia ruim.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>O teorema do policy gradient</h2>
+  <p>Queremos subir \(J(\theta)\) por gradiente, como em todo o resto do deep learning (<a data-ch="aprender-com-dados">capítulo 1</a>). O obstáculo é que \(J\) é uma esperança sobre <i>amostras</i> da própria política. Sortear um token é uma operação discreta, sem derivada, e a recompensa pode vir de uma caixa-preta, como um verificador que roda testes de código. Não dá para fazer <span class="la-term" data-term="backpropagation">backpropagation</span> “através” da amostragem nem do RM. O <span class="la-term" data-term="truque-log-derivada">truque da log-derivada</span> contorna as duas coisas com uma identidade de cálculo, \(\nabla p = p\,\nabla\log p\):</p>
+  <div class="la-eq">
+    \[ \begin{aligned} \nabla_\theta J &amp;= \nabla_\theta \sum_\tau p_\theta(\tau)\,R(\tau) \\ &amp;= \sum_\tau p_\theta(\tau)\,\nabla_\theta\log p_\theta(\tau)\,R(\tau) \\ &amp;= \mathbb E_{\tau\sim p_\theta}\big[R(\tau)\,\nabla_\theta\log p_\theta(\tau)\big] \\[4pt] \log p_\theta(\tau) &amp;= \log\rho_0(s_0) + \sum_t \log\pi_\theta(a_t\mid s_t) \\ &amp;\quad + \sum_t \log P(s_{t+1}\mid s_t, a_t) \\[4pt] \Rightarrow\quad \nabla_\theta J &amp;= \mathbb E_{\tau}\Big[R(\tau)\sum_t \nabla_\theta\log\pi_\theta(a_t\mid s_t)\Big] \end{aligned} \]
+    <ul class="la-eq-legend">
+      <li>\(\tau = (s_0, a_0, s_1, \dots)\): <span class="la-term" data-term="trajetoria">trajetória</span> (no LLM, prompt + resposta)</li>
+      <li>\(p_\theta(\tau)\): probabilidade da trajetória sob a política</li>
+      <li>\(R(\tau)\): recompensa total da trajetória, só um número</li>
+      <li>linhas de \(\nabla_\theta J\): troca-se a derivada de uma probabilidade por uma esperança com peso \(\nabla\log p\)</li>
+      <li>linhas de \(\log p_\theta(\tau)\): só o termo da política depende de \(\theta\); \(\rho_0\) e \(P\) somem ao derivar</li>
+      <li>última linha: o <span class="la-term" data-term="policy-gradient">teorema do policy gradient</span> na forma de trajetória</li>
+    </ul>
+  </div>
+  <p>A dinâmica \(P\) e a distribuição inicial \(\rho_0\) <b>somem</b>, porque não dependem de \(\theta\). O gradiente não precisa atravessar o ambiente, nem o RM: basta calcular \(\nabla\log\pi_\theta\) dos tokens que saíram (um backward comum) e conhecer o número \(R\). Dois refinamentos completam o teorema. Pela <b>causalidade</b>, a ação em \(t\) não altera recompensas passadas, então \(R(\tau)\) pode ser trocado pelo retorno a partir de \(t\), \(G_t\). Pela <b>forma geral</b> do paper do GAE (Schulman et al., 2015), o peso de cada termo pode ser qualquer \(\Psi_t\) da família \(\{R(\tau),\ G_t,\ G_t - b(s_t),\ Q^\pi,\ A^\pi,\ \delta_t\}\), e a escolha \(\Psi_t = A^\pi\) dá “quase a menor variância possível”. Sutton e colegas (2000) provaram a versão com distribuição de estados, \(\nabla J = \sum_s d^\pi(s)\sum_a \nabla\pi_\theta(a\mid s)\,Q^\pi(s,a)\): o gradiente não exige derivar \(d^\pi\), a frequência com que a política visita cada estado. No LLM, o teorema vira:</p>
+  <div class="la-eq">
+    \[ \begin{gathered} \nabla_\theta J = \mathbb E_{x\sim\mathcal D,\ y\sim\pi_\theta}\Big[\sum_{t=1}^{T}\hat A_t\,\nabla_\theta\log\pi_\theta(y_t\mid x, y_{&lt;t})\Big] \\[4pt] \frac{\partial\log\pi(a)}{\partial z_j} = \mathbb 1[j = a] - \pi(j) \end{gathered} \]
+    <ul class="la-eq-legend">
+      <li>\(\hat A_t\): vantagem estimada do token \(t\) (as próximas seções mostram como estimá-la)</li>
+      <li>\(\nabla_\theta\log\pi_\theta(y_t\mid\cdot)\): o mesmo gradiente que o SFT calcula para o token observado</li>
+      <li>\(z_j\): logit do token \(j\) naquela posição</li>
+      <li>\(\mathbb 1[j = a]\): 1 para o token sorteado \(a\), 0 para os outros</li>
+    </ul>
+  </div>
+  <p>Leia a fórmula devagar, porque ela é o coração do módulo. É <b>a mesma retropropagação do SFT</b>, o gradiente do log da probabilidade do token observado, só que cada token é <b>ponderado pela vantagem</b>: positiva quer dizer “faça mais disso”; negativa, “faça menos disso”. O SFT é o caso particular com \(\hat A_t = 1\) em todos os tokens de uma demonstração (uma intuição pedagógica, não um teorema dos papers). A segunda fórmula mostra o que acontece nos logits: um passo com vantagem \(A\) e taxa \(\eta\) faz \(z \leftarrow z + \eta A(\mathbf e_a - \pi)\). O logit do token sorteado sobe (ou desce), e todos os outros andam no sentido oposto, cada um na proporção da sua probabilidade.</p>
+  <figure class="la-fig" id="fig-softmax" data-title="O policy gradient move a massa de probabilidade">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Em cima, os logits \(z\) e a distribuição \(\pi = \mathrm{softmax}(z)\) de três tokens; os contornos tracejados são \(\pi\) antes do passo. Embaixo, o vetor \(\mathbf e_a - \pi\) (o gradiente de \(\log\pi(a)\) nos logits), multiplicado por \(\eta A\), vira o deslocamento \(\Delta z\) que sobe para os logits. Com os valores iniciais você reproduz o exemplo numérico das notas de pesquisa: “14” sorteado com \(A = +1{,}5\) e \(\eta = 1\) leva \(\pi(14)\) de 0,242 a 0,696. Os passos 2 a 4 fazem a identidade do truque se mexer, com notas \(R = (0;\ 1;\ 0{,}7)\) para “20”, “14” e “Vou”: o gradiente exato \(\pi_j(R_j - J)\), a mesma soma escrita como \(\sum_a \pi(a)\,R(a)(\mathbf e_a - \pi)\) e a média Monte Carlo de amostras \(R(a)(\mathbf e_a - \pi)\) encostando nele (as marcas âmbar ao lado das barras são a frequência com que cada token foi sorteado). Tokens, logits e notas <b>ilustrativos</b>.</figcaption>
+  </figure>
+  <p>Os logits \((2{,}0;\ 1{,}0;\ 0{,}1)\) viram \(\pi = (0{,}659;\ 0{,}242;\ 0{,}099)\). O modelo prefere “20”, a resposta errada de quem soma antes de multiplicar. O token sorteado foi “14”, que recebeu vantagem \(+1{,}5\). Com \(\eta = 1\), \(\pi(14)\) salta de 0,24 para 0,70; com \(A = -1{,}5\), despenca para 0,04. É um passo exagerado de propósito, para enxergar o movimento. Na vida real, um passo desse tamanho num lote só é exatamente o que o clipping do PPO proíbe (<a data-ch="ppo-rlhf">capítulo 55</a>). Troque o token sorteado para “20” com vantagem negativa e veja a massa migrar para as alternativas, proporcionalmente ao que cada uma já tinha.</p>
+  <p>Avance o passo a passo da figura para ver a identidade do começo da seção em movimento. Dê notas \(R = (0;\ 1;\ 0{,}7)\) aos três tokens. O desempenho é \(J = \sum_a \pi(a)R(a) = 0{,}311\), e derivar \(J\) direto nos logits dá \(\partial J/\partial z_j = \pi_j(R_j - J) = (-0{,}205;\ +0{,}167;\ +0{,}038)\). A mesma conta pode ser reescrita como \(\sum_a \pi(a)\,R(a)(\mathbf e_a - \pi)\): uma média, ponderada por \(\pi\), de “nota vezes \(\nabla\log\pi\)”. Ou seja, uma esperança sob a própria política, \(\mathbb E_{a\sim\pi}[R(a)\,\nabla\log\pi(a)]\). E esperança se estima sorteando: some \(R(a)(\mathbf e_a - \pi)\) dos tokens sorteados, divida pelo número de sorteios, e a média encosta no gradiente exato. Em nenhum momento foi preciso derivar o sorteio nem a nota.</p>
+  <div class="la-callout deep"><b class="t">Aprofundamento: uma lente para o módulo inteiro</b><p>A lente que você viu no <a data-ch="pos-treino-mapa" data-sec="s5-recompensa-preferencia-e-quem-julga">capítulo 50</a>, agora com a derivação por trás: o “\(\nabla\log\pi\) ponderado” que acabamos de deduzir. O paper do GRPO (DeepSeekMath) propõe ver SFT, RFT, PPO, GRPO e companhia como o <b>mesmo</b> gradiente, \(\mathbb E\big[\tfrac{1}{\lvert o\rvert}\sum_t \mathrm{GC}_t\,\nabla_\theta\log\pi_\theta(o_t\mid q, o_{&lt;t})\big]\), em que só mudam a fonte dos dados e o <span class="la-term" data-term="coeficiente-de-gradiente">coeficiente de gradiente</span> \(\mathrm{GC}_t\) de cada token. SFT: dataset fixo, \(\mathrm{GC} = 1\). Rejection sampling (RFT): amostras do próprio modelo, 1 nas corretas e 0 nas erradas. PPO: amostras online, \(\hat A_t\) do GAE com crítico. GRPO: \(G\) amostras por prompt, vantagem relativa ao grupo mais o gradiente do termo de KL. Distilação on-policy (extensão da lente, fora do paper): \(\log\pi_{\text{professor}} - \log\pi_{\text{aluno}}\) por token. Guarde a imagem de “um mapa de cores por token sobre a mesma resposta”: os próximos capítulos são variações sobre como pintá-lo.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Domando a variância: REINFORCE, baselines e o crítico</h2>
+  <p>O <span class="la-term" data-term="reinforce">REINFORCE</span> (Williams, 1992) é o teorema aplicado sem cerimônia: sortear \(N\) trajetórias e tirar a média, \(\hat g = \tfrac1N\sum_i R(\tau_i)\sum_t\nabla\log\pi_\theta(a^i_t\mid s^i_t)\). É um <span class="la-term" data-term="estimador-nao-enviesado">estimador não enviesado</span>: em média, aponta para o gradiente verdadeiro. O problema é a variância. Cada estimativa soma centenas de termos ruidosos, e a escala de \(R\) multiplica tudo. Se o RM devolve notas em torno de 5, todo token sorteado é empurrado para cima com força ~5, bom ou ruim, e só a pequena diferença entre as notas carrega informação. É como medir a direção da brisa com um cata-vento no meio de uma ventania.</p>
+  <p>O remédio clássico é o <span class="la-term" data-term="baseline">baseline</span>: subtrair de \(R\) qualquer número \(b(s)\) que não dependa da ação. O estimador continua não enviesado, porque</p>
+  <div class="la-eq">
+    \[ \begin{aligned} \mathbb E_{a\sim\pi}\big[\nabla_\theta\log\pi_\theta(a\mid s)\,b(s)\big] &amp;= b(s)\sum_a\nabla_\theta\pi_\theta(a\mid s) \\ &amp;= b(s)\,\nabla_\theta\underbrace{\textstyle\sum_a\pi_\theta(a\mid s)}_{=\,1} = 0 \end{aligned} \]
+    <ul class="la-eq-legend">
+      <li>\(b(s)\): baseline; pode depender do estado, nunca da ação sorteada</li>
+      <li>1º passo: \(\pi\,\nabla\log\pi = \nabla\pi\) (o truque ao contrário)</li>
+      <li>último passo: as probabilidades somam 1 para qualquer \(\theta\), então a derivada da soma é zero</li>
+    </ul>
+  </div>
+  <p>O baseline ótimo para cada componente é \(b^* = \mathbb E[g^2 R]/\mathbb E[g^2]\), com \(g = \nabla\log\pi\) (Greensmith, Bartlett e Baxter, 2004). Na prática usa-se \(b(s) \approx V^\pi(s)\), e então \(G_t - V(s_t)\) vira uma estimativa da vantagem. Em LLMs, um baseline popular que dispensa rede extra é o <span class="la-term" data-term="rloo">RLOO</span> (REINFORCE Leave-One-Out; Kool et al., 2019, usado por Ahmadian et al., 2024): amostrar \(k\) respostas para o mesmo prompt e usar como baseline de cada uma a média das <i>outras</i>:</p>
+  <div class="la-eq">
+    \[ \hat A_i = R(y_i) - \frac{1}{k-1}\sum_{j\ne i}R(y_j) = \frac{k}{k-1}\big(R_i - \bar R\big) \]
+    <ul class="la-eq-legend">
+      <li>\(k\): respostas amostradas por prompt</li>
+      <li>\(R_i\): nota da resposta \(i\); \(\bar R\): média das \(k\) notas</li>
+      <li>não enviesado: o baseline de \(i\) não usa a própria amostra \(i\)</li>
+      <li>sem crítico: nenhuma rede extra para treinar</li>
+    </ul>
+  </div>
+  <p>Com \(k = 4\) e notas \((1{,}0;\ 0{,}0;\ 0{,}5;\ 0{,}9)\), de média 0,6, os baselines leave-one-out são \((0{,}467;\ 0{,}800;\ 0{,}633;\ 0{,}500)\) e as vantagens, \((+0{,}533;\ -0{,}800;\ -0{,}133;\ +0{,}400)\): \(\tfrac43\) vezes \(R_i - \bar R\). A identidade tem uma consequência curiosa. Usar a média de <i>todas</i> as amostras, incluindo a própria, só encolhe o gradiente esperado pelo fator \((k-1)/k\) (cálculo a partir da identidade). A figura deixa você sentir a diferença entre baselines.</p>
+  <figure class="la-fig" id="fig-reinforce" data-title="REINFORCE ao vivo: variância e baselines">
+    <div class="la-fig-stage" style="height:480px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Um bandit com 4 respostas de notas \((1{,}0;\ 0{,}0;\ 0{,}5;\ 0{,}9)\) mais um deslocamento \(c\) igual para todas. A cada passo, \(N\) respostas são sorteadas; a matriz mostra a contribuição de cada amostra, \((R - b)(\mathbf e_a - \pi)\), nos 4 logits. A nuvem é o erro de cada estimativa \(\hat g\) em relação ao gradiente verdadeiro (componentes A e B): quanto menor, melhor. A curva cheia é a nota esperada \(\mathbb E_\pi[R]\) ao longo do treino; as tracejadas são corridas de referência dos três modos, com os mesmos \(c\) e \(N\). Política inicial e notas <b>ilustrativas</b>.</figcaption>
+  </figure>
+  <p>Comece <i>sem baseline</i> e com \(c = 0\): o aprendizado funciona, porque as notas já estão entre 0 e 1. Agora suba \(c\) para 4, como se o RM desse notas em torno de 4 a 5. O gradiente verdadeiro não muda, porque somar uma constante a todas as notas não muda quem é melhor, mas a nuvem de estimativas explode. Pior: como toda resposta sorteada recebe um empurrão positivo, a política tende a reforçar o que já sorteia mais, e pode travar numa resposta medíocre. Rodando esta mesma simulação 200 vezes com \(c = 4\) e \(N = 4\), sem baseline a política terminou na melhor resposta (A) em só 81 corridas, e em 17 travou na pior (B); com RLOO, acertou nas 200 (conta nossa, com a simulação ilustrativa da figura). Troque para RLOO e veja: a constante se cancela exatamente, e a nuvem encolhe para perto do alvo. O “crítico ideal” usa o valor exato \(V = \mathbb E_\pi[R]\), o melhor que um crítico perfeito faria neste problema de um estado só.</p>
+  <p>Ahmadian et al. (2024) levaram o argumento ao RLHF e concluíram que “muitos componentes do PPO são desnecessários” ali: REINFORCE e RLOO superaram PPO, DPO e RAFT nos experimentos deles. A justificativa é que um modelo pré-treinado e ajustado por SFT “está longe de uma parametrização aleatória” e concentra a massa em poucos tokens, então a variância não é o problema dominante. No PPO com Llama-7B no HH, \(\lambda = 1\) (sem bootstrap: mais variância, sem viés) foi o melhor entre 1,0, 0,95, 0,5 e 0,0, e o clipping do PPO disparou em menos de 5% do tempo por lote.</p>
+  <h3>O crítico: aprender o baseline</h3>
+  <p>Se o baseline ideal é \(V^\pi\), por que não <i>aprendê-lo</i>? Essa é a família <span class="la-term" data-term="ator-critico">ator-crítico</span>. A política (o ator) gera e é atualizada pelo policy gradient; uma segunda rede, o crítico \(V_\psi\), aprende por regressão a prever o retorno:</p>
+  <div class="la-eq">
+    \[ \mathcal L_V(\psi) = \hat{\mathbb E}_t\Big[\big(V_\psi(s_t) - \hat R_t\big)^2\Big] \]
+    <ul class="la-eq-legend">
+      <li>\(V_\psi\): crítico de parâmetros \(\psi\), um valor por posição</li>
+      <li>\(\hat R_t\): alvo, que pode ser o retorno Monte Carlo, o de \(n\) passos ou o λ-retorno (próxima seção)</li>
+      <li>\(\hat{\mathbb E}_t\): média sobre os tokens do lote</li>
+    </ul>
+  </div>
+  <p>No RLHF, o crítico é um LM com uma cabeça escalar que emite um valor <b>em cada posição</b>, diferente do RM, que é lido só no EOS. Stiennon et al. (2020) usaram um Transformer com parâmetros <b>completamente separados</b> da política, inicializado a partir do RM, para evitar que as atualizações de valor destruíssem a política pré-treinada no começo do treino; o InstructGPT fez o mesmo. O A3C, ao contrário, compartilha todas as camadas exceto as de saída: uma softmax para a política e uma saída linear para o valor. Em LLMs o crítico custa caro, porque é mais um modelo do tamanho da política em memória, e treinado. O paper do GRPO resume a queixa: a função valor “traz um fardo substancial de memória e computação”, e, como só o último token recebe recompensa, é difícil treinar um valor preciso em cada token. É por isso que RLOO e GRPO trocam o crítico por estatísticas de grupo (<a data-ch="grpo-rlvr">capítulo 56</a>).</p>
+  <div class="la-callout analogy"><b class="t">Analogia: o comentarista esportivo</b><p>O crítico é o comentarista que, a cada lance, arrisca o placar final. Ele erra, mas erra de forma suave, e a <i>diferença</i> entre o palpite dele antes e depois de um lance diz se o lance ajudou. Um gol aos 10 minutos faz o palpite subir; um pênalti perdido faz descer. Essa diferença entre palpites consecutivos é a ideia da próxima seção.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Diferença temporal e GAE: o eco da recompensa</h2>
+  <p>Se \(V\) é uma previsão do retorno, a diferença entre a previsão <i>depois</i> de um passo e a previsão <i>antes</i> dele mede quanto o passo ajudou. É o <span class="la-term" data-term="residuo-td">resíduo de diferença temporal</span> (TD):</p>
+  <div class="la-eq">
+    \[ \begin{gathered} \delta_t = r_t + \gamma V(s_{t+1}) - V(s_t) \\[4pt] G^{(n)}_t = \sum_{k=0}^{n-1}\gamma^k r_{t+k} + \gamma^n V(s_{t+n}) \\[4pt] \text{TD(0)}:\ V(s_t) \leftarrow V(s_t) + \alpha\,\delta_t \end{gathered} \]
+    <ul class="la-eq-legend">
+      <li>\(\delta_t\): resíduo TD, a “surpresa” do passo \(t\)</li>
+      <li>\(r_t + \gamma V(s_{t+1})\): o que aconteceu de fato mais o palpite seguinte</li>
+      <li>\(G^{(n)}_t\): <span class="la-term" data-term="retorno-n-passos">retorno de \(n\) passos</span>: \(n\) recompensas reais e, depois, confiança no crítico</li>
+      <li>\(\alpha\): taxa de aprendizado do crítico</li>
+    </ul>
+  </div>
+  <p>Se \(V = V^\pi\) exatamente, \(\mathbb E[\delta_t \mid s_t, a_t] = A^\pi(s_t, a_t)\): o resíduo TD estima a vantagem olhando um passo só. É o <i>bootstrap</i>, aprender um palpite a partir de outro palpite, e é a <span class="la-term" data-term="diferenca-temporal">diferença temporal</span> que dá nome à família. O retorno de \(n\) passos é o meio-termo, e é a vantagem do A3C (com \(n \le t_{\max}\)). O dilema é clássico: \(n = 1\) tem baixa variância, mas herda o viés de um \(V\) imperfeito; \(n \to \infty\) (Monte Carlo) não tem viés de bootstrap, mas tem variância alta. O <span class="la-term" data-term="lambda-retorno">λ-retorno</span> faz a média exponencial de todos os \(n\), \(G^\lambda_t = (1-\lambda)\sum_{n\ge1}\lambda^{n-1}G^{(n)}_t\). O <span class="la-term" data-term="gae">GAE</span> (Schulman, Moritz, Levine, Jordan e Abbeel, 2015) faz o mesmo com as vantagens, e a soma telescopa numa forma elegante:</p>
+  <div class="la-eq">
+    \[ \begin{gathered} \hat A^{\text{GAE}(\gamma,\lambda)}_t = \sum_{l=0}^{\infty}(\gamma\lambda)^l\,\delta_{t+l} \\[4pt] \hat A_t = \delta_t + \gamma\lambda\,\hat A_{t+1}, \qquad \hat R_t = \hat A_t + V(s_t) \end{gathered} \]
+    <ul class="la-eq-legend">
+      <li>\(\gamma\): desconto, tratado no paper como redutor de variância (“introduz viés”)</li>
+      <li>\(\lambda \in [0,1]\): dosa viés contra variância</li>
+      <li>recursão: calculada de trás para frente, com \(\hat A_{T+1} = 0\) e \(V(s_{T+1}) = 0\) no fim do episódio</li>
+      <li>\(\hat R_t\): alvo do crítico, que é exatamente o λ-retorno (com \(V\) fixo durante o cálculo)</li>
+    </ul>
+  </div>
+  <p>Os extremos ancoram a intuição. Com \(\lambda = 0\), \(\hat A_t = \delta_t\): TD de um passo, baixa variância, correto só se \(V\) estiver certo. Com \(\lambda = 1\), \(\hat A_t = \sum_l \gamma^l r_{t+l} - V(s_t)\): Monte Carlo menos baseline, correto qualquer que seja \(V\), com variância alta. Os valores publicados: Stiennon et al. e o “N+” usam \(\gamma = 1\) e \(\lambda = 0{,}95\); o InstructGPT faz o GAE sem desconto; o PPO original usa \(\gamma = 0{,}99\) e \(\lambda = 0{,}95\).</p>
+  <p>Para ver tudo em números, pegue uma resposta de 5 tokens no estilo RLHF. A recompensa de cada token é um pedágio de KL até o modelo de referência, estimado por \(\log\pi_{\text{old}} - \log\pi_{\text{ref}}\), e o EOS recebe ainda o escore do RM:</p>
+  <div class="la-eq">
+    \[ \begin{aligned} r_t = &amp;-\beta\big(\log\pi_{\theta_{\text{old}}}(y_t\mid s_t) - \log\pi_{\text{ref}}(y_t\mid s_t)\big) \\ &amp;+ \mathbb 1[t = T]\,r_\phi(x,y) \end{aligned} \]
+    <ul class="la-eq-legend">
+      <li>\(\beta\): coeficiente do pedágio (0,05 no exemplo)</li>
+      <li>\(\pi_{\theta_{\text{old}}}\): a política que gerou o rollout</li>
+      <li>\(\pi_{\text{ref}}\): o modelo de referência congelado (em geral, o SFT)</li>
+      <li>\(r_\phi(x,y)\): escore do RM, 2,0 no exemplo (ilustrativo), somado só no EOS</li>
+    </ul>
+  </div>
+  <p>Por que esse pedágio existe e como escolher \(\beta\) é assunto do <a data-ch="ppo-rlhf">capítulo 55</a>. A figura monta a tabela inteira e roda a recursão do GAE de trás para frente.</p>
+  <figure class="la-fig" id="fig-gae" data-title="GAE passo a passo: o crédito escorre para trás">
+    <div class="la-fig-stage" style="height:480px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>A tabela segue o exemplo numérico das notas de pesquisa (log-probs, crítico e RM <b>ilustrativos</b>; contas exatas). A coluna destacada é a posição em que a recursão \(\hat A_t = \delta_t + \gamma\lambda\hat A_{t+1}\) está trabalhando, da direita (EOS) para a esquerda. Embaixo, as barras são \(\hat A_t\) para o \(\lambda\) escolhido; os pontos âmbar e lilás marcam \(\lambda = 0\) e \(\lambda = 1\). Com \(\beta = 0{,}05\) e \(\gamma = 1\), os valores batem com a tabela publicada: \(\hat A_1\) = 0,1900 (\(\lambda = 0\)), 0,9781 (0,95) e 1,1025 (1).</figcaption>
+  </figure>
+  <p>Com \(\lambda = 0\), o token 2 recebe vantagem negativa (\(\delta_2 = -0{,}1025\)): antes dele o crítico esperava 1,10 (\(V(s_2)\)); depois que ele foi escrito, o prefixo passou a valer só 1,00 (\(V(s_3)\)), e o pedágio de KL (−0,0025) quase não pesa. Com \(\lambda = 0{,}95\), o crédito da recompensa final escorre para trás, e o token 2 fica com \(+0{,}83\). Com \(\lambda = 1\), todos veem o retorno final, e os alvos do crítico viram o retorno Monte Carlo (2,0025 no primeiro token). A soma das recompensas é 2,0025 = RM − β·ΣKL, com ΣKL = −0,05: o estimador de KL por amostra pode dar negativo (o <a data-ch="ppo-rlhf">capítulo 55</a> compara os estimadores \(k_1\), \(k_2\) e \(k_3\)).</p>
+  <p>Em código, tudo isso cabe em poucas linhas. O laço de trás para frente é a recursão do GAE; o detalhe que mais derruba implementações caseiras é o <i>stop-gradient</i> na vantagem: ela é um peso fixo, calculado com o crítico congelado, e o gradiente da política só pode passar pelo log-prob. Com os números da tabela, o laço devolve \(\hat A = (0{,}9781;\ 0{,}8296;\ 0{,}9811;\ 0{,}4801;\ 0{,}1975)\) para \(\lambda = 0{,}95\).</p>
+  <pre data-lang="python"><code># r[t]: recompensa do token t (pedágio de KL; o EOS soma o RM)
+# V[t]: palpite do crítico ANTES do token t, isto é, V(s_t)
+adv = torch.zeros(T)
+last = 0.0
+for t in reversed(range(T)):                     # do EOS para o começo
+    v_next = V[t + 1] if t + 1 &lt; T else 0.0      # V(s_{T+1}) = 0
+    delta = r[t] + gamma * v_next - V[t]         # resíduo TD
+    last = delta + gamma * lam * last            # Â_t = δ_t + γλ·Â_{t+1}
+    adv[t] = last
+ret = adv + V                                    # alvo do crítico (λ-retorno)
+
+# perdas: logp_new = log π_θ(y_t | s_t) e V_new = V_ψ(s_t), com grafo
+loss_pi = -(adv.detach() * logp_new).mean()      # vantagem sem gradiente
+loss_v = ((V_new - ret.detach()) ** 2).mean()
+
+# variante sem crítico (RLOO): k respostas do mesmo prompt, nota R[i] cada
+b = (R.sum() - R) / (k - 1)                      # média das outras k-1
+adv_seq = R - b                                  # a mesma para todos os tokens de i</code></pre>
+  <h3>O farol que se apaga em raciocínios longos</h3>
+  <p>Com recompensa só no último token e \(\gamma = 1\), a contribuição <i>direta</i> da recompensa final para \(\hat A_t\), pela soma dos \(\delta\), é ponderada por \(\lambda^{T-t}\). Para \(\lambda = 0{,}95\): \(0{,}95^{50} \approx 0{,}077\), \(0{,}95^{500} \approx 7\times10^{-12}\) e \(0{,}95^{8000} \approx 6\times10^{-179}\). Em respostas de milhares de tokens, os primeiros tokens dependem quase só do crítico. É o <span class="la-term" data-term="decaimento-do-sinal">decaimento do sinal</span>. O VC-PPO (Yuan et al., 2025) apontou exatamente isso, o “viés de inicialização do valor” e o “decaimento do sinal de recompensa”, como causas do colapso do PPO em cadeias de raciocínio longas. A correção proposta: pré-treinar o crítico e desacoplar o GAE, com \(\lambda_{\text{crítico}} = 1\) (alvo Monte Carlo, propagação sem viés) e \(\lambda_{\text{ator}} = 0{,}95\) (menos variância na vantagem). O VAPO foi além e adaptou \(\lambda\) ao comprimento \(l\) da resposta, \(\lambda_{\text{política}} = 1 - 1/(\alpha l)\); partindo do Qwen2.5-32B base, chegou a 60,4 no AIME 2024 em 5.000 passos (números do resumo do paper).</p>
+  <figure class="la-fig" id="fig-farol" data-title="O farol da recompensa final">
+    <div class="la-fig-stage" style="height:390px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Uma resposta de \(l\) tokens, com a recompensa no EOS (à direita). O brilho de cada trecho e a curva (eixo em escala log) mostram o peso \(\lambda^{d}\) com que a recompensa final chega a um token a distância \(d\) do fim. O pulso que corre da direita para a esquerda é o “eco” da recompensa. Ligue o λ adaptativo: o peso que chega ao primeiro token fica em ~0,51 qualquer que seja o comprimento. Os pesos são contas exatas; abaixo de \(10^{-15}\) a curva encosta no piso do gráfico.</figcaption>
+  </figure>
+  <p>Com o λ adaptativo, o peso que chega ao começo da resposta é \((1 - 1/(\alpha l))^l \to e^{-1/\alpha}\), <b>independente do comprimento</b>. Com \(\alpha = 1{,}5\), o valor usado pelo SAO, dá ≈ 0,513 para 100, 1.000 ou 10.000 tokens (cálculo). O farol chega com a mesma intensidade ao início de respostas curtas e longas. O SAO, implantado no RL agêntico do GLM-5.2, combina esse \(\lambda_{\text{política}}\) com \(\lambda_{\text{crítico}} = 1\).</p>
+  <div class="la-callout analogy"><b class="t">Analogia: o eco no corredor</b><p>A recompensa é um grito no fim de um corredor comprido, e cada token é uma pessoa parada no caminho. Com \(\lambda = 1\), o corredor não abafa nada: todos ouvem o grito inteiro, mas também todo o barulho do caminho (variância). Com \(\lambda\) menor, cada metro abafa um pouco, e quem está longe só ouve o que o vizinho repetiu (o crítico). Em corredores de 8 mil tokens, com \(\lambda = 0{,}95\), ninguém no começo ouve o grito.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>On-policy, off-policy e importance sampling</h2>
+  <p>No <a data-ch="pos-treino-mapa" data-sec="s4-de-quem-sao-os-dados-on-policy-e-off-pol">capítulo 50</a>, on- e off-policy eram a resposta a “de quem são os dados?”; aqui está a matemática. Até agora, todas as amostras vinham da política que estamos treinando, o regime <span class="la-term" data-term="on-policy">on-policy</span> (REINFORCE, A2C). Só que gerar amostras é caro, e muitas vezes elas vêm de <i>outra</i> política \(\mu\): uma versão anterior dos pesos, ou um motor de inferência com outra numérica. É o regime <span class="la-term" data-term="off-policy">off-policy</span>, e a ferramenta para usá-lo é a <span class="la-term" data-term="importance-sampling">amostragem por importância</span> (IS):</p>
+  <div class="la-eq">
+    \[ \begin{gathered} \mathbb E_{a\sim\pi}\big[f(a)\big] = \mathbb E_{a\sim\mu}\Big[\frac{\pi(a)}{\mu(a)}\,f(a)\Big] \\[4pt] \rho_t(\theta) = \frac{\pi_\theta(a_t\mid s_t)}{\pi_{\theta_{\text{old}}}(a_t\mid s_t)}, \qquad \text{TIS}:\ \min(\rho_t,\ C) \end{gathered} \]
+    <ul class="la-eq-legend">
+      <li>\(\mu\): política de comportamento, a que gerou os dados</li>
+      <li>\(\pi/\mu\): peso de importância, que corrige a frequência de cada amostra</li>
+      <li>\(\rho_t\): razão por token do PPO (\(\rho_t = 1\) antes do primeiro passo)</li>
+      <li>\(C\): teto do peso no <span class="la-term" data-term="tis">IS truncado</span></li>
+    </ul>
+  </div>
+  <p>Reponderar é o que um instituto de pesquisa eleitoral faz quando a amostra tem jovens demais: cada entrevistado passa a contar com peso \(\pi/\mu\), para que a média represente a população certa. O PPO é “quase on-policy”: os dados vêm de \(\pi_{\theta_{\text{old}}}\) e são reaproveitados por \(K\) épocas, e depois do primeiro passo de gradiente \(\pi_\theta \ne \pi_{\theta_{\text{old}}}\). A razão \(\rho_t\) é exatamente um peso de IS por token, e o clipping do PPO limita o quanto o lote pode ficar off-policy.</p>
+  <p>Por que por token, e não pela sequência inteira? O peso correto da sequência seria o produto \(\prod_t \rho_t\), e um produto de centenas de razões tem variância enorme: um único token com \(\rho = 5\) multiplica tudo por 5. A razão por token é uma aproximação de primeira ordem que ignora a mudança na distribuição de estados, e quem a justifica é o TRPO (seção 8). O IS truncado (TIS; Ionides, 2008), reintroduzido para LLMs por Yao et al. (2025), corta o peso em \(C\): troca um pouco de viés por variância limitada.</p>
+  <p>No RLHF moderno, a off-policyness vem de cinco fontes: (i) várias épocas por lote; (ii) <span class="la-term" data-term="rl-assincrono">RL assíncrono</span>, com rollouts gerados por pesos de um ou mais passos atrás; (iii) o <span class="la-term" data-term="descompasso-treino-inferencia">descompasso treino–inferência</span>, a diferença numérica entre o motor de inferência (vLLM, SGLang) e o de treino (FSDP, Megatron); (iv) rollouts <b>quantizados</b> (FP8, INT8); (v) roteamento de <span class="la-term" data-term="mixture-of-experts">MoE</span> diferente entre inferência e treino. As três últimas são o Módulo 1 batendo à porta.</p>
+  <h3>Mesmos pesos, outras probabilidades</h3>
+  <p>Yao et al. (2025) mostraram que, com geração em vLLM e treino em FSDP, \(\pi_{\text{vllm}}(a;\theta) \ne \pi_{\text{fsdp}}(a;\theta)\) apesar dos mesmos parâmetros: kernels, ordem de redução, precisão e batching diferentes. Isso “transforma implicitamente o RL on-policy em off-policy”, e piora com rollouts em INT8 ou FP8. A correção TIS para o REINFORCE é:</p>
+  <div class="la-eq">
+    \[ \mathbb E_{a\sim\pi_{\text{vllm}}(\theta)}\Big[\min\Big(\frac{\pi_{\text{fsdp}}(a;\theta)}{\pi_{\text{vllm}}(a;\theta)},\ C\Big)\,R(a)\,\nabla_\theta\log\pi_{\text{fsdp}}(a;\theta)\Big] \]
+    <ul class="la-eq-legend">
+      <li>\(\pi_{\text{vllm}}\): probabilidades no motor que <i>gerou</i> o rollout</li>
+      <li>\(\pi_{\text{fsdp}}\): probabilidades recalculadas no motor de <i>treino</i>, por onde passa o gradiente</li>
+      <li>\(C\): razão máxima (hiperparâmetro; as fontes não fixam um valor)</li>
+    </ul>
+  </div>
+  <p>No PPO, o mesmo fator, calculado com \(\theta_{\text{old}}\), multiplica o gradiente clipado usual. Na ablação deles, as alternativas ingênuas falharam: usar \(\pi_{\text{vllm}}\) no denominador da própria razão do PPO (“PPO-IS”) ou não truncar (“Vanilla-IS”) deu acurácia perto de 0 com rollouts INT8 no Qwen2.5-0.5B em GSM8K. Repare que as probabilidades do vLLM não entram no gradiente: o log-prob “de verdade” é sempre recalculado no motor de treino. A figura põe as duas máquinas lado a lado.</p>
+  <figure class="la-fig" id="fig-is" data-title="Duas máquinas, mesmos pesos: pesos de importância">
+    <div class="la-fig-stage" style="height:480px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Cada coluna é um token do rollout, com a probabilidade no amostrador (lilás) e no treinador (menta), em escala log. A linha do meio é a razão \(\rho = \pi_{\text{treino}}/\pi_{\text{vllm}}\). Embaixo, o peso que cada correção usa no gradiente (escala log centrada em 1): o produto da sequência inteira, a razão por token, o TIS com teto \(C\) ou o IcePop, que zera tokens fora de \([1/\beta, \beta]\). Os dados “tabela” são os do exemplo das notas de pesquisa (<b>ilustrativos</b>); no “sorteio”, o ruído e o efeito do FP8 também são ilustrativos.</figcaption>
+  </figure>
+  <p>No exemplo da tabela, o token 3 é raro (0,020 no treinador, 0,004 no vLLM). Sozinho, ele leva a razão a 5 e o produto da sequência a 5,71: um token raro com descompasso domina o peso inteiro. Por token, com TIS, o estrago para em \(C = 2\). O <span class="la-term" data-term="icepop">IcePop</span>, usado no GLM-5 com \(\beta = 2\), é mais radical: <b>zera</b> o gradiente dos tokens cuja razão sai de \([1/\beta, \beta] = [0{,}5;\ 2]\). (Cuidado com a notação: aqui \(\beta\) é o limiar do IcePop, não o coeficiente de KL.) Aumente o descompasso no modo sorteio e ligue o rollout em FP8: os tokens raros são os primeiros a sair da faixa. As fontes atacam o problema em três frentes:</p>
+  <ul>
+    <li><b>Precisão na saída do modelo.</b> O <a data-ch="pos-treino-mapa" data-sec="s8-ponte-com-o-modulo-1-o-motor-de-inferenc">capítulo 50</a> já citou o resultado; o mecanismo é este: o MiniMax-M1 encontrou, camada a camada, ativações de alta magnitude na <span class="la-term" data-term="lm-head">LM head</span> como fonte principal do descompasso; subir só ela para FP32 levou a correlação entre as probabilidades de treino e de inferência de ~0,9 para ~0,99.</li>
+    <li><b>Kernels batch-invariantes.</b> A Thinking Machines mostrou que o não determinismo vem de kernels (RMSNorm, matmul, atenção) que mudam a ordem de redução com o tamanho do batch. Com <span class="la-term" data-term="kernels-batch-invariantes">kernels batch-invariantes</span>, 1.000 execuções do mesmo prompt deram 1.000 saídas idênticas, contra 80 completions distintas no Qwen3-8B a temperatura 0. É a <span class="la-term" data-term="invariancia-de-lote">invariância de lote</span> do <a data-ch="numeros-no-computador">capítulo 4</a>; o TensorFold do <a data-ch="motor-exato-tensorfold">capítulo 48</a> a garante por contrato no serviço. Num RLVR, sem correção, a KL amostrador–treinador disparou junto com o colapso da recompensa; com IS, ficou em ~0,001; com numérica bit a bit idêntica (“True On-Policy RL”), em 0. O custo no teste deles: 55 s com o vLLM determinístico não otimizado, contra 26 s no padrão.</li>
+    <li><b>Roteamento de MoE.</b> Em MoE, a KL treino–inferência é mais que o dobro da de modelos densos, e ~94% dos tokens escolhem experts diferentes em pelo menos uma camada entre as duas fases (o número que você viu no capítulo 50). Em linguagem de IS, cada um desses tokens tem \(\mu\) e \(\pi\) calculados por redes diferentes, e a razão \(\rho_t\) mede essa diferença, não uma mudança de pesos. O <span class="la-term" data-term="routing-replay">R3 (Rollout Routing Replay)</span> grava as máscaras top-K da inferência e as reaplica no treino. O DeepSeek faz o mesmo (“Keep Routing”) desde o V3-0324 e o considera crucial para MoE.</li>
+  </ul>
+  <div class="la-callout recipe" data-recipe="qwen"><b class="t"><span class="la-rb qwen"></span><span class="la-rb glm"></span> Nas receitas do Módulo 1</b><p>O overlay de determinismo da receita Qwen, a correção do tipo “on-policy verdadeiro” no motor de rollout, já tem cartão próprio no <a data-ch="pos-treino-mapa" data-sec="s8-ponte-com-o-modulo-1-o-motor-de-inferenc">capítulo 50</a>. O que este capítulo acrescenta é o instrumento para medir o problema: a receita GLM tem o <code>logprob_capture.py</code>, que captura os logprobs top-20 de prompt em dois servidores e compara KL e argmax entre eles. É a mesma métrica que se vigia entre amostrador e treinador: a KL que, no experimento da Thinking Machines acima, disparou junto com o colapso da recompensa. Do lado do amostrador, o vLLM tem ainda o <code>VLLM_BATCH_INVARIANT</code>, que liga os kernels batch-invariantes. Os três modelos do Módulo 1 são MoE com pesos e KV quantizados: usá-los como geradores de rollout de uma política treinada em BF16 seria o pior caso de descompasso, com quantização e roteamento somados, e TIS, R3 e LM head em FP32 seriam obrigatórios (interpretação).</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Atores assíncronos: A2C, A3C e IMPALA</h2>
+  <p>Gerar experiência é a parte lenta do RL, e isso já valia em 2016. Mnih et al. (2016) atacaram o problema rodando vários <b>atores-aprendizes</b> em paralelo. No <span class="la-term" data-term="a3c">A3C</span> (Asynchronous Advantage Actor-Critic), cada thread de uma única máquina multi-core (16 núcleos de CPU, sem GPU) tem a sua cópia do ambiente, calcula gradientes e os aplica <b>assincronamente</b>, sem lock, num conjunto de parâmetros compartilhado, no estilo <span class="la-term" data-term="hogwild">Hogwild!</span>. Atores explorando partes diferentes do ambiente <b>descorrelacionam</b> os dados, o papel que o replay buffer fazia no DQN, e isso estabiliza um treino on-policy sem replay. Cada ator atualiza a cada \(t_{\max}\) ações, ou no fim do episódio:</p>
+  <div class="la-eq">
+    \[ \begin{gathered} \nabla_{\theta'}\log\pi(a_t\mid s_t;\theta')\,A(s_t,a_t;\theta,\theta_v) + \beta\,\nabla_{\theta'}H\big(\pi(\cdot\mid s_t;\theta')\big) \\[4pt] A = \sum_{i=0}^{k-1}\gamma^i r_{t+i} + \gamma^k V(s_{t+k};\theta_v) - V(s_t;\theta_v) \end{gathered} \]
+    <ul class="la-eq-legend">
+      <li>\(\theta'\): cópia local dos parâmetros do ator</li>
+      <li>\(\theta_v\): parâmetros do valor (na prática, camadas compartilhadas com a política)</li>
+      <li>\(A\): vantagem de \(k\) passos, com \(k \le t_{\max} = 5\)</li>
+      <li>\(H(\pi)\): entropia da política naquele estado</li>
+      <li>\(\beta = 0{,}01\): peso do <span class="la-term" data-term="bonus-de-entropia">bônus de entropia</span> (outro \(\beta\): aqui é o peso da entropia, na notação do paper, e não o coeficiente de KL da seção 5 nem o limiar do IcePop)</li>
+    </ul>
+  </div>
+  <p>O bônus de entropia desencoraja, nas palavras do paper, a “convergência prematura a políticas determinísticas subótimas”; \(\beta = 0{,}01\) em todos os experimentos de Atari e TORCS. Os outros hiperparâmetros citados: 16 threads, \(t_{\max} = 5\), RMSProp com estatísticas compartilhadas e \(\gamma = 0{,}99\). O resultado foi superar o estado da arte em Atari “treinando metade do tempo numa única CPU multi-core em vez de GPU”. O <span class="la-term" data-term="a2c">A2C</span> é a variante <b>síncrona</b>: espera todos os atores e faz uma atualização em lote, popularizada pelas OpenAI Baselines. Um detalhe histórico saboroso: o paper que inaugurou o RL a partir de preferências humanas (Christiano et al., 2017) otimizava a política com A2C nos jogos de Atari e com TRPO nas tarefas de robótica. O RLHF nasceu em cima dos algoritmos deste capítulo.</p>
+  <p>O <span class="la-term" data-term="impala">IMPALA</span> (Espeholt et al., 2018) deu o passo seguinte. Os atores não mandam gradientes, mandam <b>trajetórias</b> para um aprendiz central, e continuam gerando com pesos que podem estar algumas versões atrasados. Esse atraso, a <span class="la-term" data-term="staleness">defasagem</span> (<i>staleness</i>), torna os dados off-policy, e o IMPALA os corrige com o <span class="la-term" data-term="v-trace">V-trace</span>, um alvo de valor com importance sampling truncado:</p>
+  <div class="la-eq">
+    \[ \begin{gathered} v_s = V(x_s) + \sum_{t=s}^{s+n-1}\gamma^{t-s}\Big(\prod_{i=s}^{t-1}c_i\Big)\,\delta_t V \\[4pt] \delta_t V = \rho_t\big(r_t + \gamma V(x_{t+1}) - V(x_t)\big) \\[4pt] \rho_t = \min\Big(\bar\rho,\ \frac{\pi(a_t\mid x_t)}{\mu(a_t\mid x_t)}\Big), \qquad c_i = \min\Big(\bar c,\ \frac{\pi(a_i\mid x_i)}{\mu(a_i\mid x_i)}\Big) \end{gathered} \]
+    <ul class="la-eq-legend">
+      <li>\(v_s\): alvo de valor corrigido para o estado \(x_s\), olhando \(n\) passos</li>
+      <li>\(\mu\): política dos atores (defasada); \(\pi\): política do aprendiz</li>
+      <li>\(\delta_t V\): resíduo TD pesado pela razão truncada \(\rho_t\)</li>
+      <li>\(c_i\): “traços” truncados, que controlam quanto o erro distante se propaga</li>
+      <li>\(\bar\rho \ge \bar c\): os tetos dos dois truncamentos</li>
+    </ul>
+  </div>
+  <p>Leia o V-trace como um GAE com freios: cada resíduo TD é pesado pela razão \(\pi/\mu\), mas truncada em \(\bar\rho\) e \(\bar c\), para que um ator muito defasado não injete variância sem limite. Com \(\pi = \mu\) e tetos folgados, todos os pesos valem 1 e o alvo vira o retorno de \(n\) passos de sempre. É o avô direto de TIS, IcePop e companhia (interpretação das fontes): <b>importância truncada</b> para um aprendiz que consome dados de atores defasados. Em LLMs, o \(\mu\) é o motor de inferência, e a defasagem é a distância em versões entre os pesos que geraram o rollout e os que estão sendo treinados.</p>
+  <figure class="la-fig" id="fig-async" data-title="A fábrica de experiência: síncrono, Hogwild! e IMPALA">
+    <div class="la-fig-stage" style="height:420px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Linha do tempo de 4 atores e do aprendiz (ou dos parâmetros compartilhados, no A3C). Barras coloridas são rollouts; o cinza hachurado é tempo ocioso; as setas são gradientes (A3C) ou trajetórias (IMPALA) indo para o aprendiz; o número em cada entrega é a defasagem em versões. Aumente a cauda dos comprimentos e compare a ociosidade do modo síncrono com a defasagem dos assíncronos. Durações e comprimentos <b>ilustrativos</b> (simulação com semente fixa).</figcaption>
+  </figure>
+  <p>A figura mostra por que essa engenharia ressuscitou com os LLMs. No modo síncrono, cada rodada espera o rollout mais longo; aumente a cauda e veja as bolhas cinzas crescerem. Com LLMs, a cauda é brutal: respostas de raciocínio vão de centenas a dezenas de milhares de tokens, e agentes podem levar horas. E gerar é caro. Segundo o paper do OpenRLHF, a fase de inferência “frequentemente responde por mais de 90%” do tempo total de RLHF; no Llama 2, gerar com o FSDP do treino ficou ≈20× mais lento, e cada iteração de PPO no 70B levava ≈330 s. Daí os sistemas atuais porem um motor de inferência dedicado no laço. Segundo a documentação do vLLM, Cosmos-RL, ms-swift, NeMo-RL, Open Instruct, OpenRLHF, PipelineRL, Prime-RL, SkyRL, TRL, Unsloth e verl o usam para rollouts; o slime usa SGLang + Megatron e declara ser o framework de RL por trás do GLM-5.3 e antecessores.</p>
+  <p>Desacoplar geração e treino é o IMPALA de novo, e é o <span class="la-term" data-term="rl-assincrono">RL assíncrono</span> que o <a data-ch="pos-treino-mapa" data-sec="s8-ponte-com-o-modulo-1-o-motor-de-inferenc">capítulo 50</a> apresentou na ponte com o Módulo 1; aqui ele ganha a genealogia e a correção. Noukhovitch et al. (2024) geram o lote \(i+1\) no vLLM enquanto treinam no lote \(i\), um treino off-policy de um passo. Com o mesmo desempenho do síncrono, ficou ~25% mais rápido num modelo de 2,8B, ~40% num chatbot LLaMA 3.1 8B e ~70% no Rho 1B em GSM8k. Entre as perdas testadas, o Online DPO foi a mais robusta a dados off-policy, e a robustez cresceu com o tamanho da política. Os sistemas de 2025–2026 controlam a defasagem cada um a seu modo. O AReaL balanceia produção e consumo e chega a 2,77× de speedup sobre o síncrono. O RL agêntico do GLM-5 descarta trajetórias com atraso de versão acima de um limite. O MiMo-V2.6, como você viu no capítulo 50, usa rollouts parciais com defasagem de até 4 passos; o que interessa aqui é o mecanismo: as sequências em voo são interrompidas e retomadas, pagando um novo prefill do KV. O DeepSeek-V4 torna os rollouts preemptíveis com um log por token, porque regenerar do zero seria “matematicamente incorreto”: um viés a favor das respostas curtas, que sobrevivem mais às interrupções.</p>
+  <div class="la-callout analogy"><b class="t">Analogia: a cozinha e a fábrica</b><p>O A3C é uma cozinha com vários cozinheiros mexendo a mesma panela sem esperar a vez; funciona porque cada mexida é pequena. O IMPALA é um restaurante: os cozinheiros preparam pratos e os mandam para um chef que prova e ajusta a receita, e os pratos chegam feitos com a receita de ontem, coisa que o chef desconta (V-trace). No RL de LLMs, os cozinheiros são instâncias de vLLM, o chef é o treinador, e o carimbo de validade no prato é a defasagem.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Região de confiança: o TRPO</h2>
+  <p>O policy gradient diz para onde andar, mas não quanto. E aqui o RL é mais traiçoeiro que o aprendizado supervisionado: um passo grande demais muda a política, a política ruim gera dados ruins, e dados ruins não ensinam o caminho de volta. Pior, distância em parâmetros não é distância em comportamento. Mexer 0,01 num peso pode não mudar nada ou pode inverter a distribuição de um token. O <span class="la-term" data-term="trpo">TRPO</span> (Trust Region Policy Optimization; Schulman et al., 2015) resolve as duas coisas medindo o passo em <b>KL entre políticas</b> e proibindo passos maiores que uma <span class="la-term" data-term="regiao-de-confianca">região de confiança</span>.</p>
+  <p>A teoria parte do <span class="la-term" data-term="lema-diferenca-de-desempenho">lema da diferença de desempenho</span> (Kakade e Langford, 2002), que diz exatamente quanto uma nova política \(\tilde\pi\) ganha sobre a atual \(\pi\):</p>
+  <div class="la-eq">
+    \[ \begin{gathered} \eta(\tilde\pi) = \eta(\pi) + \mathbb E_{\tau\sim\tilde\pi}\Big[\sum_t\gamma^t A_\pi(s_t,a_t)\Big] \\[4pt] L_\pi(\tilde\pi) = \eta(\pi) + \sum_s\rho_\pi(s)\sum_a\tilde\pi(a\mid s)\,A_\pi(s,a) \end{gathered} \]
+    \[ \begin{gathered} \eta(\tilde\pi) \ge L_\pi(\tilde\pi) - C\,D^{\max}_{KL}(\pi,\tilde\pi) \\[4pt] C = \frac{4\epsilon\gamma}{(1-\gamma)^2}, \qquad \epsilon = \max_{s,a}\lvert A_\pi(s,a)\rvert \end{gathered} \]
+    <ul class="la-eq-legend">
+      <li>\(\eta(\pi)\): desempenho (retorno esperado) da política \(\pi\)</li>
+      <li>\(A_\pi\): vantagem calculada com a política <i>atual</i></li>
+      <li>\(L_\pi\): aproximação local, com os estados \(\rho_\pi\) da política atual</li>
+      <li>\(D^{\max}_{KL}\): o maior KL entre as duas políticas em qualquer estado</li>
+      <li>\(C\): o preço da distância; enorme quando \(\gamma\to1\)</li>
+    </ul>
+  </div>
+  <p>O lema tem um problema: a esperança é sobre trajetórias da política <i>nova</i>, que ainda não temos. A aproximação \(L_\pi\) usa os estados da política <i>atual</i> e coincide com \(\eta\) em primeira ordem. É daqui que vem a razão por token da seção anterior: ignorar a mudança na distribuição de estados é seguro <b>enquanto as políticas forem próximas</b>. O Teorema 1 do paper quantifica o “próximas”: maximizar o lado direito da desigualdade a cada passo garante melhoria monotônica (minorização–maximização). Mas \(C\) é enorme, e os passos ficam minúsculos. O TRPO prático troca a penalidade por uma <b>restrição</b> e o máximo por uma média:</p>
+  <div class="la-eq">
+    \[ \begin{gathered} \max_\theta\ \hat{\mathbb E}_t\Big[\frac{\pi_\theta(a_t\mid s_t)}{\pi_{\theta_{\text{old}}}(a_t\mid s_t)}\,\hat A_t\Big] \\[4pt] \text{sujeito a}\quad \hat{\mathbb E}_t\Big[D_{KL}\big(\pi_{\theta_{\text{old}}}(\cdot\mid s_t)\,\big\|\,\pi_\theta(\cdot\mid s_t)\big)\Big] \le \delta \end{gathered} \]
+    <ul class="la-eq-legend">
+      <li>objetivo: a vantagem reponderada pela razão por token (o “substituto”)</li>
+      <li>restrição: KL médio entre a política velha e a nova, estado a estado</li>
+      <li>\(\delta\): raio da região de confiança, 0,01 em todos os experimentos do paper</li>
+    </ul>
+  </div>
+  <p>Vale parar no KL, que apareceu várias vezes neste capítulo como “pedágio” e agora vira régua. A <span class="la-term" data-term="kld">divergência de Kullback–Leibler</span> entre duas distribuições sobre as ações é \(D_{KL}(p\,\|\,q)=\sum_a p(a)\log\frac{p(a)}{q(a)}\ge 0\), zero só quando \(p=q\). Como função de \(\theta\), \(D_{KL}\big(\pi_{\theta_{\text{old}}}\,\|\,\pi_\theta\big)\) tem o seu mínimo, zero, em \(\theta = \theta_{\text{old}}\). Num mínimo o gradiente é zero, então a expansão de Taylor em torno de \(\theta_{\text{old}}\) não tem termo constante nem linear, e o primeiro termo que sobra é o quadrático. A curvatura desse termo, a <span class="la-term" data-term="hessiana">Hessiana</span> do KL em \(\theta_{\text{old}}\), é a <span class="la-term" data-term="matriz-de-fisher">matriz de informação de Fisher</span> \(F\). Ela tem uma segunda forma, que amarra tudo à seção 3:</p>
+  <div class="la-eq">
+    \[ \begin{aligned} F &amp;= \nabla^2_\theta\,\hat{\mathbb E}_s\Big[D_{KL}\big(\pi_{\theta_{\text{old}}}(\cdot\mid s)\,\big\|\,\pi_\theta(\cdot\mid s)\big)\Big]\Big|_{\theta_{\text{old}}} \\ &amp;= \mathbb E_{s,\ a\sim\pi_{\theta_{\text{old}}}}\Big[\nabla_\theta\log\pi_\theta(a\mid s)\,\nabla_\theta\log\pi_\theta(a\mid s)^\top\Big] \end{aligned} \]
+    <ul class="la-eq-legend">
+      <li>\(\nabla^2_\theta\): Hessiana, a matriz das segundas derivadas em relação a \(\theta\)</li>
+      <li>\(\nabla_\theta\log\pi_\theta(a\mid s)\): a mesma <i>função score</i> do truque da log-derivada, o vetor que o policy gradient multiplica pela vantagem</li>
+      <li>produto externo: \(F\) é a covariância da função score; direções em que \(\nabla\log\pi\) varia muito são direções em que a política muda muito</li>
+    </ul>
+  </div>
+  <p>Com isso, o TRPO aproxima o objetivo por uma reta e a restrição por uma parábola de curvatura \(F\):</p>
+  <div class="la-eq">
+    \[ \begin{gathered} D_{KL} \approx \tfrac12(\theta - \theta_{\text{old}})^\top F\,(\theta - \theta_{\text{old}}) \\[4pt] s \approx F^{-1}g, \qquad \beta = \sqrt{\frac{2\delta}{s^\top F s}} \\[4pt] \theta \leftarrow \theta_{\text{old}} + \beta s \ \ (\text{com busca em linha}) \end{gathered} \]
+    <ul class="la-eq-legend">
+      <li>\(g = \nabla_\theta L\): gradiente do objetivo substituto</li>
+      <li>\(F\): Fisher, a curvatura do KL; mede distância em <i>comportamento</i></li>
+      <li>\(s\): direção do <span class="la-term" data-term="gradiente-natural">gradiente natural</span></li>
+      <li>\(\beta\): o maior passo que satisfaz \(\tfrac12(\beta s)^\top F(\beta s) = \delta\) (mais um \(\beta\): o tamanho do passo, na notação do TRPO; neste capítulo a letra já foi o coeficiente de KL, o limiar do IcePop e o peso da entropia do A3C)</li>
+    </ul>
+  </div>
+  <ol class="la-steps">
+    <li><b>Linearizar.</b> Calcular \(g = \nabla_\theta L\) e a aproximação quadrática do KL com \(F\).</li>
+    <li><b>Gradiente natural.</b> A direção é \(s \approx F^{-1}g\) (Amari, 1998; Kakade, 2001). Inverter \(F\) com bilhões de parâmetros é impossível, então resolve-se \(Fs = g\) por <span class="la-term" data-term="gradiente-conjugado">gradiente conjugado</span> (CG), que só precisa de produtos \(v \mapsto Fv\). O produto Fisher-vetor sai analiticamente da Hessiana do KL, sem guardar gradientes por amostra.</li>
+    <li><b>Passo máximo.</b> O maior \(\beta\) que respeita a restrição quadrática.</li>
+    <li><b><span class="la-term" data-term="busca-em-linha">Busca em linha</span>.</b> Encolher \(\beta\) exponencialmente até o objetivo <i>não linear</i> melhorar e o KL <i>real</i> ficar \(\le\delta\). Nas palavras do paper, sem ela “o algoritmo ocasionalmente dá passos grandes que causam degradação catastrófica”.</li>
+  </ol>
+  <p>A diferença para o gradiente natural “puro” (NPG) é sutil e importante. O NPG usa um passo de tamanho fixo; o TRPO <b>impõe</b> a restrição a cada atualização, o que, segundo o paper, melhora significativamente o desempenho em problemas maiores. Siga o exemplo em 2D da figura, com uma Fisher \(2\times2\).</p>
+  <figure class="la-fig" id="fig-trpo" data-title="TRPO em 2D: gradiente natural, CG e busca em linha">
+    <div class="la-fig-stage" style="height:470px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>O plano é o espaço dos deslocamentos \(\Delta\theta\). A elipse menta é a região \(\tfrac12\Delta^\top F\Delta = \delta\); as linhas tracejadas são curvas de nível do objetivo linear \(g^\top\Delta\). A seta lilás é o gradiente comum escalado até a elipse; a rosa, o passo do gradiente natural. O quadro mostra \(F\), \(g\), as iterações do CG e \(\beta\). Nos valores iniciais (\(F_{11} = 2\), \(\delta = 0{,}01\)) os números são os do exemplo das notas de pesquisa; o “KL real” da busca em linha é uma curva <b>ilustrativa</b>.</figcaption>
+  </figure>
+  <p>No exemplo, \(F = \begin{pmatrix}2 &amp; 0{,}5\\ 0{,}5 &amp; 1\end{pmatrix}\), \(g = (1;\ 1)\) e \(\delta = 0{,}01\). A primeira iteração do CG dá \((0{,}5;\ 0{,}5)\); a segunda, \((0{,}2857;\ 0{,}8571)\), que já é a solução exata \(F^{-1}g\), porque o CG converge em no máximo tantos passos quanto a dimensão: cada nova direção de busca é <i>F-conjugada</i> às anteriores (\(p_i^\top F p_j = 0\)), então cada iteração resolve o problema de vez numa direção, e nenhuma desfaz o trabalho das outras (em aritmética exata). Com \(s^\top Fs = 1{,}1429\), \(\beta = \sqrt{2\delta/s^\top Fs} = 0{,}1323\), e o passo é \((0{,}0378;\ 0{,}1134)\), com KL quadrático de exatamente 0,0100. O gradiente comum, escalado para o mesmo KL, daria \((0{,}0707;\ 0{,}0707)\). O natural anda <b>mais</b> na direção de baixa curvatura (na 2ª coordenada, onde a curvatura é a metade, \(F_{22} = 1\) contra \(F_{11} = 2\), mexer muda menos a política) e menos na de alta. Repare também que, sobre a mesma elipse, ele alcança uma curva de nível mais alta do objetivo (0,1512 contra 0,1414): o gradiente natural é justamente a direção que mais sobe por unidade de KL.</p>
+  <div class="la-callout analogy"><b class="t">Analogia: o círculo de giz</b><p>O TRPO desenha um círculo de giz em volta dos pés da política: ela pode pisar em qualquer lugar dentro dele, nunca fora. O círculo não é medido em centímetros de parâmetro, e sim em “quanto o comportamento mudou”. Por isso, no espaço dos parâmetros, ele vira uma elipse esticada nas direções em que mexer muito muda pouco. A busca em linha é testar o chão antes de pisar: se o passo planejado afunda, recua-se pela metade.</p></div>
+  <h3>Por que o TRPO motivou o PPO</h3>
+  <p>O TRPO funciona, mas cada iteração pede CG, produtos Fisher-vetor e uma busca em linha, e é difícil combiná-lo com minibatches, dropout e redes em que política e valor compartilham parâmetros. Para LLMs com bilhões de parâmetros, a segunda ordem é proibitiva (interpretação apoiada no paper do PPO). O PPO (Schulman et al., 2017) se apresenta como um método que “emula a melhoria monotônica do TRPO” com otimização de primeira ordem: em vez de uma restrição de KL, um <b>clipping</b> da razão \(\rho_t\) em \([1-\varepsilon, 1+\varepsilon]\). A ablação do paper (MuJoCo, 7 ambientes, escore normalizado) mostra que alguma região de confiança é indispensável: sem clipping nem penalidade, −0,39; com clipping \(\varepsilon = 0{,}2\), 0,82; com penalidade de KL adaptativa, no máximo 0,74; com KL fixa, no máximo 0,72. E, depois de uma iteração no Hopper, o KL da política atualizada fica em ~0,02, na mesma ordem de grandeza do \(\delta\) do TRPO.</p>
+</section>
+
+<section class="la-sec">
+  <h2>O que sobrevive em 2026 e a ponte para o PPO</h2>
+  <p>Em 2026, ninguém treina um LLM de fronteira com A3C ou TRPO literais, e as bibliotecas refletem isso: OpenRLHF e verl trazem PPO, REINFORCE, RLOO e GRPO prontos, e o TRL traz RLOO e GRPO (o <code>PPOTrainer</code> saiu do TRL na v1.13), mas nenhuma delas tem trainer de A3C ou TRPO (inferência das notas de pesquisa sobre as bibliotecas verificadas). Mas as ideias deste capítulo estão em toda parte, recombinadas em três alavancas. O que muda de um algoritmo moderno para outro é (a) o <b>estimador de vantagem</b> (crítico, grupo, lote global), (b) a <b>forma da região de confiança</b> (clip simétrico ou assimétrico, por token ou por sequência, duro ou suave, máscara por KL) e (c) a <b>correção off-policy</b> (do V-trace ao TIS e ao IcePop).</p>
+  <table>
+    <thead><tr><th>Ideia clássica</th><th>Onde reaparece (2024–2026)</th><th>Alavanca</th></tr></thead>
+    <tbody>
+      <tr><td>Baseline, RLOO</td><td>GRPO usa a média do grupo de respostas ao mesmo prompt; REINFORCE++ normaliza pelo lote global</td><td>vantagem</td></tr>
+      <tr><td>Crítico + GAE</td><td>VC-PPO e VAPO (λ desacoplado e adaptativo); SAO, com crítico, no RL agêntico do GLM-5.2</td><td>vantagem</td></tr>
+      <tr><td>Bônus de entropia (A3C)</td><td>controle de entropia: o MiMo ajusta as faixas de clip pela entropia; Clip-Cov e KL-Cov</td><td>exploração</td></tr>
+      <tr><td>Restrição de KL (TRPO)</td><td>clip do PPO/GRPO; clip-higher do DAPO; GSPO clipa a sequência inteira; portão suave do SAPO (Qwen); Off-Policy Sequence Masking do DeepSeek-V3.2, literalmente um limiar de KL por sequência</td><td>região de confiança</td></tr>
+      <tr><td>Atores assíncronos (A3C, IMPALA)</td><td>AReaL, slime, PipelineRL, MiMo: geração e treino desacoplados, com defasagem controlada</td><td>off-policy</td></tr>
+      <tr><td>V-trace (IS truncado)</td><td>TIS; IcePop (GLM-5); IS direto de dois lados (GLM-5, SAO); R3 e Keep Routing para MoE</td><td>off-policy</td></tr>
+    </tbody>
+  </table>
+  <p>A figura organiza essa genealogia em três trilhas. Escolha uma alavanca para ver o fio que liga o algoritmo de 1992 ou de 2015 ao que os laboratórios publicaram nos últimos meses.</p>
+  <figure class="la-fig" id="fig-linhagem" data-title="Três alavancas, uma genealogia">
+    <div class="la-fig-stage" style="height:420px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Cada trilha é uma alavanca: o estimador de vantagem (menta), a forma da região de confiança (lilás) e a correção off-policy dos sistemas assíncronos (rosa). As setas são heranças de ideia, não citações formais; as datas são as dos papers e relatórios citados nas fontes. O PPO fica no cruzamento das três, que é onde o próximo capítulo começa.</figcaption>
+  </figure>
+  <h3>Guia prático: o que vigiar num laço de RL</h3>
+  <ol class="la-steps">
+    <li><b>Desconto e λ.</b> Em LLMs, \(\gamma = 1\). Comece com \(\lambda = 0{,}95\), ou \(\lambda = 1\), que foi o melhor no estudo do RLOO; em respostas longas, use \(\lambda_{\text{crítico}} = 1\) ou um λ adaptativo ao comprimento.</li>
+    <li><b>Sempre um baseline.</b> Sem crítico, RLOO ou média de grupo; com crítico, inicialize-o a partir do RM e considere pré-treiná-lo antes de mexer na política.</li>
+    <li><b>Razão média igual a 1 na primeira época.</b> Se \(\rho_t\) já se afasta de 1 no primeiro minibatch, há dropout ligado ou não determinismo no treinador (sintoma descrito nas fontes). Se você usa os log-probs do amostrador como \(\pi_{\text{old}}\), o desvio também mede o descompasso amostrador–treinador; se os recalcula no treinador, como recomenda a seção 6, a razão não o enxerga, e é preciso medi-lo à parte (item 4).</li>
+    <li><b>Medir a KL amostrador–treinador.</b> Por token, como o <code>logprob_capture.py</code> da receita GLM faz entre dois servidores. Com rollouts quantizados ou de MoE, aplique TIS ou IcePop e reproduza o roteamento (R3, Keep Routing).</li>
+    <li><b>Limitar a defasagem.</b> No RL assíncrono, fixe quantas versões de atraso aceitar e corrija o resto por importância truncada.</li>
+    <li><b>Olhar o espaço de ações, não só a recompensa.</b> Perplexidade, comprimento das respostas e KL até o SFT são, segundo o “Secrets of RLHF”, mais informativos sobre a estabilidade do que a recompensa e as perdas.</li>
+  </ol>
+  <p>Agora você tem todas as peças do PPO: uma vantagem estimada por GAE com um crítico, uma razão por token que funciona como importance sampling, e uma região de confiança barata no lugar da do TRPO. O <a data-ch="ppo-rlhf">próximo capítulo</a> junta tudo no pipeline RLHF do InstructGPT: o objetivo clipado, a recompensa com KL até a referência, os quatro modelos na memória e o motor de inferência dentro do laço.</p>
+</section>

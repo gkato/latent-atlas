@@ -1,0 +1,426 @@
+<p class="la-lead">In 2022, human evaluators preferred the outputs of a 1.3-billion-parameter model over those of the 175-billion-parameter GPT-3, a model 100× larger. The difference was not size but three post-training stages that became known as <span class="la-term" data-term="rlhf">RLHF</span>: SFT, a reward model and, at the end, a reinforcement learning algorithm called <span class="la-term" data-term="ppo">PPO</span>. And it was cheap: PPO-ptx for the 175B model cost 60 petaflop/s-days, versus 3,640 for GPT-3's pretraining. This chapter opens PPO up from the inside (the probability ratio, the clip, the critic, the entropy, the epochs) and then builds the system around it: the reward held in check by a KL leash, the four models in memory, the inference engine generating responses inside the training loop and the tricks that separate a stable run from a collapse. By the end, you will be able to read and write the config of a PPO-RLHF run, estimate whether it fits on your machine and diagnose what went wrong when the reward curve lies.</p>
+
+<section class="la-sec">
+  <h2>Why PPO exists: reuse the batch without falling off the cliff</h2>
+  <p>Start with what you already have from <a data-ch="rl-fundamentos">chapter 54</a>. An LLM generating a response is a <span class="la-term" data-term="politica">policy</span> \(\pi_\theta\). The state is the prompt plus the prefix generated so far, the action is the next token, and the reward arrives almost entirely at the end. The policy gradient says how to move the weights to increase the expected reward:</p>
+  <div class="la-eq">
+    \[ \begin{gathered} \nabla_\theta J = \mathbb E_{x\sim\mathcal D,\ y\sim\pi_\theta(\cdot\mid x)}\Big[\sum_{t=1}^{T}\hat A_t \\ \cdot\,\nabla_\theta\log\pi_\theta(y_t\mid x, y_{&lt;t})\Big] \end{gathered} \]
+    <ul class="la-eq-legend">
+      <li>\(x\): prompt drawn from the set \(\mathcal D\); \(y = (y_1,\dots,y_T)\): response sampled from the policy <i>itself</i></li>
+      <li>\(\hat A_t\): estimated <span class="la-term" data-term="vantagem">advantage</span> of token \(t\), that is, how much better (positive) or worse (negative) than expected it was at that point</li>
+      <li>\(\nabla_\theta\log\pi_\theta(y_t\mid\cdot)\): the same <span class="la-term" data-term="logprob">log-probability</span> gradient as in SFT (<a data-ch="sft">chapter 52</a>)</li>
+    </ul>
+  </div>
+  <p>A useful reading (it is an intuition, not a theorem): the formula is SFT with weights. Tokens with positive advantage become more likely; tokens with negative advantage, less likely. The detail that will change everything sits in the subscript of the expectation: \(y\sim\pi_\theta\). The gradient only holds for responses sampled from the <i>current</i> policy. And generating responses is the expensive part of RLHF (the section on the inference engine measures how expensive). Throwing away a batch of 512 responses after a single gradient step would be an enormous waste. We want to take several steps with the same batch.</p>
+  <p>The catch is that, after the first step, the weights are no longer the ones that generated the batch. Call \(\pi_{\theta_{\text{old}}}\) the policy that generated the responses. To use samples from one distribution as if they came from another, there is <span class="la-term" data-term="amostragem-por-importancia">importance sampling</span>, and the weight of each token is the <span class="la-term" data-term="razao-de-probabilidades">probability ratio</span>:</p>
+  <div class="la-eq">
+    \[ \begin{aligned} \rho_t(\theta) &amp;= \frac{\pi_\theta(a_t\mid s_t)}{\pi_{\theta_{\text{old}}}(a_t\mid s_t)} \\ L^{CPI}(\theta) &amp;= \hat{\mathbb E}_t\big[\rho_t(\theta)\,\hat A_t\big] \end{aligned} \]
+    <ul class="la-eq-legend">
+      <li>\(s_t = (x, y_{&lt;t})\) and \(a_t = y_t\): state and action of token \(t\)</li>
+      <li>\(\rho_t\): how much the current policy likes the sampled token, relative to the policy that sampled it; it is exactly 1 before the first step</li>
+      <li>\(L^{CPI}\): the <span class="la-term" data-term="objetivo-substituto">surrogate objective</span> inherited from TRPO (<i>conservative policy iteration</i>); \(\hat{\mathbb E}_t\) is the average over the tokens of the batch</li>
+    </ul>
+  </div>
+  <p>At \(\theta = \theta_{\text{old}}\), the gradient of \(L^{CPI}\) is exactly the policy gradient, because \(\nabla\rho = \rho\,\nabla\log\pi\) and \(\rho = 1\). Far from there, the approximation rots. The advantages were measured under \(\pi_{\theta_{\text{old}}}\), and the per-token ratio ignores that the new policy would also visit <i>other prefixes</i>. The PPO paper sums it up: without a constraint, maximizing \(L^{CPI}\) leads to excessively large updates. And why is the ratio per token rather than per sequence? Because the product of hundreds of ratios explodes. With four tokens whose ratios are 1.20, 0.96, 5.00 and 0.99, the product is already 5.70, dominated by the single rare token on which the two policies disagree (illustrative example).</p>
+  <p><span class="la-term" data-term="trpo">TRPO</span> (Schulman and colleagues, 2015) solved this with a <span class="la-term" data-term="regiao-de-confianca">trust region</span>: maximize \(L^{CPI}\) subject to \(\hat{\mathbb E}_t[D_{KL}(\pi_{\theta_{\text{old}}}\,\|\,\pi_\theta)]\le\delta\), with \(\delta = 0.01\) in every experiment in the paper. It works, but each update requires products with the Fisher matrix, a conjugate gradient and a line search, over billions of parameters, and the method combines poorly with minibatches, dropout and shared parameters. PPO (Schulman, Wolski, Dhariwal, Radford and Klimov, 2017) wants the same effect with an ordinary first-order <span class="la-term" data-term="otimizador">optimizer</span>, such as <span class="la-term" data-term="adam">Adam</span>. The figure shows the problem and the solution on a three-token policy.</p>
+  <figure class="la-fig" id="fig-penhasco" data-title="Probability mass under repeated steps">
+    <div class="la-fig-stage" style="height:420px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>The same toy policy from chapter 54 (tokens “20”, “14” and “Let”), now taking several steps with the same batch. The parameters are the <span class="la-term" data-term="logits">logits</span> themselves, \(z = (2.0,\ 1.0,\ 0.1)\), so \(\pi_{\text{old}} = (0.659,\ 0.242,\ 0.099)\). The “14” was drawn and received advantage \(\hat A = \pm 1.5\). Each step is one gradient ascent step on the surrogate objective over the <b>same</b> batch, as PPO's epochs and minibatches do. On the left, the logit vector and the bars of \(\pi\) (dashed outline = \(\pi_{\text{old}}\)). On the right, the ratio \(\rho\) of the sampled token at each step, with the band \([1-\varepsilon,\,1+\varepsilon]\) in green and, dashed, what the other mode would do with the same batch. <b>Illustrative</b> numbers. With \(\eta = 1\) (drag the slider all the way), the first step takes \(\rho\) to 2.87, exactly the example from chapter 54 (\(\pi(\text{14})\) from 0.242 to 0.696); with the clip on, the following steps are blocked.</figcaption>
+  </figure>
+  <p>Run both modes with the positive advantage. Without the clip, ten steps take the ratio of the sampled token from 1 to nearly 2 (with the default step) and mass keeps migrating to it, all based on a single batch and a single noisy advantage estimate. With the clip, the steps continue until \(\rho\) goes past \(1+\varepsilon\); from then on, that token's gradient is zero and the bars freeze. Notice that they freeze slightly <i>above</i> \(1+\varepsilon\): the last step started inside the band and ended outside it. The clip is not a wall, it is an incentive cut. In a real network the weights are still shared, and the gradient from other tokens keeps moving the probability of a token that is already clipped. That is why, in practice, people still monitor the KL between the policies and take few steps per batch.</p>
+  <div class="la-callout analogy"><b class="t">Analogy: the speed limiter</b><p>\(L^{CPI}\) is a car without a speed limiter: the gradient says “accelerate”, and it accelerates until it leaves the road, which here is the region where the batch still describes the policy. TRPO is an engineer who, at every curve, computes the maximum safe speed by solving a linear system (the conjugate gradient) and then also tests the brakes (the line search). PPO is the electronic limiter: once past \(1+\varepsilon\), the pedal simply stops responding. It is crude, but it is cheap and it works with any optimizer.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>The clipped objective, case by case</h2>
+  <p>Here is the objective that gave the algorithm its name (eq. 7 of the PPO paper):</p>
+  <div class="la-eq">
+    \[ \begin{aligned} &amp;L^{CLIP}(\theta) = \hat{\mathbb E}_t\Big[\min\big(\rho_t(\theta)\,\hat A_t, \\ &amp;\qquad\operatorname{clip}(\rho_t(\theta),\,1-\varepsilon,\,1+\varepsilon)\,\hat A_t\big)\Big] \end{aligned} \]
+    <ul class="la-eq-legend">
+      <li>\(\operatorname{clip}(\rho, 1-\varepsilon, 1+\varepsilon)\): clamps \(\rho\) inside the interval \([1-\varepsilon,\,1+\varepsilon]\)</li>
+      <li>\(\varepsilon\): clip radius; the paper suggests “say, 0.2”, which is the value used by InstructGPT, Bai and Llama 2</li>
+      <li>\(\min\): picks the smaller of the two terms, which makes the <span class="la-term" data-term="objetivo-clipado">clipped objective</span> a <i>pessimistic</i> lower bound on \(L^{CPI}\); near \(\rho = 1\) the two coincide to first order</li>
+    </ul>
+  </div>
+  <p>The \(\min\) looks like a detail, but it is what decides when the gradient dies. Do a case analysis, looking at the derivative with respect to \(\rho\):</p>
+  <ol class="la-steps">
+    <li><b>Good action (\(\hat A &gt; 0\)), ratio rising.</b> The objective grows with \(\rho\) up to \(1+\varepsilon\) and then goes flat. There is no incentive to make the good action even more likely <i>in this batch</i>.</li>
+    <li><b>Good action, ratio falling below \(1-\varepsilon\).</b> The unclipped term is the smaller one, so the gradient keeps going: PPO corrects a good action that became unlikely.</li>
+    <li><b>Bad action (\(\hat A &lt; 0\)), ratio falling.</b> Below \(1-\varepsilon\), flat: the bad action has already been demoted enough.</li>
+    <li><b>Bad action, ratio rising above \(1+\varepsilon\).</b> The \(\min\) picks the unclipped term and the penalty keeps going: the bad action became <i>more</i> likely, and PPO does not let that slide.</li>
+  </ol>
+  <p>The rule, in the authors' words: the change in the ratio is ignored only when it would improve the objective, and it is included when it makes the objective worse. The table does the math with \(\varepsilon = 0.2\) for a good action (\(\hat A = +2\)) and a bad one (\(\hat A = -1\)).</p>
+  <table>
+    <thead><tr><th>\(\rho\)</th><th>\(\hat A=+2\): \(L\)</th><th>\(\partial L/\partial\rho\)</th><th>\(\hat A=-1\): \(L\)</th><th>\(\partial L/\partial\rho\)</th></tr></thead>
+    <tbody>
+      <tr><td>0.7</td><td>1.40</td><td>2</td><td>−0.80</td><td><b>0</b></td></tr>
+      <tr><td>0.8</td><td>1.60</td><td>2</td><td>−0.80</td><td>−1</td></tr>
+      <tr><td>1.0</td><td>2.00</td><td>2</td><td>−1.00</td><td>−1</td></tr>
+      <tr><td>1.2</td><td>2.40</td><td>2</td><td>−1.20</td><td>−1</td></tr>
+      <tr><td>1.3</td><td>2.40</td><td><b>0</b></td><td>−1.30</td><td>−1</td></tr>
+    </tbody>
+  </table>
+  <figure class="la-fig" id="fig-clip" data-title="The PPO clip function">
+    <div class="la-fig-stage" style="height:400px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>The objective of a single token as a function of the ratio \(\rho\). Dashed: \(\rho\hat A\) (no clip). Dotted: \(\operatorname{clip}(\rho)\hat A\). Thick line: the \(\min\) of the two, which is \(L^{CLIP}\). The hatched zones are where the gradient is zero. Drag on the chart (or use the \(\rho\) control) and turn on “gradient ascent”: the ball climbs the slope and stops when it enters a flat zone. With \(\hat A = +2\) and \(\hat A = -1\), the values match the table above, which reproduces Fig. 1 of the paper.</figcaption>
+  </figure>
+  <p>Play with the sign of the advantage. With \(\hat A &gt; 0\), the ball climbs to \(1+\varepsilon\) and stops. With \(\hat A &lt; 0\), it descends to \(1-\varepsilon\) and stops. Now put the ball to the right of \(1+\varepsilon\) with a negative advantage: it gets pushed back, because there the \(\min\) picked the unclipped term. That is the asymmetry of item 4 in the list.</p>
+  <p>Does it work? On MuJoCo, the paper compares variants on a normalized score (7 environments, 21 runs per variant). Without clip or penalty, the score is −0.39: the plain surrogate diverges. After one iteration on Hopper, the KL of the updated policy sits around 0.02, the point where \(L^{CLIP}\) peaks (Fig. 2 of the paper).</p>
+  <table>
+    <thead><tr><th>Variant (MuJoCo)</th><th>Normalized score</th></tr></thead>
+    <tbody>
+      <tr><td>no clip or penalty</td><td>−0.39</td></tr>
+      <tr><td>clip \(\varepsilon\) = 0.1 / <b>0.2</b> / 0.3</td><td>0.76 / <b>0.82</b> / 0.70</td></tr>
+      <tr><td>adaptive KL, \(d_{\text{targ}}\) = 0.003 / 0.01 / 0.03</td><td>0.68 / 0.74 / 0.71</td></tr>
+      <tr><td>fixed KL, \(\beta\) = 0.3 / 1 / 3 / 10</td><td>0.62 / 0.71 / 0.72 / 0.69</td></tr>
+    </tbody>
+  </table>
+  <p>The KL rows are the alternative the paper itself tested, \(L^{KLPEN} = \hat{\mathbb E}_t[\rho_t\hat A_t - \beta\,D_{KL}(\pi_{\theta_{\text{old}}}\|\pi_\theta)]\). After each update, \(d = \hat{\mathbb E}_t[D_{KL}]\) is measured: if \(d &lt; d_{\text{targ}}/1.5\), \(\beta\) is halved; if \(d &gt; 1.5\,d_{\text{targ}}\), \(\beta\) doubles. It did worse than the clip on these benchmarks, and the clip became the standard.</p>
+  <div class="la-callout warn"><b class="t">Two KLs that are not the same</b><p>Two KL divergences with different roles show up in this chapter. PPO's, \(D_{KL}(\pi_{\theta_{\text{old}}}\|\pi_\theta)\), measures how far the policy moved <b>within one iteration</b>; it is the trust region, and it amounts to hundredths of a nat (about 0.02 on Hopper). RLHF's, \(D_{KL}(\pi_\theta\|\pi_{\text{ref}})\), measures how far the policy drifted from the <b>SFT model</b> over the whole training run; it is the leash, and it reaches several nats (14 to 18 nats in Stiennon's final models; 19 in one of the runs of the \(\beta\) sweep). Mixing the two up is a common mistake when reading configs: <code>clip_range</code> and <code>kl_coef</code> control different things.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>The full loss: critic, entropy, epochs and minibatches</h2>
+  <p>The clip takes care of the policy. But PPO is an <span class="la-term" data-term="ator-critico">actor-critic</span> method: it needs a <span class="la-term" data-term="critico">critic</span> \(V\) to estimate the advantages. The paper combines everything into a single objective (eq. 9):</p>
+  <div class="la-eq">
+    \[ \begin{aligned} &amp;L^{CLIP+VF+S}_t(\theta) = \hat{\mathbb E}_t\Big[L^{CLIP}_t(\theta) \\ &amp;\qquad - c_1\,L^{VF}_t(\theta) + c_2\,S[\pi_\theta](s_t)\Big] \\ &amp;L^{VF}_t = \big(V_\theta(s_t) - V^{\text{targ}}_t\big)^2 \end{aligned} \]
+    <ul class="la-eq-legend">
+      <li>\(L^{VF}\): value loss, a regression of the critic toward the target \(V^{\text{targ}}\)</li>
+      <li>\(c_1\): weight of the value loss, needed when policy and critic share parameters (on Atari, \(c_1 = 1\))</li>
+      <li>\(S[\pi_\theta](s_t) = -\sum_a \pi_\theta(a\mid s_t)\log\pi_\theta(a\mid s_t)\): the policy's <span class="la-term" data-term="entropia">entropy</span>, added as an <span class="la-term" data-term="bonus-de-entropia">entropy bonus</span> with weight \(c_2\) (0.01 on Atari) to keep exploration going</li>
+    </ul>
+  </div>
+  <h3>The critic of an LLM</h3>
+  <p>In RLHF the critic is a whole LM with a scalar head that outputs a value <b>at every position</b>: \(V(s_t)\) answers “what final score do I expect if I keep sampling from this prefix?”. That is different from the reward model, which is only read at the final token. Stiennon and colleagues (2020) used a Transformer with parameters “completely separate” from the policy, because this keeps the value-function updates from partially destroying the pretrained policy early in training. And they initialized the critic with the RM weights, a practice InstructGPT repeated. With separate parameters, \(c_1\) loses its role of arbitrating shared weights. When the two networks live in the same optimizer (as in the N+ reproduction, \(c_1 = 0.1\)), it only rescales the critic's gradient. With Adam, which normalizes each parameter, that matters little, except through the global norm clip, which is shared by both.</p>
+  <p>The critic's target comes from the <span class="la-term" data-term="gae">GAE</span> you saw in <a data-ch="rl-fundamentos">chapter 54</a>: \(\hat A_t = \sum_l(\gamma\lambda)^l\delta_{t+l}\), with residual \(\delta_t = r_t + \gamma V(s_{t+1}) - V(s_t)\), and target \(\hat R_t = \hat A_t + V_{\text{old}}(s_t)\), which is the λ-return. In RLHF almost everyone uses \(\gamma = 1\): Stiennon and the “N+ implementation details” reproduction (Huang and colleagues, 2024) use \(\lambda = 0.95\); InstructGPT only says it used no discount. Long responses come at a price. With the reward only at the last token, its direct contribution to \(\hat A_t\) is weighted by \(\lambda^{T-t}\): with \(\lambda = 0.95\), \(0.95^{50}\approx 0.077\) and \(0.95^{500}\approx 7\times 10^{-12}\). In reasoning chains of thousands of tokens, the first tokens depend almost entirely on the critic's guess. VC-PPO (2025) attacked exactly this, according to the paper's abstract: it pretrains the critic and decouples GAE (\(\lambda = 1\) in the critic, \(0.95\) in the actor). VAPO, also according to its abstract, took Qwen 32B base to 60.4 on AIME 2024 in 5,000 steps with PPO and a critic.</p>
+  <h3>Value clipping</h3>
+  <p>Just like the policy, the critic can also take too big a jump on a single batch. The implementation detail inherited from OpenAI Baselines, and adopted in RLHF, is to clip the value:</p>
+  <div class="la-eq">
+    \[ \begin{aligned} V^{\text{clip}}_t &amp;= V_{\text{old}} + \operatorname{clip}\big(V_\psi - V_{\text{old}},\,-\hat\varepsilon,\,\hat\varepsilon\big) \\ L^{VF,\text{clip}}_t &amp;= \max\Big(\big(V_\psi - \hat R_t\big)^2,\ \big(V^{\text{clip}}_t - \hat R_t\big)^2\Big) \end{aligned} \]
+    <ul class="la-eq-legend">
+      <li>\(V_\psi\): current critic; \(V_{\text{old}}\): the value it predicted when the batch was generated (both evaluated at \(s_t\))</li>
+      <li>\(V^{\text{clip}}_t\): the new prediction clamped to the band \(V_{\text{old}}\pm\hat\varepsilon\)</li>
+      <li>\(\hat R_t\): target (λ-return); \(\hat\varepsilon\): radius of the <span class="la-term" data-term="clipping-do-valor">value clipping</span> (0.2 in N+)</li>
+      <li>\(\max\): the pessimistic version of a loss (for the policy, PPO took the \(\min\) of an objective to be maximized)</li>
+    </ul>
+  </div>
+  <p>The logic mirrors \(L^{CLIP}\). If the new value has already left the band \(V_{\text{old}}\pm\hat\varepsilon\) <i>in the direction that reduces the error</i>, the clipped term, now constant, becomes the larger one, the \(\max\) picks it and the gradient goes to zero. If it left in the wrong direction, the unclipped term dominates and pulls it back. The figure shows three cases (illustrative example, exact math).</p>
+  <figure class="la-fig" id="fig-valor" data-title="Value loss clipping">
+    <div class="la-fig-stage" style="height:380px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Horizontal axis: the critic's prediction \(V\) for one token. Dashed parabola: \((V-\hat R)^2\). Dotted curve: the clipped term, flat outside the band \(V_{\text{old}}\pm\hat\varepsilon\) (green band). Thick line: the \(\max\), which is the loss actually used; hatched where it picks the clipped term and the gradient is zero. The ball is the critic over the epochs: it starts at \(V_{\text{old}} = 1.0\) and descends the gradient; with the target far away, it stops at the edge of the band. The diamond is the \(V_{\text{new}}\) of each case (illustrative example, exact math, \(\hat\varepsilon = 0.2\)): \(V\) = 1.6 with target 1.1 (loss 0.25, pulls back); \(V\) = 0.7 with target 1.1 (loss 0.16, pulls back); \(V\) = 1.3 with target 2.0 (loss 0.64, <b>zero</b> gradient: it already moved +0.3 in the right direction).</figcaption>
+  </figure>
+  <h3>Entropy: the bonus RLHF does without</h3>
+  <p>In A3C (Mnih and colleagues, 2016), the entropy bonus with weight 0.01 discouraged premature convergence to deterministic policies. In LLM RLHF it is almost always switched off: Bai and colleagues (2022) use no entropy bonus, and the KL penalty to the reference model already plays that role, as the section on the KL leash shows with a two-line identity.</p>
+  <h3>Epochs and minibatches</h3>
+  <p>The paper's algorithm is simple: at each iteration, \(N\) actors collect \(T\) steps with \(\pi_{\theta_{\text{old}}}\); the advantages are computed; the surrogate is optimized for <b>\(K\) epochs</b> on minibatches of size \(M\le NT\) with Adam; and \(\theta_{\text{old}}\leftarrow\theta\). On MuJoCo, \(K = 10\) epochs, a minibatch of 64 and a horizon of 2,048; on Atari, \(K = 3\). In LLMs the numbers drop: InstructGPT uses a batch of 512 and a minibatch of 64 (8 minibatches) with <b>1 epoch</b>; Stiennon and N+ use 4 epochs; Bai tries 1, 2 and 4 and observes that a larger \(K\) typically gives more stable results; Llama 2 takes one gradient step per minibatch. Interpretation: each epoch pushes the policy further from the one that generated the batch, and in a model with billions of parameters a few steps already move the distribution a lot.</p>
+</section>
+
+<section class="la-sec">
+  <h2>The RLHF pipeline: SFT → reward model → PPO</h2>
+  <p>PPO is only the third piece. The pipeline around it was assembled over five years, paper by paper:</p>
+  <div class="la-cards">
+    <div class="la-card"><span class="ic">🦿</span><h4>Christiano et al. 2017</h4><p>RL from human comparisons of 1–2 s clips, on Atari (A2C) and MuJoCo (TRPO), with the environment reward hidden. With 900 queries, in under an hour, Hopper learned to do a backflip.</p></div>
+    <div class="la-card"><span class="ic">✍️</span><h4>Ziegler et al. 2019</h4><p>The first RLHF on an LM (GPT-2 774M). Brought the KL-shaped reward to LMs and introduced the adaptive \(\beta\) controller. The summarizers turned into “smart copiers” that copied whole sentences from the text.</p></div>
+    <div class="la-card"><span class="ic">📰</span><h4>Stiennon et al. 2020</h4><p>The canonical SFT → RM → PPO pipeline on summarization. \(\beta = 0.05\), a separate critic initialized from the RM, 1M episodes, about 320 GPU-days for the RL of the 6.7B.</p></div>
+    <div class="la-card"><span class="ic">🧭</span><h4>InstructGPT 2022</h4><p>The same pipeline applied to general instructions, with <span class="la-term" data-term="ppo-ptx">PPO-ptx</span> to avoid losing capabilities. It became the industry standard.</p></div>
+    <div class="la-card"><span class="ic">🤝</span><h4>Bai et al. 2022</h4><p>Helpfulness and harmlessness, online RLHF with RMs and policies updated every week, \(\lambda_{KL} = 0.001\), and a reward that grows linearly with \(\sqrt{\text{KL}}\).</p></div>
+    <div class="la-card"><span class="ic">🦙</span><h4>Llama 2 2023</h4><p>Two RMs (helpfulness and safety), rejection sampling and, in the later versions, PPO on top of the rejection sampling checkpoint, a reward transformed by <code>whiten(logit(·))</code>, about 330 s per PPO iteration on the 70B.</p></div>
+  </div>
+  <p><span class="la-term" data-term="instructgpt">InstructGPT</span> (Ouyang and colleagues, 2022) is the reference case because the paper publishes almost everything. There are three datasets, one per stage:</p>
+  <table>
+    <thead><tr><th>Stage</th><th>Train</th><th>Validation</th><th>What it contains</th></tr></thead>
+    <tbody>
+      <tr><td>SFT</td><td>12,725 prompts (11,295 from labelers + 1,430 from customers)</td><td>1,653</td><td>demonstrations written by labelers</td></tr>
+      <tr><td>RM</td><td>33,207 prompts (6,623 + 26,584)</td><td>17,887</td><td>rankings of \(K = 4\) to \(9\) responses</td></tr>
+      <tr><td>PPO</td><td>31,144 prompts (API only)</td><td>16,185</td><td>prompts with no human label</td></tr>
+    </tbody>
+  </table>
+  <p>Follow the assembly line in the figure. Notice that the PPO stage uses <i>no</i> new human labels: all of the human judgment has already been compressed into the <span class="la-term" data-term="modelo-de-recompensa">reward model</span> (<a data-ch="preferencias-reward-models">chapter 53</a>).</p>
+  <figure class="la-fig wide" id="fig-pipeline" data-title="The InstructGPT assembly line">
+    <div class="la-fig-stage" style="height:400px"><canvas></canvas></div>
+    <figcaption>Three stations: SFT on demonstrations, an RM trained on pairs taken from the rankings, PPO against the RM with the KL to the SFT. Then PPO-ptx and the result. Counts and hyperparameters from the InstructGPT paper (Tab. 6 and App. C). Use the steps or leave it on autoplay.</figcaption>
+  </figure>
+  <p>InstructGPT's PPO hyperparameters (App. C.4) became a starting point for a lot of people:</p>
+  <table class="la-params">
+    <thead><tr><th>Parameter</th><th>Value</th><th>What it does</th><th>Why it matters</th></tr></thead>
+    <tbody>
+      <tr><td>\(\beta\) (KL to the SFT)</td><td>0.02</td><td>weight of the per-token penalty</td><td>in the ablations, the optimum was between 0.01 and 0.02; 0 and 2 were bad</td></tr>
+      <tr><td>episodes</td><td>256k (~31k unique prompts)</td><td>responses generated and scored</td><td>512k made DROP and SQuADv2 fall below GPT-3</td></tr>
+      <tr><td>batch / minibatch</td><td>512 / 64</td><td>8 minibatches per batch, 1 epoch</td><td>512 was the best among 64 to 1,024 in human evaluation</td></tr>
+      <tr><td>clip \(\varepsilon\)</td><td>0.2</td><td>radius of \(L^{CLIP}\)</td><td>the value from the PPO paper</td></tr>
+      <tr><td>GAE</td><td>no discount</td><td>\(\gamma = 1\)</td><td>the whole response is a short episode</td></tr>
+      <tr><td>sampling temperature</td><td>1</td><td>the policy samples without distortion</td><td>the temperature is part of the policy</td></tr>
+      <tr><td>RM and critic</td><td>6B for every policy</td><td>critic initialized from the RM</td><td>a 6B critic serves a 175B policy</td></tr>
+      <tr><td>weight EMA</td><td>decay 0.992</td><td>moving average of the policy weights</td><td>smooths out noise between iterations (interpretation)</td></tr>
+      <tr><td>precision</td><td>fp16 + fp32 masters</td><td>weights and activations in fp16</td><td>the memory accounting in the hands-on section</td></tr>
+    </tbody>
+  </table>
+  <p>One iteration has 512 episodes, so 256k episodes are 500 iterations (calculation). The SFT that serves as the policy's starting point is also special: 2 epochs with 10% pretraining data mixed in (out of 0%, 10% and 50%, only 10% stood out). And the main SFT was trained for 16 epochs, with the checkpoint chosen by the <b>RM score</b> on validation: the validation loss overfits after 1 epoch, but more epochs improve the RM score and human preference.</p>
+</section>
+
+<section class="la-sec">
+  <h2>The KL leash: shaped reward, adaptive control and PPO-ptx</h2>
+  <p>If PPO maximized only the RM score, it would find the responses that <i>fool</i> the RM: the <span class="la-term" data-term="reward-hacking">reward hacking</span> from <a data-ch="preferencias-reward-models">chapter 53</a>. The classic defense is to tie the policy to the SFT model with a <span class="la-term" data-term="penalidade-kl">KL penalty</span> built into the reward itself:</p>
+  <div class="la-eq">
+    \[ \begin{aligned} R(x,y) &amp;= r_\phi(x,y) - \beta\log\frac{\pi_\theta(y\mid x)}{\pi_{\text{ref}}(y\mid x)} \\ \mathbb E_{y\sim\pi_\theta}[R] &amp;= \mathbb E[r_\phi] - \beta\,D_{KL}\big(\pi_\theta\,\|\,\pi_{\text{ref}}\big) \end{aligned} \]
+    <ul class="la-eq-legend">
+      <li>\(r_\phi\): the RM score, already normalized; \(\pi_{\text{ref}}\): the <span class="la-term" data-term="politica-de-referencia">reference policy</span>, a frozen copy of the SFT</li>
+      <li>\(\beta\): KL coefficient (0.05 in Stiennon, 0.02 in InstructGPT)</li>
+      <li>\(\log\pi(y\mid x) = \sum_t\log\pi(y_t\mid s_t)\); the second line holds because \(\mathbb E_{y\sim\pi}[\log\pi/\pi_{\text{ref}}]\) is the definition of KL, with both distributions conditioned on the same prompt: \(D_{KL}\big(\pi_\theta(\cdot\mid x)\,\|\,\pi_{\text{ref}}(\cdot\mid x)\big)\)</li>
+    </ul>
+  </div>
+  <p>In PPO, this reward is spread across the tokens. The RM only speaks at the last one; every token receives its share of the KL:</p>
+  <div class="la-eq">
+    \[ \begin{aligned} r_t = &amp;-\beta\big(\log\pi_{\theta_{\text{old}}}(y_t\mid s_t) - \log\pi_{\text{ref}}(y_t\mid s_t)\big) \\ &amp;+ \mathbb 1[t = T]\;r_\phi(x,y) \end{aligned} \]
+    <ul class="la-eq-legend">
+      <li>\(\mathbb 1[t=T]\): equals 1 only at the last token (the <span class="la-term" data-term="token-eos">EOS</span>), where the RM score is added</li>
+      <li>with \(\gamma = 1\), \(\sum_t r_t = R(x,y)\); N+ shows a real example: 4.5 at the EOS, and the other numbers are the per-token KL penalty</li>
+    </ul>
+  </div>
+  <p>Why this leash? The sources give three readings. <b>First</b>, it is an entropy bonus in disguise: \(D_{KL}(\pi\|\pi_{\text{ref}}) = -H(\pi) - \mathbb E_\pi[\log\pi_{\text{ref}}]\), so \(-\beta D_{KL} = \beta H(\pi) + \beta\,\mathbb E_\pi[\log\pi_{\text{ref}}]\), and the policy is rewarded for keeping its entropy. That is why RLHF does without \(c_2\). <b>Second</b>, it keeps the RM valid: it stops the policy from producing outputs very different from the ones the RM saw in training. <b>Third</b>, in style tasks it is part of the very definition of the task (Ziegler): coherence and topic come from the SFT. There are counterpoints: Gao and colleagues (2022) found the KL equivalent to early stopping in their setup, and Bai used an almost-zero KL.</p>
+  <h3>The optimal policy: the SFT reweighted by the reward</h3>
+  <p>The KL objective has a closed-form solution. It is the foundation of DPO (<a data-ch="dpo">chapter 57</a>) and the best way to understand what \(\beta\) does:</p>
+  <div class="la-eq">
+    \[ \begin{aligned} \pi^*(y\mid x) &amp;= \frac{1}{Z(x)}\,\pi_{\text{ref}}(y\mid x)\,\exp\big(r(x,y)/\beta\big) \\ Z(x) &amp;= \sum_y \pi_{\text{ref}}(y\mid x)\,e^{r(x,y)/\beta} \end{aligned} \]
+    <ul class="la-eq-legend">
+      <li>\(\pi^*\): the policy that maximizes \(\mathbb E_\pi[r] - \beta D_{KL}(\pi\|\pi_{\text{ref}})\)</li>
+      <li>\(Z(x)\): the normalization constant (the partition function)</li>
+      <li>\(\beta\): the temperature; as \(\beta\to0\) only the reward matters, as \(\beta\to\infty\) the policy stays at \(\pi_{\text{ref}}\)</li>
+    </ul>
+  </div>
+  <div class="la-callout deep"><b class="t">Deep dive: the derivation in two lines</b><p>Rewrite the objective as \(\mathbb E_{y\sim\pi}\big[r - \beta\log\pi + \beta\log\pi_{\text{ref}}\big] = -\beta\,\mathbb E_{y\sim\pi}\big[\log\pi - \log(\pi_{\text{ref}}e^{r/\beta})\big]\). Add and subtract \(\log Z\): the objective becomes \(-\beta\,D_{KL}\big(\pi\,\|\,\tfrac1Z\pi_{\text{ref}}e^{r/\beta}\big) + \beta\log Z\). The second term does not depend on \(\pi\), and the KL is minimal (zero) when the two distributions are equal. Therefore \(\pi^* = \tfrac1Z\pi_{\text{ref}}e^{r/\beta}\). RLHF with KL does not invent new responses: it <b>reweights</b> what the SFT already did, exponentially by the reward.</p></div>
+  <p>The figure shows this reweighting on a prompt with six possible responses. One of them is an “exploit”: the RM gives it the highest score, but its real quality is terrible, and the SFT would almost never write it. Lower \(\beta\) and watch the mass drain toward it.</p>
+  <figure class="la-fig" id="fig-otima" data-title="The optimal policy and the price of loosening the leash">
+    <div class="la-fig-stage" style="height:430px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>On the left, \(\pi_{\text{ref}}\) (outline) and \(\pi^* \propto \pi_{\text{ref}}e^{r/\beta}\) (bars) over six responses, with the RM score \(r\) and a hypothetical “real” quality \(g\). On the right, sweeping \(\beta\): on the horizontal axis, \(\sqrt{D_{KL}(\pi^*\|\pi_{\text{ref}})}\); the lavender curve is the mean RM reward and the mint curve is the mean real quality. The dot marks the current \(\beta\). Pink = the exploit. Amber = the verbose response: the RM likes it (+1.2) more than it is worth (+0.5), the length bias from <a data-ch="preferencias-reward-models">chapter 53</a>; notice that it also gains mass as \(\beta\) drops. All numbers are <b>illustrative</b>; the shape (proxy rising, real quality rising and then falling) is that of the over-optimization measured by Gao and colleagues (2022).</figcaption>
+  </figure>
+  <p>With \(\beta = 1\), the optimal policy still looks like the SFT, and the helpful, correct response is the most likely one. With \(\beta = 0.3\), the exploit already takes 68% of the mass: the RM score climbs to 2.0, but the mean real quality plunges to −0.8. This is the portrait of the <span class="la-term" data-term="superotimizacao">over-optimization</span> (Goodhart) that <a data-ch="preferencias-reward-models">chapter 53</a> measured, now seen as a <i>choice</i> of \(\beta\).</p>
+  <h3>Measuring the KL with samples</h3>
+  <p>The exact sequence KL would require summing over every possible response. Per token, you could sum over the whole vocabulary, but that requires keeping the full logits of \(\pi\) and \(\pi_{\text{ref}}\) (\(B\times T\times 10^5\) numbers per iteration). Standard practice is an estimator that uses only the sampled token. With \(y_t\sim\pi_\theta\) and \(r = \pi_{\text{ref}}(y_t)/\pi_\theta(y_t)\), Schulman's blog (2020) compares three:</p>
+  <div class="la-eq">
+    \[ \begin{aligned} k_1 &amp;= -\log r \\ k_2 &amp;= \tfrac12(\log r)^2 \\ k_3 &amp;= (r-1) - \log r \end{aligned} \]
+    <ul class="la-eq-legend">
+      <li>\(k_1\): unbiased, high variance, <b>can be negative</b>; it is the per-token reward term above</li>
+      <li>\(k_2\): biased, low variance; matches the KL up to second order</li>
+      <li>\(k_3\): unbiased and <b>always ≥ 0</b>; it is what GRPO uses inside the loss (<a data-ch="grpo-rlvr">chapter 56</a>)</li>
+    </ul>
+  </div>
+  <table>
+    <thead><tr><th>\(\log\pi_\theta\)</th><th>\(\log\pi_{\text{ref}}\)</th><th>\(k_1\)</th><th>\(k_2\)</th><th>\(k_3\)</th></tr></thead>
+    <tbody>
+      <tr><td>−1.0</td><td>−1.2</td><td>0.2000</td><td>0.0200</td><td>0.0187</td></tr>
+      <tr><td>−2.0</td><td>−1.0</td><td><b>−1.0000</b></td><td>0.5000</td><td>0.7183</td></tr>
+      <tr><td>−0.1</td><td>−0.1</td><td>0.0000</td><td>0.0000</td><td>0.0000</td></tr>
+      <tr><td>−0.5</td><td>−3.0</td><td>2.5000</td><td>3.1250</td><td>1.5821</td></tr>
+    </tbody>
+  </table>
+  <p>In PPO's reward, a token with a negative \(k_1\) earns a small <i>bonus</i>. On average this cancels out, because the expectation of \(k_1\) is the true KL. Interpretation: putting the KL in the reward (InstructGPT) and putting it in the loss (GRPO) do not give the same gradient. In the reward, it goes through the advantage, the critic and GAE; in the loss, it is differentiated directly. In expectation, both pull toward \(\pi_{\text{ref}}\). And the value of \(\beta\) varies a lot from paper to paper:</p>
+  <table>
+    <thead><tr><th>Work</th><th>\(\beta\)</th><th>Note</th></tr></thead>
+    <tbody>
+      <tr><td>Ziegler 2019</td><td>adaptive, \(K_\beta = 0.1\)</td><td>targets of 6 to 10 nats</td></tr>
+      <tr><td>Stiennon 2020</td><td>0.05</td><td>final KL of 14 to 18 nats (final models)</td></tr>
+      <tr><td>InstructGPT 2022</td><td>0.02</td><td>optimum between 0.01 and 0.02</td></tr>
+      <tr><td>Bai 2022</td><td>0.001</td><td>“perhaps unnecessary”</td></tr>
+      <tr><td>Llama 2 2023</td><td>0.01 (7B/13B) and 0.005 (34B/70B)</td><td>with a <code>whiten(logit)</code> reward</td></tr>
+      <tr><td>N+ 2024 (Pythia)</td><td>0.05</td><td>reproduction of Stiennon</td></tr>
+    </tbody>
+  </table>
+  <p>One \(\beta\) is only comparable to another when the reward scale is the same: the RM loss is invariant to shifts but not to scale, and the scale of \(r\) sets how much \(\beta\) “weighs”.</p>
+  <h3>Adaptive control: aim at a KL, not at a β</h3>
+  <p>Ziegler and colleagues noticed a practical problem: runs with the same \(\beta\) and different seeds ended up with very different KLs, which were hard to compare. The solution was a proportional <span class="la-term" data-term="controlador-adaptativo-kl">adaptive controller</span> in log space that aims at a target KL:</p>
+  <div class="la-eq">
+    \[ \begin{aligned} e_t &amp;= \operatorname{clip}\Big(\frac{\text{KL}_t - \text{KL}_{\text{target}}}{\text{KL}_{\text{target}}},\ -0.2,\ 0.2\Big) \\ \beta_{t+1} &amp;= \beta_t\,(1 + K_\beta\,e_t), \quad K_\beta = 0.1 \end{aligned} \]
+    <ul class="la-eq-legend">
+      <li>\(e_t\): relative error of the measured KL \(\text{KL}_t = \text{KL}(\pi_t,\pi_{\text{ref}})\), clipped at ±20%</li>
+      <li>\(K_\beta\): controller gain; at 0.1, \(\beta\) changes by at most ±2% per step</li>
+      <li>\(\text{KL}_{\text{target}}\): targets used in the paper, such as 6, 8 and 10 nats</li>
+    </ul>
+  </div>
+  <p>With a target of 6 nats and \(\beta_0 = 0.1\), follow a sequence of measurements: a KL of 12 gives \(e = +0.2\) and \(\beta\) goes to 0.1020; the next one, 10, takes it to 0.10404; a 6 leaves it unchanged; a 3 brings it to 0.10196. The controller is slow on purpose. The PPO paper's rule, which doubles or halves \(\beta\), is much more aggressive. The figure simulates three seeds that “pull” the KL with different strengths.</p>
+  <figure class="la-fig" id="fig-kl-ctrl" data-title="Leash control: fixed, Ziegler or double/halve">
+    <div class="la-fig-stage" style="height:400px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>On top, the KL to the reference for three seeds over 300 iterations (dashed = target). Below, each one's \(\beta\). With a fixed \(\beta\), the three end up at different KLs, which is the problem that motivated Ziegler. With Ziegler's controller (\(K_\beta = 0.1\), clip ±0.2), the three slowly converge to the target. The double/halve rule, which in the PPO paper controlled the KL to \(\pi_{\text{old}}\), is applied here to the same signal only to compare aggressiveness: \(\beta\) jumps in 2× steps and the KL can stop anywhere in the dead zone between target/1.5 and 1.5·target (with \(\beta\) bounded to the interval 0.001–10 in the simulation). The KL dynamics are an <b>illustrative</b> model; the \(\beta\) update rules are the ones from the papers.</figcaption>
+  </figure>
+  <h3>PPO-ptx: the third force</h3>
+  <p>Even with the leash, InstructGPT's RLHF caused regressions on public benchmarks (SQuADv2, DROP, translation), which the authors called the <span class="la-term" data-term="imposto-de-alinhamento">alignment tax</span>. The fix was to mix pretraining gradients into PPO (eq. 2 of the paper):</p>
+  <div class="la-eq">
+    \[ \begin{aligned} &amp;\text{objective}(\phi) = \mathbb E_{(x,y)\sim D_{\pi^{RL}_\phi}}\Big[r_\theta(x,y) \\ &amp;\qquad - \beta\log\frac{\pi^{RL}_\phi(y\mid x)}{\pi^{SFT}(y\mid x)}\Big] \\ &amp;\qquad + \gamma\,\mathbb E_{x\sim D_{\text{pretrain}}}\big[\log\pi^{RL}_\phi(x)\big] \end{aligned} \]
+    <ul class="la-eq-legend">
+      <li>\(\pi^{RL}_\phi\): the policy (the paper calls its parameters \(\phi\)); \(r_\theta\): the RM</li>
+      <li>\(\gamma\): pretraining coefficient (not the discount!), equal to <b>27.8</b>; with \(\gamma = 0\) the model is “PPO”, and “InstructGPT” is PPO-ptx</li>
+      <li>the second term is the log-likelihood of pretraining text, the same loss as in pretraining</li>
+    </ul>
+  </div>
+  <p>In the implementation, each minibatch computes the PPO gradient and the pretraining gradient in consecutive steps, accumulated in the same buffer, the second one multiplied by \(\gamma\), with 8× more pretraining examples than RL episodes. This <b>doubles</b> training time compared with plain PPO. \(\gamma\ge20\) reversed the regressions on the 1.3B, and 27.8 worked from 1.3B to 175B. And the most instructive detail: raising only the KL's \(\beta\) does not solve it. Even \(\beta = 2.0\), 100× the default, did not fix the regressions and also dragged down the validation reward. Interpretation: the leash keeps the policy close to the SFT on the distribution of RL prompts; ptx keeps it close to pretraining on the distribution of general text.</p>
+</section>
+
+<section class="la-sec">
+  <h2>One iteration from the inside: four models, nine steps</h2>
+  <p>Putting the pieces together, a PPO-RLHF run keeps four networks alive at the same time. It is worth giving each one a name and a role:</p>
+  <table>
+    <thead><tr><th>Model</th><th>Role</th><th>Initialization</th><th>Trains?</th><th>Work per iteration</th></tr></thead>
+    <tbody>
+      <tr><td><b>Policy (actor)</b> \(\pi_\theta\)</td><td>generates responses; receives the PPO gradient</td><td>SFT</td><td>yes</td><td>generation in the inference engine + forward of \(\log\pi_{\theta_{\text{old}}}\) + \(K\) epochs of forward and backward</td></tr>
+      <tr><td><b>Reference</b> \(\pi_{\text{ref}}\)</td><td>log-probs for the KL</td><td>frozen copy of the SFT</td><td>no</td><td>1 forward per response</td></tr>
+      <tr><td><b>Reward</b> \(r_\phi\)</td><td>score at the EOS</td><td>trained RM</td><td>no</td><td>1 forward per response</td></tr>
+      <tr><td><b>Critic</b> \(V_\psi\)</td><td>\(V(s_t)\) at every token, for GAE</td><td>the RM</td><td>yes</td><td>1 forward + \(K\) epochs of forward and backward</td></tr>
+    </tbody>
+  </table>
+  <p>And one iteration, in pseudocode, as described by the public reproductions:</p>
+  <pre data-lang="text"><code>for each iteration:
+  1. prompts  ← sample B prompts                            # InstructGPT and N+: B = 512
+  2. rollouts ← inference_engine.generate(prompts, π_θold)  # vLLM/SGLang; N+ generates up to the max and truncates at EOS
+  3. score    ← r_φ(x, y) read at EOS; no EOS → −1          # N+'s "EOS trick"
+  4. logp_ref ← π_ref.forward(x, y)                         # per token
+     logp_old ← π_θold.forward(x, y)                        # recomputed in the TRAINING engine
+     V_old    ← V_ψ.forward(x, y)                           # per token
+  5. r_t      ← −β (logp_old − logp_ref);  r_T += score
+  6. Â_t, R̂_t ← GAE(r, V_old, γ, λ);  R̂_t = Â_t + V_old
+  7. Â_t      ← whiten(Â)                                   # mean 0, std 1 over the batch
+  8. for epoch = 1..K; for minibatch in shuffle(batch):
+        ρ_t = exp(log π_θ(y_t|s_t) − logp_old_t)
+        L_π = −mean(min(ρ_t Â_t, clip(ρ_t, 1−ε, 1+ε) Â_t))
+        L_V = ½ mean(max((V_ψ − R̂)², (V_old + clip(V_ψ − V_old, ±ε̂) − R̂)²))
+        optimizer step (global gradient-norm clip)
+  9. sync π_θ → inference engine;  θ_old ← θ</code></pre>
+  <p>The figure walks through the nine steps with a five-token response, and fills in the batch matrix row by row with the numbers of an illustrative exact-math example (\(\beta = 0.05\), RM score = 2.0), the same ones as the step-by-step GAE in <a data-ch="rl-fundamentos">chapter 54</a>. There, the focus was the recursion; here, it is who computes each row and in what order.</p>
+  <figure class="la-fig wide" id="fig-iteracao" data-title="One PPO-RLHF iteration, step by step">
+    <div class="la-fig-stage" style="height:540px"><canvas></canvas></div>
+    <figcaption>At the top, the five characters: the inference engine and the four networks. The ones working in the current step light up. Below, the batch matrix for one response (“The sky is blue” + EOS): log-probs, values, per-token KL \(k_1\), rewards \(r_t\), residuals \(\delta_t\), GAE advantages with \(\lambda = 0.95\), targets \(\hat R_t\) and whitened advantages. <b>Illustrative</b> input values; everything else is computed exactly by the formulas. In step 8, the \(\rho_t\) row shows the ratio leaving 1.000 and stopping at the clip edges (illustrative motion).</figcaption>
+  </figure>
+  <p>Three details in the figure are worth their weight in gold. In step 4, \(\log\pi_{\text{old}}\) is <b>recomputed in the training engine</b>, not copied from the log-probs vLLM returned: the next section shows that the two do not match, even with the same weights. In step 5, token 3 has a negative KL (\(-0.50\)) and earns a bonus of +0.025, an effect of the \(k_1\) estimator. In step 6, with \(\lambda = 0.95\), the credit from the final score flows backward: the first token gets an advantage of 0.98, even though its own residual is only 0.19. The N+ reproduction spells out the complete config of a run that reproduces Stiennon:</p>
+  <table class="la-params">
+    <thead><tr><th>Parameter</th><th>Value (N+, Pythia)</th><th>Comment</th></tr></thead>
+    <tbody>
+      <tr><td>episodes</td><td>1M</td><td>≈ 8.56 epochs of the 116,722-prompt SFT set, resampled without replacement</td></tr>
+      <tr><td>optimizer</td><td>AdamW, eps 1e-5, lr 3e-6, linear</td><td>small, decaying LR</td></tr>
+      <tr><td>batch / minibatches / \(K\)</td><td>512 / 1 / 4</td><td>4 epochs over the whole batch</td></tr>
+      <tr><td>\(\beta\), \(\gamma\), \(\lambda\)</td><td>0.05 / 1 / 0.95</td><td>as in Stiennon</td></tr>
+      <tr><td>\(\varepsilon\), \(\hat\varepsilon\), \(c_1\)</td><td>0.2 / 0.2 / 0.1</td><td>value loss clipping on</td></tr>
+      <tr><td>sampling temperature</td><td>0.7</td><td>different from InstructGPT (1)</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="la-sec">
+  <h2>The inference engine inside the loop</h2>
+  <p>This is where Module 1 comes back in full. Generating 512 responses is autoregressive <span class="la-term" data-term="decode">decode</span>, the <span class="la-term" data-term="memory-bound">memory-bound</span> phase from <a data-ch="prefill-decode-kv">chapter 10</a>. And a training engine is terrible at it. Llama 2 reports that generating with FSDP was about <b>20× slower</b>, even with a large batch and a <span class="la-term" data-term="kv-cache">KV cache</span>; the mitigation was to consolidate the weights on each node before generation. The OpenRLHF paper says the inference phase often accounts for <b>more than 90%</b> of the total time of RLHF or RLVR. That is why every modern framework generates the <span class="la-term" data-term="rollout">rollouts</span> with <span class="la-term" data-term="vllm">vLLM</span> or SGLang, with <span class="la-term" data-term="pagedattention">PagedAttention</span>, <span class="la-term" data-term="continuous-batching">continuous batching</span> and <span class="la-term" data-term="cuda-graph">CUDA graphs</span> (<a data-ch="vllm-arquitetura">chapter 30</a>), and computes gradients with another engine (DeepSpeed ZeRO, FSDP, Megatron). The vLLM docs list, among the frameworks that use it for rollouts, OpenRLHF, verl, TRL, NeMo-RL, Open Instruct, SkyRL and Unsloth.</p>
+  <p>A FLOP count helps to see the paradox. With the rule of thumb of ~\(2N\) FLOPs per token for a forward and ~\(6N\) for a forward+backward (Kaplan and colleagues, 2020), four 7B models, 512 prompts of 256 tokens and responses of 256 tokens (262,144 tokens per iteration) and \(K = 1\):</p>
+  <table>
+    <thead><tr><th>Phase</th><th>FLOPs</th><th>Math</th></tr></thead>
+    <tbody>
+      <tr><td>generation (prefill + decode)</td><td>3.67 PFLOP</td><td>\(2N\times262{,}144\)</td></tr>
+      <tr><td>scoring forwards (\(\pi_{\text{old}}\), \(\pi_{\text{ref}}\), RM, \(V_{\text{old}}\))</td><td>14.68 PFLOP</td><td>\(4\times2N\times262{,}144\)</td></tr>
+      <tr><td>policy + critic training (1 epoch)</td><td>22.02 PFLOP</td><td>\(2\times6N\times262{,}144\)</td></tr>
+      <tr><td><b>total</b></td><td><b>40.37 PFLOP</b></td><td>illustrative example, attention excluded</td></tr>
+    </tbody>
+  </table>
+  <p>In FLOPs, generation is the <i>smallest</i> share. In time, it weighs much more than the FLOPs suggest, because every decode step reads all of the weights. On the <span class="la-term" data-term="gb10">GB10</span>, the 14 GB of bf16 weights of a 7B at 273 GB/s give at least 51 ms per step, or 13 s for 256 steps, and that only if all 512 rollouts fit in a single KV batch (calculation). The compute limits, on the same machine, give the other half of the story: at ~125 TFLOP/s of dense bf16, the 22.02 PFLOP of training take ≥ 176 s, the scoring forwards ≥ 117 s and generation itself ≥ 29 s, that is, ≥ 323 s in total at 100% utilization, versus the ≥ 13 s of bandwidth-bound decode (calculation). Interpretation: in this short-response example, the lower bounds still point to training; the dominance of generation that OpenRLHF reports shows up with long responses (reasoning that runs to thousands of tokens) and with the tail, where the longest response in the batch holds everyone up.</p>
+  <h3>Colocated or disaggregated</h3>
+  <p>There are two ways to put the two engines together:</p>
+  <table>
+    <thead><tr><th></th><th><span class="la-term" data-term="modo-colocado">Colocated</span> (<i>hybrid engine</i>)</th><th><span class="la-term" data-term="modo-desagregado">Disaggregated</span></th></tr></thead>
+    <tbody>
+      <tr><td>GPUs</td><td>the same GPUs alternate between training and generation</td><td>separate training and rollout pools</td></tr>
+      <tr><td>weight sync</td><td>in memory: shared tensors or <span class="la-term" data-term="cuda-ipc">CUDA IPC</span> handles</td><td>network: <span class="la-term" data-term="nccl">NCCL</span> broadcast from training to rollout, or a checkpoint on disk</td></tr>
+      <tr><td>memory</td><td>must free the inference engine's KV and weights during training, and the optimizer during generation</td><td>no contention; each side is sized on its own</td></tr>
+      <tr><td>idle time</td><td>no GPU sits idle, but the phases run in series</td><td>one side waits for the other, unless async RL is used</td></tr>
+      <tr><td>examples</td><td>DeepSpeed-Chat; verl 3D-HybridEngine; OpenRLHF hybrid mode</td><td>OpenRLHF (Ray); slime disaggregated; Noukhovitch et al.</td></tr>
+    </tbody>
+  </table>
+  <p>verl (the HybridFlow paper) reshards the actor between the training parallelism and the generation parallelism “with zero memory redundancy”, offloading the generation weights to the CPU during training, and reports 1.53× to 20.57× the throughput of the baselines it compares against. OpenRLHF uses Ray to schedule the roles of <i>rollout engines</i> (vLLM) and <i>actor engines</i> (DeepSpeed ZeRO), supports a hybrid mode and an async flow, and reports speedups of 1.22× to 1.68×.</p>
+  <p>The engines grew their own APIs for this. In vLLM (<code>latest</code> docs as of 2026-10), <span class="la-term" data-term="sleep-mode">sleep mode</span> (<code>--enable-sleep-mode</code>) has two levels: <code>llm.sleep(level=1)</code> offloads the weights to CPU RAM and discards the KV cache; <code>level=2</code> discards weights and KV, which is useful when the weights are about to be replaced anyway. <code>llm.wake_up(tags=["weights"])</code> and then <code>tags=["kv_cache"]</code> wake up in stages to reduce peak memory. <span class="la-term" data-term="sincronizacao-de-pesos">Weight synchronization</span> uses <code>WeightTransferConfig(backend=...)</code>, with the backends <code>"nccl"</code>, <code>"ipc"</code>, <code>"sparse_nccl"</code>, <code>"sharded_rdt"</code> and <code>"nccl_m2n"</code>, in a four-phase protocol: <code>init_weight_transfer_engine</code> → <code>start_weight_update</code> → <code>update_weights</code> (repeatable, in chunks) → <code>finish_weight_update</code>. On the HTTP server, these routes (and <code>/sleep</code>, <code>/wake_up</code>) only exist with <code>VLLM_SERVER_DEV_MODE=1</code>. In SGLang, the equivalents are <code>update_weights_from_tensor</code> (colocated), <code>update_weights_from_distributed</code> (NCCL/IB), <code>release_memory_occupation</code>/<code>resume_memory_occupation</code> and <code>pause_generation</code> in the <code>abort</code>, <code>retract</code> or <code>in_place</code> modes.</p>
+  <p>How much does moving the weights cost? The 14 GB of a 7B in bf16, over the GB10's ConnectX-7 (≈ 15.7 GB/s per PCIe function, ≈ 25 GB/s with both), take ≈ 0.9 s or ≈ 0.56 s, without protocol overhead (calculation with the numbers from <a data-ch="nccl-rdma">chapter 39</a>). In unified memory, colocated mode can reduce the sync to a handle exchange (interpretation). Watch out for the same fact in reverse: on the GB10, “offloading to CPU RAM” (sleep level 1) does not free physical memory, because the CPU and the GPU share the same LPDDR5x (<a data-ch="memoria-unificada">chapter 27</a>); only level 2, which discards, frees it. This is our interpretation, by the same argument as for Adam offload; it has not been tested on the hardware.</p>
+  <h3>Asynchronous RL</h3>
+  <p>In synchronous disaggregated mode, the training pool waits for generation and vice versa. Noukhovitch and colleagues (ICLR 2025) generate batch \(i+1\) while training on batch \(i\): training becomes <span class="la-term" data-term="rl-assincrono">1-step off-policy</span>. They ask how much off-policyness can be tolerated. Performance generally degrades with more lag, and among the losses tested Online DPO was the most robust, with robustness growing with the size of the policy. The measured gains: the same performance as synchronous training about 25% faster on a 2.8B, about 40% faster on a LLaMA 3.1 8B chatbot and about 70% faster on Rho 1B on GSM8k. It is the A3C idea (actors generating experience in parallel, a central learner consuming it) with vLLM instances playing the actors.</p>
+  <figure class="la-fig wide" id="fig-motor" data-title="Three ways to put the engine in the loop">
+    <div class="la-fig-stage" style="height:400px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>The three arrangements side by side, on the same time scale, for three iterations; the highlighted one shows its numbers in the readouts, and the vertical line is a shared clock. Mint = generation in the inference engine; lavender = scoring forwards; pink = training (PPO epochs); amber = weight sync; gray = context switch (sleep/wake, resharding); hatched = idle GPU. The traveling dots are rollouts heading to training; the amber arrow is the weights coming back. <b>Illustrative</b> timing model, which assumes linear scaling with the number of GPUs; the real measured gains (25% to 70% for async RL) are in the text.</figcaption>
+  </figure>
+  <p>Move the fraction of GPUs in the rollout pool. In synchronous disaggregated mode, any choice leaves someone idle. In async mode, there is a balance point (near 70% in the figure's default) where both pools work all the time, at the price of one iteration of lag. Colocated mode has no idle time, but it pays for the context switch at every iteration and serializes the phases. Notice that, in this toy model, well-balanced async only ties with colocated. Interpretation: the real advantage of disaggregation comes from what the model does not capture. Decode does not scale linearly with the number of GPUs, the longest response in the batch holds up the generation phase, and each pool can use whatever parallelism and memory suit it best, without sharing the GPU with the optimizer.</p>
+  <h3>Same weights, different probabilities</h3>
+  <p>There is an even sneakier source of off-policyness. With generation in vLLM and training in FSDP, \(\pi_{\text{vllm}}(a;\theta)\ne\pi_{\text{fsdp}}(a;\theta)\), despite the same parameters: different kernels, reduction order, precision and batching (Yao and colleagues, 2025). This implicitly turns on-policy RL into off-policy RL, and it gets worse with rollouts quantized to INT8 or FP8. The fixes have names: <span class="la-term" data-term="tis">TIS</span> multiplies the gradient by \(\min(\pi_{\text{fsdp}}/\pi_{\text{vllm}}, C)\); MiniMax-M1 raised the <span class="la-term" data-term="lm-head">LM head</span> to FP32 and took the correlation between training and inference probabilities from ~0.9 to ~0.99; in MoE, R3 records the <span class="la-term" data-term="roteador">router</span>'s choices at inference and replays them in training, because ~94% of tokens pick different experts in at least one layer between the two phases. <a data-ch="grpo-rlvr">Chapter 56</a> goes deeper into this topic; here, the bridge to the recipes is enough.</p>
+  <div class="la-callout recipe" data-recipe="qwen"><b class="t"><span class="la-rb qwen"></span> The recipes have already solved half the problem</b><p>The Qwen recipe has a <span class="la-term" data-term="determinismo-bit-a-bit">determinism</span> overlay (<code>VLLM_QSA_DET_TOPK=1</code>, <code>VLLM_MOE_DET_FINALIZE=1</code> with <code>VLLM_FLASHINFER_MOE_FUSED_FINALIZE=0</code>) that took the prompt logprob spread from 0.25 / 6.07 nats to 0 / 0, at a cost of ~4% in decode: that is exactly the class of fix that a “truly on-policy” setup requires. The <span class="la-rb glm"></span> recipe ships <code>logprob_capture.py</code>, which compares the KL and the argmax of logprobs between two servers, the same metric you monitor between sampler and trainer. And GLM's <code>patch_cache_reset.py</code> overlay exposes <b>only</b> the cache reset routes, without <code>/sleep</code> or the RPC routes that <code>VLLM_SERVER_DEV_MODE=1</code> would mount. Interpretation: a <i>serving</i> recipe deliberately closes the doors that an RL system needs to open. And since the three models of Module 1 are MoE with quantized weights, using them as rollout generators for a policy trained in BF16 would be the worst case of mismatch: quantization and routing at the same time.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Instabilities, tricks and cost</h2>
+  <p>PPO has a reputation for instability, and the reputation is deserved: Engstrom and colleagues (2020) and the post “The 37 Implementation Details of PPO” showed that normalizations, initializations and clippings explain a good part of the performance. For RLHF, the equivalent lists are “N+ implementation details” (Huang and colleagues, 2024) and “Secrets of RLHF” (Zheng and colleagues, 2023). The tricks that show up most often:</p>
+  <table class="la-params">
+    <thead><tr><th>Trick</th><th>What it does</th><th>Source</th></tr></thead>
+    <tbody>
+      <tr><td>turn off dropout</td><td>with dropout, log-probs are not reproducible, the KL becomes unreliable and the ratios already start away from 1 in the 1st epoch</td><td>N+, Ziegler</td></tr>
+      <tr><td>EOS ≠ PAD</td><td>if PAD is EOS, EOS gets masked in SFT, the model does not learn to stop and the length bias grows</td><td>N+</td></tr>
+      <tr><td><span class="la-term" data-term="eos-trick">“EOS trick”</span></td><td>generate up to the max length, truncate at EOS; a response without EOS gets −1</td><td>N+</td></tr>
+      <tr><td>normalize the RM</td><td>a bias makes the demonstrations (or references) have a mean score of 0</td><td>Stiennon, InstructGPT, N+</td></tr>
+      <tr><td>whiten or scale the reward</td><td>Llama 2: <code>whiten(logit(R))</code>, undoes the sigmoid and standardizes to balance against the KL</td><td>Llama 2, N+</td></tr>
+      <tr><td>normalize and clip the reward</td><td>\(\tilde r = \operatorname{clip}\big((r-\bar r)/\sigma(r), -\delta, \delta\big)\) with historical statistics</td><td>Secrets</td></tr>
+      <tr><td><span class="la-term" data-term="branqueamento">whiten the advantage</span></td><td>\(\hat A\leftarrow(\hat A - \text{mean})/\text{std}\) over the batch</td><td>N+, Engstrom</td></tr>
+      <tr><td>value clipping</td><td>\(\hat\varepsilon = 0.2\)</td><td>N+, Secrets</td></tr>
+      <tr><td>critic initialized from the RM, or pretrained</td><td>better initial policy gradients, less drift</td><td>Stiennon, InstructGPT, Secrets, VC-PPO</td></tr>
+      <tr><td>global gradient clip</td><td>norm 1.0</td><td>Llama 2, Secrets</td></tr>
+      <tr><td>small LR</td><td>10⁻⁶ (Llama 2), 3×10⁻⁶ (N+), 9×10⁻⁶ for the critic (InstructGPT)</td><td>papers</td></tr>
+      <tr><td>few epochs, small buffer</td><td>nearly on-policy data (1 epoch in InstructGPT)</td><td>InstructGPT, Secrets</td></tr>
+      <tr><td>weight EMA</td><td>decay 0.992: moving average of the policy weights; smooths out noise between iterations (interpretation)</td><td>InstructGPT</td></tr>
+      <tr><td>monitor the “action space”</td><td>perplexity, length and KL to the SFT say more about stability than reward and losses do</td><td>Secrets §5</td></tr>
+      <tr><td>several seeds and early stopping</td><td>N+ runs 4 seeds and reports failures; Llama 2 stops early on held-out prompts</td><td>N+, Llama 2</td></tr>
+    </tbody>
+  </table>
+  <p>Whitening deserves one more sentence. The advantage multiplies the gradient, so its scale is, in practice, a hidden learning rate. A reward that ranges from −5 to +5 in one batch and from −0.1 to +0.1 in the next would make the effective step vary 50× (illustrative example). Subtracting the mean and dividing by the standard deviation leaves only the relative signal: <i>in this batch</i>, which tokens were better than the others. It is the same idea as the REINFORCE baseline, applied once more after GAE.</p>
+  <p>The typical symptoms, as read from the sources (interpretation): the reward rises while human quality falls (over-optimization); length explodes (length bias); KL shoots up (\(\beta\) too small or LR too high); the mean ratio is already far from 1 in the 1st epoch (dropout on, or sampler–trainer mismatch); huge value loss at the start (critic not initialized from the RM). The dashboard below acts out each one.</p>
+  <figure class="la-fig wide" id="fig-painel" data-title="Diagnostic dashboard for a PPO run">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Four charts every RLHF dashboard should have: RM score versus real quality, KL to the SFT, mean response length, and the mean \(|\rho-1|\) of the ratio in the 1st epoch (bars, right axis from 0 to 0.1) together with the value loss (line, left axis from 0 to 1). Pick a scenario and read the symptom and the remedy. The curves are <b>illustrative</b>: the shape of each one follows the textual description of the symptoms in the sources (Secrets, N+, Stiennon, Singhal), not measured data.</figcaption>
+  </figure>
+  <p>Finally, the cost. The real numbers give the scale: PPO-ptx for InstructGPT 175B cost 60 petaflop/s-days (GPT-3's pretraining, 3,640); Stiennon's RL for the 6.7B, about 320 GPU-days; one PPO iteration on Llama 2 70B, about 330 s. And PPO is expensive for four reasons that add up: two trainable models (twice the optimizer memory), four forwards per response, \(K\) epochs and a serial generation bottleneck. Hence the three escape routes the next chapters explore: DPO eliminates RL, RLOO and GRPO eliminate the critic, and async RL eliminates the bubbles.</p>
+</section>
+
+<section class="la-sec">
+  <h2>In practice: does it fit on your machine? Tools in 2026</h2>
+  <p>The first question for anyone who wants to run PPO is not about the algorithm, it is about memory. A model trained with Adam in mixed precision costs about <b>16 bytes per parameter</b>: 2 for the bf16 weights, 2 for the gradients and 12 for the FP32 master copy, the first moment and the second moment (4 + 4 + 4), in the ZeRO paper's accounting (<a data-ch="treino-memoria-lora">chapter 51</a>). A frozen model in <span class="la-term" data-term="bf16">bf16</span> costs 2 bytes per parameter. Policy and critic with \(N\) parameters, plus a reference and an RM of the same size:</p>
+  <div class="la-eq">
+    \[ M_{\text{PPO}} \approx 2\times16N + 2\times2N = 36N\ \text{bytes} \]
+    <ul class="la-eq-legend">
+      <li>\(16N\): each trainable model (policy and critic)</li>
+      <li>\(2N\): each frozen model (reference and RM)</li>
+      <li>left out of the math: activations, communication buffers, fragmentation, the inference engine's copy of the weights and the rollouts' KV cache</li>
+    </ul>
+  </div>
+  <p>That gives 54 GB (50.3 GiB) for 1.5B, 108 GB for 3B, 252 GB (234.7 GiB) for 7B and 288 GB for 8B. A <span class="la-term" data-term="dgx-spark">DGX Spark</span> exposes about 121.69 GiB of <span class="la-term" data-term="memoria-unificada">unified memory</span> to CUDA; two of them add up to about 243 GiB. In other words: PPO with full fine-tuning of a 7B policy and critic (≈ 235 GiB of states alone) no longer fits with activations and KV, not even on two nodes; 3B (≈ 101 GiB) fits on a single node for the states alone. Do the math in the calculator.</p>
+  <figure class="la-fig" id="fig-memoria" data-title="Calculator: four models in memory">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Each model is a strip of bytes per parameter, in the model's own color (the same one used in the stacked bar): weights in a full tone, gradients in a medium tone and Adam states + FP32 master in a light tone for the trainable ones; weights only for the frozen ones. The bottom bar stacks the GiB against the lines for the 24 GB Mac M4 and for one and two DGX Sparks; when less than 15% of headroom is left, the readout warns that only the states fit. Full FT and “no critic” use the sources' accounting. In LoRA mode, the 1% trainable fraction is an <b>illustrative estimate</b> (it depends on the rank and the layers), and the reference comes for free because it is the same network with the adapter turned off, a common engineering practice. Activations and KV cache are not included.</figcaption>
+  </figure>
+  <p>The usual ways out show up in the calculator. <b>Critic and RM smaller than the policy</b>: InstructGPT used a 6B RM and critic for a 175B policy. <b>LoRA</b>: the reference becomes “the same network with the adapter turned off”, with no extra copy. <b>Offloading Adam to the CPU</b>: helps on discrete GPUs, but on the GB10 it does not free physical memory, for the same reason as sleep mode. And <b>dropping the critic</b>, which is the path of RLOO and GRPO. In MoE, as with the three models of Module 1, memory scales with the <i>total</i> parameters, while FLOPs scale with the active ones.</p>
+  <h3>The tools in 2026</h3>
+  <p>The ecosystem has moved. TRL, which for years was the easiest way to run PPO, <b>removed <code>PPOTrainer</code> in version 1.13.0</b>, according to the release notes; the current version is 1.14.1, which keeps <code>RewardTrainer</code> stable for the RM stage. For PPO with a critic, the path today is dedicated RL frameworks:</p>
+  <div class="la-compare">
+    <div><h4>OpenRLHF 0.11.2</h4><p>Ray + vLLM + DeepSpeed. Entry point <code>python3 -m openrlhf.cli.train_ppo_ray</code>; the default advantage estimator (<code>--algo.advantage.estimator</code>) is PPO with a critic, and the same script runs <code>group_norm</code> (GRPO), <code>reinforce_baseline</code> and <code>rloo</code>. Namespaced flags: <code>--vllm.num_engines</code>, <code>--vllm.tensor_parallel_size</code>, <code>--ds.lora.rank</code>, and <code>--reward.remote_url</code> to serve the RM over HTTP.</p></div>
+    <div><h4>verl 0.9.1</h4><p>Hydra config, training on FSDP/FSDP2/Megatron and rollout on vLLM or SGLang (HybridFlow paper). The official PPO example on GSM8K turns on a separate critic with <code>critic.model.path</code> and puts the KL in <code>algorithm.kl_ctrl.kl_coef=0.001</code>.</p></div>
+    <div><h4>On the Mac: mlx-lm-lora</h4><p><code>mlx-lm-lora</code> 3.1.3 accepts <code>--train-mode ppo</code> (and <code>rlhf_reinforce</code>) with a reward model as the judge. The reference is a second full, frozen copy, loaded from <code>--reference-model-path</code>: on the 24 GB Mac, budget for that.</p></div>
+  </div>
+  <p>The verl example, as it appears in the GSM8K docs (8 GPUs on one node):</p>
+  <pre data-lang="bash"><code>python3 -m verl.trainer.main_ppo \
+  data.train_files=... data.train_batch_size=1024 \
+  data.max_prompt_length=512 data.max_response_length=512 \
+  actor_rollout_ref.model.path=deepseek-ai/deepseek-llm-7b-chat \
+  actor_rollout_ref.actor.optim.lr=1e-6 \
+  actor_rollout_ref.rollout.name=vllm \
+  actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
+  critic.model.path=deepseek-ai/deepseek-llm-7b-chat \
+  algorithm.kl_ctrl.kl_coef=0.001 \
+  trainer.n_gpus_per_node=8 trainer.nnodes=1 trainer.total_epochs=15</code></pre>
+  <p>Read each line with what you have learned. <code>rollout.name=vllm</code> is the engine in the loop; <code>gpu_memory_utilization=0.5</code> is the slice of memory vLLM may reserve, because the training weights live on the same GPUs (colocated mode, interpretation); <code>critic.model.path</code> is the fourth model; <code>kl_coef=0.001</code> is \(\beta\), at the same level as Bai's \(\lambda_{KL}\). On the infrastructure side, slime (SGLang + Megatron) states in its README that it is the RL framework behind GLM versions 4.5 to 5.3, and vime (June 2026) brings slime's design to the vLLM ecosystem, with colocated and disaggregated modes.</p>
+  <p>So where does PPO-RLHF stand today? For general chat alignment, a good part of the open community moved to DPO and its variants, with no explicit RM and no RL (<a data-ch="dpo">chapter 57</a>), and to REINFORCE, RLOO and GRPO, with no critic. HelpSteer2-Preference reached 85.0 on Arena Hard (1st place on October 1, 2024) with the RM and REINFORCE. For reasoning with verifiable rewards, DeepSeek-R1's GRPO became the standard, but PPO with a critic is competitive again when the critic is handled well (VC-PPO, VAPO). And the bottleneck moved from the algorithm to the system: efficient generation, weight sync, asynchrony and numerical consistency between sampler and trainer. This is where Module 1 becomes a prerequisite for Module 2.</p>
+  <div class="la-callout tip"><b class="t">Roadmap for your first run</b><p>Start small, with the critic the same size as the RM. Turn off dropout, make sure EOS ≠ PAD, normalize the RM with the demonstrations, whiten the advantages and turn on value clipping. Use \(\varepsilon = 0.2\), few epochs (1 to 4), an LR on the order of 10⁻⁶ and a \(\beta\) in the range of the leash table, or a KL target. Before looking at the reward, look at the ratio in the 1st epoch (it must start at exactly 1), the KL to the SFT and the mean length. If the memory math does not work out, swap full FT for LoRA or drop the critic, which is the subject of the next chapter.</p></div>
+  <p>The next step is precisely to rip out the most expensive piece of this chapter. <a data-ch="grpo-rlvr">Chapter 56</a> replaces the critic with group statistics (GRPO, RLOO), replaces the RM with math and code verifiers (RLVR), and tackles head-on the training–inference mismatch that only appeared in passing here.</p>
+</section>

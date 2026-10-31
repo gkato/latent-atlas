@@ -1,0 +1,628 @@
+<p class="la-lead">For 50 chapters (0 to 49) you served models trained by other people. Chapters 50 to 62 opened the box from the other side: <a data-ch="sft">SFT</a>, <a data-ch="dpo">DPO</a>, <a data-ch="grpo-rlvr">GRPO</a> and <a data-ch="avaliacao-pos-treino">evaluation</a>. This chapter closes the loop with a complete recipe. You'll turn an open model into an <b>inference-engineering tutor</b>, the assistant that answers “how much KV does one token take in <code>fp8_ds_mla</code>?” with the right number, and hand it back to the same vLLM, the same quantization and the same pair of <span class="la-term" data-term="dgx-spark">DGX Sparks</span> from Module 1. There are two tracks. <b>Track A</b> runs on a 24 GB Mac M4 with MLX and a 4-billion-parameter model. <b>Track B</b> runs on two Sparks: SFT and DPO on a Qwen3.8-27B, merge, re-quantization to NVFP4 and serving on vLLM, plus a GRPO run on a 9B model. An honest warning: the research behind this chapter checked versions, flags and code on October 1, 2026, but <b>did not run any training on a GPU</b>. Every training time and memory figure comes with its formula alongside and the <b>[estimate]</b> tag. Plan with them and measure on your own kit.</p>
+
+<section class="la-sec">
+  <h2>The map: ten phases, a gate at each</h2>
+  <p>The <a data-ch="receita-do-zero">recipe from scratch</a> in chapter 46 taught a method with an <b>exit criterion</b> at every step. The same discipline applies here, with one difference: there the checkpoint came ready-made; here <i>you</i> produce it. Each phase leaves a verifiable artifact that the next one consumes.</p>
+  <table>
+    <thead><tr><th>Phase</th><th>What comes out</th><th>Where it runs</th></tr></thead>
+    <tbody>
+      <tr><td><b>F0</b> frozen baseline</td><td>evaluation sets and the base model's numbers</td><td>Spark (vLLM) or Mac (<code>mlx_lm.server</code>)</td></tr>
+      <tr><td><b>F1</b> data</td><td>decontaminated <code>sft.jsonl</code>, <code>pref.jsonl</code>, <code>kto.jsonl</code>, <code>grpo.jsonl</code></td><td>Sparks serving the Module 1 recipes</td></tr>
+      <tr><td><b>F2</b> SFT (LoRA/QLoRA)</td><td>SFT adapter</td><td>Mac or 2× Spark in DDP</td></tr>
+      <tr><td><b>F3</b> preferences (DPO and variants)</td><td>DPO adapter</td><td>Mac or 2× Spark</td></tr>
+      <tr><td><b>F4</b> verifiable RL (GRPO)</td><td>GRPO adapter</td><td>Mac (small model) or Spark A trains + Spark B generates</td></tr>
+      <tr><td><b>F5</b> evaluation and gates</td><td>report with confidence intervals and a decision</td><td>Spark or Mac</td></tr>
+      <tr><td><b>F6</b> merge</td><td>merged model in BF16</td><td>Spark or Mac</td></tr>
+      <tr><td><b>F7</b> re-quantization</td><td>NVFP4, EXL3, W4A16 or MLX 4-bit</td><td>Spark or Mac</td></tr>
+      <tr><td><b>F8</b> KLD and post-quantization regression</td><td>report</td><td>Spark</td></tr>
+      <tr><td><b>F9</b> serving</td><td>OpenAI-API-compatible endpoint</td><td>vLLM 0.30.0 or <code>mlx_lm.server</code></td></tr>
+    </tbody>
+  </table>
+  <figure class="la-fig wide" id="fig-mapa" data-title="The post-training line: ten stations">
+    <div class="la-fig-stage" style="height:390px"><canvas></canvas></div>
+    <figcaption>The model (the mint character) travels from station to station. Each station shows where the phase runs: <b>Mac</b> (lavender), <b>Spark</b> (mint) or both. The bag at the bottom collects the artifacts with track B's sizes, all taken from the sources or from the math in the research's Appendix A. Each step's text names the gate that unlocks the next phase.</figcaption>
+  </figure>
+  <h3>Why not post-train the Module 1 models?</h3>
+  <p>Memory. In BF16, the weights alone already far exceed what two Sparks have:</p>
+  <table>
+    <thead><tr><th>Model</th><th>Parameters</th><th>BF16, weights only</th><th>On 2× Spark (≈ 2 × 121.7 GiB)</th></tr></thead>
+    <tbody>
+      <tr><td><span class="la-rb glm"></span> GLM-5.3-Flash</td><td>321.3 B (18 B active)</td><td>≈ 643 GB</td><td>doesn't fit even with BF16 LoRA; with QLoRA it would be ≈ 160+ GB of weights alone, with no off-the-shelf tooling for KDA, mHC and DSA</td></tr>
+      <tr><td><span class="la-rb ds"></span> DeepSeek-V4-Flash</td><td>284 B (13 B active)</td><td>≈ 568 GB</td><td>same, and vLLM has no LoRA for <code>DeepseekV4ForCausalLM</code></td></tr>
+      <tr><td><span class="la-rb qwen"></span> Qwen3.8-Flash-Next</td><td>125 B in the main model (~6 B active) + PLE</td><td>&gt; 250 GB</td><td>same</td></tr>
+    </tbody>
+  </table>
+  <p>For these giants, the realistic path is to train adapters on bigger infrastructure, merge, and re-quantize with the Module 1 tools (exllamav3 with <code>-ngb</code> for the PLE; llm-compressor or ModelOpt for NVFP4, and llm-compressor already publishes <code>RedHatAI/GLM-5.3-Flash-NVFP4</code> and <code>RedHatAI/Qwen3.8-Flash-Next-NVFP4</code>). The lab picks <b><code>Qwen/Qwen3.8-27B</code></b>, from the same family as Qwen3.8-Flash-Next: <code>model_type: qwen3_5</code>, a 3:1 hybrid of <span class="la-term" data-term="gdn">Gated DeltaNet</span> and attention with gated output, <code>head_dim</code> 256. Every stage (merge, calibration, NVFP4, FP8 KV, MTP, vLLM) is the same as in the recipes, at a scale that fits.</p>
+  <dl class="la-kv">
+    <dt>Qwen3.8-27B</dt><dd>27,781,427,952 BF16 parameters (<b>55.56 GB</b>); <code>Qwen3_5ForConditionalGeneration</code>, a VLM with a 27-block vision tower; 64 layers = <b>48 GDN + 16 full attention</b>; hidden 5120; 24 Q heads and 4 KV heads of 256; FFN 17,408; vocabulary 248,320; <b>1 MTP layer</b>; thinks by default; Apache-2.0.</dd>
+    <dt>Qwen3.5-9B</dt><dd>9,653,104,368 parameters, same <code>model_type</code>, 24 GDN + 8 attention. It's the GRPO student, because RL is dominated by <i>generation</i>, and generating with a BF16 27B on a <span class="la-term" data-term="gb10">GB10</span> is too slow for a lab.</dd>
+    <dt>Qwen3-4B-Instruct-2507</dt><dd>4,022,468,096 parameters, 36 layers, hidden 2560, vocabulary 151,936, <b>no thinking mode</b>. It's track A's student.</dd>
+  </dl>
+  <h3>Versions: pin everything</h3>
+  <p>The ecosystem changes every week. <span class="la-term" data-term="trl">TRL</span> hit 1.0 in March and then removed <code>PPOTrainer</code> (v1.13.0) and six experimental trainers (v1.14.0); <code>mlx-lm</code> 0.32.0 came out on the day of the research. Without version pins, the recipe won't reproduce next month.</p>
+  <table class="la-params">
+    <thead><tr><th>Package</th><th>Version</th><th>Note</th></tr></thead>
+    <tbody>
+      <tr><td><code>trl</code></td><td>1.14.1</td><td>supports vLLM from 0.20.1 to 0.30.0</td></tr>
+      <tr><td><code>peft</code> · <code>transformers</code> · <code>accelerate</code></td><td>0.21.2 · 5.18.0 · 1.15.0</td><td>TRL loads in FP32 if you don't pass <code>dtype</code></td></tr>
+      <tr><td><code>vllm</code></td><td>0.30.0</td><td>the same image as Qwen's v0.30 lane in Module 1</td></tr>
+      <tr><td><code>llmcompressor</code> · <code>nvidia-modelopt</code></td><td>0.14.0 · 0.47.0</td><td>llm-compressor has an official Qwen3.8-27B example; the ModelOpt recipe was checked on <i>main</i> (the card cites v0.48.0): check with <code>git ls-tree</code> before pinning the version; the path is <code>examples/hf_ptq</code> on main, <code>examples/llm_ptq</code> in the playbook</td></tr>
+      <tr><td><code>exllamav3</code></td><td>v1.5.3</td><td>used here for the KLD panel</td></tr>
+      <tr><td><code>mlx-lm</code> · <code>mlx-lm-lora</code></td><td>0.32.0 · 3.1.3</td><td><span class="la-term" data-term="mlx-lm-lora">mlx-lm-lora</span> does DPO, ORPO and GRPO, but not KTO</td></tr>
+      <tr><td><code>openrlhf</code> · <code>verl</code> · <code>lm-eval</code></td><td>0.11.2 · 0.9.1 · 0.4.13</td><td>2-node RL (not tested on the GB10) and API-based evaluation</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="la-sec">
+  <h2>Data: Module 1 becomes teacher and jury</h2>
+  <p>Before they become training machines, the Sparks serve the Module 1 models, all with an OpenAI API on port <b>8888</b> (<code>GLM-5.3-Flash-EXL3</code>, <code>qwen3.8-flash-next</code>, <code>deepseek-v4-flash-vision-exp</code>). Since each recipe takes both nodes, they run one at a time. They play two roles: the <span class="la-term" data-term="modelo-professor">teacher</span> writes the answers, and a jury of judges (<span class="la-term" data-term="llm-as-judge">LLM as judge</span>) decides which ones are good.</p>
+  <div class="la-callout warn"><b class="t">License first</b><p>Before publishing anything derived, check whether the teacher model's terms allow using its outputs to train another model.</p></div>
+  <ol class="la-steps">
+    <li><b>Seeds from the platform itself.</b> The glossaries of the 50 Module 1 chapters (0 to 49) add up to ~1,170 unique terms (the research, done when there were 48, counted 1,079), and <code>docs/APANHADO.md</code> lists 1,484 recipe parameters. Each term becomes 2 to 4 questions.</li>
+    <li><b>Teacher answers.</b> GLM answers each question <b>4 times</b> (<code>n=4</code>, temperature 0.9), which makes it possible to build pairs later. Cost <b>[estimate]</b>: 3,000 questions × 4 × ~400 tokens ≈ 4.8 M tokens; at ~100–150 tok/s aggregate, <b>9 to 13 hours</b> of teacher time.</li>
+    <li><b>Pairwise judging, with position swapping, by a judge from another family</b>, with a rubric: technical correctness, answering what was asked, numbers and units, conciseness; ignore length and formatting.</li>
+    <li><b>Cleaning and decontamination</b>, and only then the split.</li>
+  </ol>
+  <h3>Why DeepSeek is the judge</h3>
+  <p>Two biases decide who sits on the jury. <span class="la-term" data-term="vies-de-posicao">Position bias</span> is strong: with ChatGPT as the judge, just by reordering the answers, Vicuna-13B “won” 66 of 80 queries (Wang et al., 2023). <span class="la-term" data-term="autopreferencia">Self-preference</span> makes the evaluator favor its own outputs, with a strength proportional to its ability to <i>recognize itself</i> (Panickssery et al., 2024). The teacher is GLM and the student is Qwen3.8-27B, a relative of Qwen3.8-Flash-Next. Excluding both families leaves a single impartial judge: <span class="la-rb ds"></span> DeepSeek. GLM and Qwen join, at most, as secondary judges on a PoLL-style panel (Verga et al., 2024), with their agreement reported separately.</p>
+  <p>The script runs a tournament per question. Each of the \(\binom{4}{2} = 6\) pairs is judged <b>twice</b>, as (A, B) and as (B, A), and a win only counts when the judge agrees with itself in both orders:</p>
+  <div class="la-eq">
+    \[ s(i,j)=\begin{cases}+1 & v(i,j)=\text{A}\ \text{and}\ v(j,i)=\text{B}\\ -1 & v(i,j)=\text{B}\ \text{and}\ v(j,i)=\text{A}\\ 0 & \text{otherwise}\end{cases}\qquad S_i=\sum_{j\neq i} s(i,j) \]
+    <ul class="la-eq-legend">
+      <li>\(v(i,j)\): the judge's verdict with answer \(i\) in position A and \(j\) in position B</li>
+      <li>\(S_i\): answer \(i\)'s balance in the tournament (from −3 to +3 with 4 answers)</li>
+      <li><code>sft.jsonl</code> gets the best answer if \(S_{\text{best}} \ge 1\)</li>
+      <li><code>pref.jsonl</code> gets (best, worst) if \(S_{\text{best}} - S_{\text{worst}} \ge 2\): the minimum margin discards ambiguous pairs. Note that the balances sum to zero, so a <b>single</b> consistent verdict is enough for the margin to reach 2: a threshold of 2 only discards the questions where everything tied; 3 or 4 actually filter <b>[our own math]</b></li>
+      <li><code>kto.jsonl</code> gets the best with <code>label: true</code> and the worst with <code>label: false</code></li>
+    </ul>
+  </div>
+  <figure class="la-fig" id="fig-torneio" data-title="The judge's tournament: position swapping and minimum margin">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Four teacher answers, each with a hidden “true” quality (the little stars, which the judge can't see). The robot judges the 6 pairs in both orders. Verdicts that change with the order become ties. Below, a simulation of 2,000 questions shows the fraction of questions that yield a <b>pair</b> (the yield) and the <b>purity</b> (fraction of pairs in which the chosen answer really is better), with and without swapping, for the chosen minimum margin. <b>Illustrative</b> simulation: the judge picks position A with the bias probability and, the rest of the time, compares the qualities with noise.</figcaption>
+  </figure>
+  <p>Raise the bias to 0.4. Without swapping, the answer that shows up most often in position A gets free points, and purity drops to around 80% in the figure's model: one pair in five teaches the model to prefer the worse answer. With swapping, the bias turns into a tie and the remaining pairs stay clean (93%). Now raise the minimum margin to 3. Swapping starts to cost real pairs: the yield drops from 85% (no swap) to 67% (with swap), and purity with swapping rises to 95%, versus 83% without. That's the quantity-versus-cleanliness trade-off the threshold controls; with 4 answers and margin 2, as in the recipe, almost every question yields a pair.</p>
+  <h3>Cleaning, decontamination and split by term</h3>
+  <p>Normalize, deduplicate (MinHash or n-grams) and remove from training every item that shares a normalized 13-gram with <b>any</b> evaluation set. The threshold of 13 follows the practice of the GPT-3 report, a number the research itself flags as “from memory; to be checked”. <span class="la-term" data-term="descontaminacao">Decontamination</span> matters twice as much here: the teacher may have memorized GSM8K, and “generate problems similar to these” produces near-copies.</p>
+  <p>Then split <code>train</code>, <code>valid</code> and <code>test_dominio</code> <b>by glossary term</b>, never by row: if the same term shows up in training and in the test, the test measures memorization. Suggested sizes: SFT 3,000–6,000 examples, DPO 1,500–3,000 pairs, KTO 3,000–6,000 labels and a test of <b>300–500 questions</b> on unseen terms (a CI of ±4–6 points on the win rate). Drop the <code>term</code> column after the split.</p>
+  <h3>The formats: one JSONL per algorithm</h3>
+  <p>Each trainer looks for specific keys, and the wrong key usually doesn't raise an error: it usually trains the wrong thing. The four most common formats:</p>
+  <pre data-lang="json"><code># (a) conversational SFT — TRL SFTTrainer, mlx_lm.lora ("chat" format), mlx_lm_lora --train-mode sft
+{"messages": [{"role": "system", "content": "You are an inference engineer. Answer in English, with numbers and units."}, {"role": "user", "content": "How much KV does one token take in GLM's fp8_ds_mla?"}, {"role": "assistant", "content": "656 bytes per token per DSA layer: 512 B of NoPE latent in FP8, 16 B of scales and 128 B of RoPE (64 BF16 values)."}]}
+
+# (d) preference pair — TRL DPOTrainer / RewardTrainer (explicit prompt, recommended)
+{"prompt": [{"role": "user", "content": "Why doesn't GLM use NVFP4 for the experts?"}], "chosen": [{"role": "assistant", "content": "Because NVFP4's measured KLD (0.0605 nats) was 2.5× that of 4 bpw EXL3 (0.0246)…"}], "rejected": [{"role": "assistant", "content": "Because the GB10 doesn't support FP4."}], "chat_template_kwargs": {"enable_thinking": false}}
+
+# (f) KTO — binary, unpaired signal — TRL KTOTrainer
+{"prompt": [{"role": "user", "content": "What is the default --max-loras?"}], "completion": [{"role": "assistant", "content": "1."}], "label": true}
+{"prompt": [{"role": "user", "content": "What is the default --max-loras?"}], "completion": [{"role": "assistant", "content": "Unlimited; vLLM loads every adapter that fits."}], "label": false}
+
+# (g) GRPO / RLVR — TRL GRPOTrainer: "prompt" is required; accuracy_reward reads the "solution" column
+{"prompt": [{"role": "user", "content": "Natalia sold hair clips to 48 friends in April and half as many in May. How many in total? Put the final answer in \\boxed{}."}], "solution": "72"}</code></pre>
+  <table class="la-params">
+    <thead><tr><th>Trainer</th><th>Keys</th><th>Gotcha</th></tr></thead>
+    <tbody>
+      <tr><td><code>mlx_lm_lora.train --train-mode dpo|cpo|orpo</code></td><td><code>system</code>, <code>prompt</code>, <code>chosen</code>, <code>rejected</code> as <b>plain text</b></td><td>not TRL's conversational format</td></tr>
+      <tr><td><code>mlx_lm_lora.train --train-mode grpo</code></td><td><code>prompt</code>, <code>answer</code>, <code>system</code></td><td><code>answer</code> in the singular (TRL uses <code>solution</code>)</td></tr>
+      <tr><td><code>mlx_lm.lora</code> with <code>--mask-prompt</code></td><td><code>chat</code>, <code>tools</code>, <code>completions</code>, <code>text</code></td><td>in <code>chat</code>, only the <b>last</b> message counts: multi-turn data trains only the last turn</td></tr>
+      <tr><td>TRL <code>KTOTrainer</code></td><td><code>prompt</code>, <code>completion</code>, <code>label</code></td><td>if it receives pairs, it converts <code>chosen</code>→<code>True</code> and <code>rejected</code>→<code>False</code></td></tr>
+    </tbody>
+  </table>
+  <h3>The chat template is part of the data</h3>
+  <p>The <span class="la-term" data-term="chat-template">chat template</span> from chapter 5 is the number-one cause of broken fine-tunes on Qwen3.x. Four decisions, checked against the Qwen3.8-27B template and the TRL code:</p>
+  <ol class="la-steps">
+    <li><b>Reasoning goes in <span class="la-term" data-term="reasoning-content"><code>reasoning_content</code></span>, never inside <code>content</code>.</b> The template renders the assistant as <code>&lt;think&gt;\n{reasoning_content}\n&lt;/think&gt;\n\n{content}</code> and doesn't look for <code>&lt;think&gt;</code> in <code>content</code>: inline reasoning produces <b>two</b> thinking blocks.</li>
+    <li><b><span class="la-term" data-term="assistant-only-loss"><code>assistant_only_loss=True</code></span> swaps the template</b> for <code>qwen3_8_training.jinja</code>, which always emits the thinking block and marks the output with <code>{% generation %}…{% endgeneration %}</code>. Examples without <code>reasoning_content</code> become <code>&lt;think&gt;\n\n&lt;/think&gt;\n\n{content}</code>: the model learns to answer <b>without thinking</b>.</li>
+    <li><b><code>enable_thinking</code> touches the system prompt:</b> when undefined or true, the template injects “Reasoning effort is set to xhigh…”; with <code>false</code>, it doesn't. Train, evaluate and serve with the <b>same</b> <span class="la-term" data-term="chat-template-kwargs"><code>chat_template_kwargs</code></span>.</li>
+    <li><b>The <code>eos_token</code> is <code>&lt;|im_end|&gt;</code>.</b> That's right for chat; don't change it.</li>
+  </ol>
+  <figure class="la-fig" id="fig-template" data-title="From JSONL to tokens: template and loss mask">
+    <div class="la-fig-stage" style="height:420px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>On top, the JSONL record. Below, what the model actually sees after the Qwen3.8 template (the split into blocks is <b>illustrative</b>; real tokens are smaller). With the mask on, only the blocks with the pink stripe go into the loss; the exact boundary is set by the training template's <code>{% generation %}</code> tags. In the mode with <code>&lt;think&gt;</code> inside content, the classic bug shows up: two thinking blocks.</figcaption>
+  </figure>
+  <p>The empty <code>&lt;think&gt;\n\n&lt;/think&gt;</code> block in “no reasoning” mode isn't decoration: with <code>enable_thinking=false</code>, the generation prompt already ends with it. Training like this and serving without thinking is consistent; training like this and serving with thinking produces a model that has forgotten how to think. To preserve reasoning, write it into <code>reasoning_content</code> and mix in a fraction of those examples.</p>
+</section>
+
+<section class="la-sec">
+  <h2>Track A: a tutor on the 24 GB Mac M4</h2>
+  <p>The Mac is the pocket lab: slow, but always on, with the same <span class="la-term" data-term="memoria-unificada">unified memory</span> as chapter 27. The system Python is 3.9.6 and MLX requires ≥ 3.10, so the environment comes from <code>uv</code>:</p>
+  <pre data-lang="bash"><code>uv venv --python 3.12 ~/.venvs/mlxft &amp;&amp; source ~/.venvs/mlxft/bin/activate
+uv pip install "mlx-lm[train]==0.32.0" "mlx-lm-lora==3.1.3" "lm-eval[api]==0.4.13" openai datasets</code></pre>
+  <p>Two numbers rule on the Mac: <b>19.07 GB</b> of recommended working set (~74% of 24 GB) and a <b>maximum buffer of 14.3 GB</b>, which no single tensor may exceed (<code>sudo sysctl iogpu.wired_limit_mb=N</code> raises the ceiling until the next boot). The student is <code>mlx-community/Qwen3-4B-Instruct-2507-4bit</code>, a <b>2.26 GB</b> file. Since it's quantized, <code>mlx_lm.lora</code> does <span class="la-term" data-term="qlora">QLoRA</span> automatically: the base stays frozen at 4 bits and only the adapters train.</p>
+  <h3>Two LoRA scales: don't copy the LR between frameworks</h3>
+  <p><a data-ch="treino-memoria-lora">Chapter 51</a> introduced <span class="la-term" data-term="lora">LoRA</span>. The detail that breaks recipes is that MLX and PEFT scale the low-rank term differently:</p>
+  <div class="la-eq">
+    \[ y = W_0x + s\cdot B\,A\,x,\qquad s_{\text{PEFT}} = \frac{\alpha}{r},\qquad s_{\text{MLX}} = \texttt{scale}\ (\text{20 in } \texttt{mlx\_lm.lora},\ \text{10 in } \texttt{mlx-lm-lora}),\qquad \eta_{\text{PEFT}}\cdot s_{\text{PEFT}} \approx \eta_{\text{MLX}}\cdot s_{\text{MLX}} \]
+    <ul class="la-eq-legend">
+      <li>\(W_0\): frozen weight; \(A\in\mathbb R^{r\times d_{in}}\) (random: \(U(\pm 1/\sqrt{d_{in}})\) in MLX) and \(B\in\mathbb R^{d_{out}\times r}\) (starts at zero)</li>
+      <li>\(r\): rank; \(\alpha\): PEFT's <code>lora_alpha</code> (default \(r=8,\ \alpha=8 \Rightarrow s=1\))</li>
+      <li>\(\eta\): learning rate. With Adam, the effective step of the product \(sBA\) scales with \(s\times\eta\) <b>[research inference]</b></li>
+      <li>example: the <code>mlx_lm.lora</code> default (LR 1e-5 × scale 20) is equivalent to PEFT with LR 2e-4 and \(\alpha/r=1\)</li>
+    </ul>
+  </div>
+  <p>By the same math, the <code>mlx-lm-lora</code> default (1e-5 × 10) is equivalent to ~1e-4 on the PEFT scale, too high for DPO, where TRL suggests ~1e-5 for adapters. That's why the Mac DPO uses 1e-6. Another difference: <code>mlx_lm.lora</code> trains the last <b>16</b> layers, while <code>mlx_lm_lora.train</code> trains <b>all</b> of them and fuses the adapter at the end by default.</p>
+  <h3>Baseline and SFT</h3>
+  <p>The baseline brings up <span class="la-term" data-term="mlx-lm-server"><code>mlx_lm.server</code></span> and runs lm-eval against it. Send the <b>same</b> model id that's loaded (a different id makes the server switch models and even download from the Hub) and use <code>num_concurrent=1</code>, because the server processes requests essentially one after another.</p>
+  <pre data-lang="bash"><code>mlx_lm.server --model mlx-community/Qwen3-4B-Instruct-2507-4bit --port 8080
+lm_eval --model local-chat-completions \
+  --model_args model=mlx-community/Qwen3-4B-Instruct-2507-4bit,base_url=http://127.0.0.1:8080/v1/chat/completions,num_concurrent=1,max_retries=3,tokenized_requests=False \
+  --apply_chat_template --tasks ifeval,gsm8k_cot_zeroshot --limit 250 \
+  --output_path results/mac/base --log_samples</code></pre>
+  <p>The SFT goes in a YAML, because <code>lr_schedule</code> and <code>lora_parameters</code> <b>only</b> exist in the file. Omitting <code>keys</code> applies LoRA to every linear in the trained layers, as <i>LoRA Without Regret</i> (Thinking Machines, 2025) recommends: attention-only LoRA at rank 256 loses to MLP-only LoRA at rank 128.</p>
+  <pre data-lang="yaml"><code>model: mlx-community/Qwen3-4B-Instruct-2507-4bit   # quantized =&gt; QLoRA automatically
+train: true
+data: data/mlx_sft                                 # train.jsonl / valid.jsonl, "chat" format
+fine_tune_type: lora
+num_layers: 16
+batch_size: 4
+grad_accumulation_steps: 2                         # effective batch 8
+iters: 600
+learning_rate: 1.0e-5                              # with scale 20
+lr_schedule:
+  name: cosine_decay
+  warmup: 30
+  arguments: [1.0e-5, 600, 1.0e-6]
+max_seq_length: 1024
+mask_prompt: true                                  # loss only on the last message (assistant)
+grad_checkpoint: true
+lora_parameters:
+  rank: 16
+  scale: 20.0
+  dropout: 0.0
+steps_per_report: 10
+steps_per_eval: 100
+adapter_path: adapters/mac_sft
+seed: 0</code></pre>
+  <p>Training memory has four parts: frozen weights, adapter state, activations and <span class="la-term" data-term="logits">logits</span>. The research's math uses the activation formula from Korthikanti et al. (about \(34\,s\,b\,h\) bytes per layer with FlashAttention):</p>
+  <div class="la-eq">
+    \[ M \approx \underbrace{M_W}_{\text{weights}} + \underbrace{16\,P_{\text{LoRA}}}_{\text{weight+grad+Adam FP32}} + \underbrace{\big(2\,s\,b\,h\,L_t + 34\,s\,b\,h\big)}_{\text{activations with checkpointing}} + \underbrace{2\cdot 4\,b\,s\,V}_{\text{FP32 logits + gradient}},\qquad P_{\text{LoRA}} = r\,L_t\sum_{\text{linears}}(d_{in}+d_{out}) \]
+    <ul class="la-eq-legend">
+      <li>\(M_W\): 2.26 GB in 4-bit (in DPO, two 8-bit copies of ≈ 4.3 GB each)</li>
+      <li>\(L_t\): trained layers (16); \(h\) = 2560; \(V\) = 151,936; \(s\): sequence; \(b\): micro-batch</li>
+      <li>in Qwen3-4B, \(\sum(d_{in}+d_{out})\) = 57,344 per layer (q, k, v, o, gate, up, down) → \(r=16,\ L_t=16\): <b>14.7 M</b> parameters, ≈ 0.24 GB of state</li>
+      <li>without <span class="la-term" data-term="gradient-checkpointing">gradient checkpointing</span>, activations become \(34\,s\,b\,h\,L_t\): 11.4 GB at \(s=2048,\ b=4\)</li>
+    </ul>
+  </div>
+  <figure class="la-fig" id="fig-mac" data-title="The Mac's tank: a fine-tune's memory in 24 GB">
+    <div class="la-fig-stage" style="height:420px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>The tank fills with the four parts of the equation above. The dashed line is the 19.07 GB working set; the amber one marks the <b>14.3 GB maximum buffer</b>, which the logits tensor alone can't exceed. Times assume 1–2 effective TFLOPS (36–72% of the 2.78 BF16 matmul TFLOPS measured on an M4 by third parties, an <b>unverified</b> number). Everything is <b>[estimate]</b>: run 20 iterations and read the <code>Peak mem</code> that <code>mlx_lm.lora</code> prints.</figcaption>
+  </figure>
+  <p>The term that grows the most isn't the model, it's the logits: \(4 \times 1024 \times 151{,}936 \times 4\) B ≈ 2.5 GB, plus the gradient. With the YAML defaults the total lands at <b>≈ 7–10 GB</b>. Try it in the figure: set batch 8 and sequence 4096. The logits tensor alone becomes 19.9 GB, exceeds the 14.3 GB buffer, and the tank overflows (≈ 48 GB in total); no rank or layer count saves this configuration. Go back to the defaults and turn off <code>grad_checkpoint</code>: activations jump from 0.7 to 5.7 GB. If it blows up, use batch 2 with accumulation 4 (same effective batch), sequence 768 or, in <code>mlx-lm-lora</code>, <code>--sft-loss-type chunked_nll</code>. Time <b>[estimate]</b>: ≈ 15 GFLOP per token (8.0 GFLOP forward + backward through the trained layers and the <code>lm_head</code> + recomputation), or 65–130 tok/s; the ~1.2 M tokens of 600 iterations take <b>2.5 to 5 hours</b>.</p>
+  <h3>DPO on the Mac: fuse the SFT at 8 bits first</h3>
+  <p>The DPO reference is the model <b>after</b> SFT. Fuse the SFT into its own checkpoint, and at <b>8 bits</b>, not 4: the LoRA delta is small compared with the step of the 4-bit grid, and part of it would vanish (the merge section shows this cell by cell). <code>mlx_lm_lora.train</code> loads the reference as a <b>second full copy</b>, and two 8-bit copies fit.</p>
+  <pre data-lang="bash"><code># 1) fuse the SFT onto the BF16 base and quantize to 8 bits
+mlx_lm.fuse --model mlx-community/Qwen3-4B-Instruct-2507-bf16 --adapter-path adapters/mac_sft --save-path models/sft_bf16 --dequantize
+mlx_lm.convert --hf-path models/sft_bf16 --mlx-path models/sft_8bit -q --q-bits 8 --q-group-size 64
+# 2) DPO: QLoRA on the 8-bit; reference = the same frozen 8-bit
+mlx_lm_lora.train --model models/sft_8bit --train --train-mode dpo \
+  --data data/mlx_dpo --beta 0.1 --dpo-cpo-loss-type sigmoid \
+  --reference-model-path models/sft_8bit \
+  --num-layers 16 --batch-size 1 --gradient-accumulation-steps 8 \
+  --learning-rate 1e-6 --lora-parameters '{"rank": 16, "dropout": 0.0, "scale": 10.0}' \
+  --max-seq-length 1024 --grad-checkpoint --epochs 1 \
+  --steps-per-eval 50 --save-every 100 --adapter-path adapters/mac_dpo</code></pre>
+  <div class="la-callout warn"><b class="t">mlx-lm-lora's automatic fuse</b><p>At the end, <code>mlx_lm_lora.train</code> fuses by default and writes the fused model (dequantized from the 8-bit) to <code>--adapter-path</code>. To keep only the adapter, pass a YAML with <code>fuse: false</code> (<code>-c cfg/mac_dpo.yaml</code>). If you left the default, <code>adapters/mac_dpo</code> is already the fused model: use it as <code>models/final_bf16</code> and skip the <code>mlx_lm.fuse</code> in the final block, further below (the base, in that case, is the dequantized 8-bit, not <code>sft_bf16</code>: a small difference).</p></div>
+  <p><code>--dpo-cpo-loss-type</code> accepts <code>sigmoid</code>, <code>hinge</code>, <code>ipo</code> and <code>dpop</code>, and <code>--train-mode</code> goes from <code>sft</code> to <code>ppo</code>, but there's no <span class="la-term" data-term="kto">KTO</span> or SimPO. For KTO on the Mac, convert the labels into pairs (best positive × worst negative) and use DPO. ORPO does without the reference: it drops one of the two 8-bit copies (−4.3 GB; in the figure, from ≈ 11.7 to ≈ 7.4 GB). DPO memory <b>[estimate]</b>: <b>11–14 GB</b>. Time: ≈ 2 sequences × (15 + 8 GFLOP/token, counting the reference forward) × ~700 tokens ≈ 32 TFLOP, or <b>16–32 s per pair</b>. Start with 300–500 pairs.</p>
+  <h3>A small GRPO, and the end of the track</h3>
+  <p>RL on the Mac works only with a small model, because every step generates text. With <code>Qwen3-1.7B-4bit</code>, groups of 4, accuracy and format rewards on GSM8K, <code>--grpo-loss-type dr_grpo</code> and <code>--beta 0.0</code> (the reference isn't even evaluated), each step takes <b>~0.5–1 min</b> <b>[estimate]</b>. Watch out for <code>mlx-lm-lora</code>'s <code>epsilon</code> (clip width): <b>1e-4</b>, much smaller than the classic 0.2.</p>
+  <p>At the end, fuse the adapter onto the BF16 version of the stage's starting point and re-quantize with a calibrated method. <span class="la-term" data-term="dwq">DWQ</span> (<code>mlx_lm.dwq</code>) distills from BF16 to 4 bits by tuning scales and biases on <i>your</i> data:</p>
+  <pre data-lang="bash"><code>mlx_lm.fuse --model models/sft_bf16 --adapter-path adapters/mac_dpo --save-path models/final_bf16 --dequantize
+mlx_lm.dwq --model models/final_bf16 --bits 4 --group-size 64 --data-path data/mlx_sft \
+  --num-samples 512 --max-seq-length 1025 --batch-size 2 --grad-checkpoint --mlx-path models/final_4bit_dwq
+python kl_mlx.py models/final_bf16 models/final_4bit_dwq data/kl_texts.jsonl   # quantization error vs the merge
+mlx_lm.server --model models/final_4bit_dwq --port 8080                         # the Latent Atlas copilot, MLX preset</code></pre>
+  <p>The research's <code>kl_mlx.py</code> computes the mean per-token \(\mathrm{KL}(P\|Q)\) and top-1 agreement. Compare models at the same precision so you don't mix quantization with drift. An alternative to “train, then quantize” is <code>mlx-lm-lora</code>'s <span class="la-term" data-term="qat">QAT</span> (<code>--qat-enable --qat-bits 4</code>), which projects the trainable weights onto the quantized grid at every step.</p>
+</section>
+
+<section class="la-sec">
+  <h2>Track B: a 27B on two Sparks</h2>
+  <p>Track B reuses the Module 1 network: on each Spark, the NCCL variables from <a data-ch="nccl-rdma">chapter 39</a> and a <code>drop_caches</code> before loading 55 GB, because in unified memory the page cache counts as used memory. The training container is NGC <code>pytorch:26.08-py3</code>, with the image's torch pinned via <code>PIP_CONSTRAINT</code>:</p>
+  <pre data-lang="bash"><code>python -c "import torch; print(f'torch=={torch.__version__}')" &gt; /work/constraints.txt
+export PIP_CONSTRAINT=/work/constraints.txt
+pip install "trl==1.14.1" "peft==0.21.2" "transformers==5.18.0" "accelerate==1.15.0" datasets \
+            "bitsandbytes==0.50.2" "liger-kernel==0.8.4" math-verify hf_transfer openai "lm-eval[api]==0.4.13"
+# Gated DeltaNet fast path: without it, GDN falls back to pure PyTorch
+pip install "flash-linear-attention==0.5.2"
+TORCH_CUDA_ARCH_LIST=12.1 pip install --no-build-isolation "causal-conv1d==1.7.0"
+python -c "import fla, causal_conv1d; print('GDN fast path OK')"</code></pre>
+  <p>The last two lines are worth hours. transformers 5.x loads the GDN kernels with a silent <i>fallback</i> to pure PyTorch. In a third-party repository (unverified), just installing the <span class="la-term" data-term="caminho-rapido-gdn">fast path</span> took Qwen3.5-2B LoRA from <b>505 to 3,076 tok/s</b> on a GB10. That's why the preflight measures 10 SFT steps: the target <b>[estimate]</b> for the 27B is 185–370 tok/s per Spark, and below 100 the fast path isn't active. These versions weren't tested together on sm_121; plan B is the older pins from the public reference (NGC 26.03, transformers 5.5.0, TRL 0.24.0).</p>
+  <h3>DDP, not FSDP: when the model fits, don't shard it</h3>
+  <p>The reflex would be to use FSDP, as in NVIDIA's multi-node playbook. But the 27B in BF16 takes 55.6 GB, and each Spark sees 121.7 GiB: it <b>fits whole on each node</b>. So the choice is symmetric <span class="la-term" data-term="ddp">DDP</span>: each Spark holds the model, processes half of the data and, at each optimizer step, only the LoRA gradients cross the <span class="la-term" data-term="roce">RoCE</span> link (217.6 M parameters at r=32, or 0.87 GB in FP32). With <span class="la-term" data-term="fsdp">FSDP</span>, every forward, backward and recomputation would all-gather the weights. With 2 ranks, each node receives the half it doesn't have: ≈ 3 all-gathers × 27.8 GB per direction <b>per micro-batch</b>. With accumulation of 16, that's ~1.3 TB per optimizer step, ≈ 67 s at 20 GB/s, as much as the compute itself (39–78 s) <b>[estimate]</b>. With DDP, the compute-to-communication ratio per step is huge, unlike the decode in <a data-ch="paralelismos">chapter 38</a>; with FSDP, the cable becomes a bottleneck for no reason.</p>
+  <figure class="la-fig wide" id="fig-cabo" data-title="Two Sparks, one cable: DDP, FSDP and asymmetric GRPO">
+    <div class="la-fig-stage" style="height:410px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>On each Spark, the layer strip shows the forward and backward sweeping through the model (or generation, on GRPO's Spark B), and the bar below is memory: the visible limit (121.7 GiB ≈ 130.7 GB) and the practical ceiling from chapter 51 (~105 GiB ≈ 113 GB). The packets on the cable have an area proportional to the bytes per step. The bottom ruler is the timeline of one step. Numbers from the research's tables, all <b>[estimate]</b>; the cable assumes ~20 GB/s effective, out of the 25 GB/s theoretical for 200 Gb/s.</figcaption>
+  </figure>
+  <p>Switch to FSDP and watch the cable become the bottleneck: the pink all-gather bar grows as long as the compute bar, and the weights per node drop by half without anyone needing that. Then go to GRPO and notice the opposite rhythm: the two nodes take turns, one generating while the other waits, and the cable only carries text in one direction and ~19 GB of weights in the other.</p>
+  <table class="la-params">
+    <thead><tr><th>Job (per Spark)</th><th>Weights</th><th>LoRA + grad + Adam</th><th>Activations</th><th>Logits</th><th>Total [estimate]</th></tr></thead>
+    <tbody>
+      <tr><td>SFT LoRA BF16, 27B, r=32, seq 4096, micro-batch 1</td><td>55.6 GB</td><td>3.5 GB</td><td>~2.7 GB + 1–2 GB peak</td><td>4096 × 248,320 × 4 B ≈ 4.1 GB (+ gradient): with PEFT, and on a VLM such as <code>Qwen3_5ForConditionalGeneration</code>, the default <code>chunked_nll</code> does not apply (<a data-ch="treino-memoria-lora">chapters 51</a> and <a data-ch="sft">52</a>); check the chosen loss in the log or set <code>use_liger_kernel=True</code></td><td><b>≈ 70–80 GB</b></td></tr>
+      <tr><td>DPO LoRA BF16, 27B, <code>max_length</code> 2048</td><td>55.6 GB (reference = adapter disabled: 0 GB extra)</td><td>3.5 GB</td><td>~2.7 GB + peak</td><td>2 × 2048 × 248,320 × 4 B ≈ 4.1 GB (+ gradient)</td><td><b>≈ 70–80 GB</b></td></tr>
+      <tr><td>QLoRA NF4, 27B (single-node alternative)</td><td>≈ 19–20 GB (embedding and <code>lm_head</code> stay BF16: 5.1 GB)</td><td>3.5 GB</td><td>same</td><td>same</td><td><b>≈ 30–40 GB</b></td></tr>
+      <tr><td>GRPO 9B, Spark A (training)</td><td>19.3 GB</td><td>~0.6–1.3 GB</td><td>~1–2 GB</td><td>≈ 3.6 GB</td><td><b>≈ 30–40 GB</b></td></tr>
+      <tr><td>GRPO 9B, Spark B (vLLM, <code>--gpu-memory-utilization 0.55</code>)</td><td>19.3 GB</td><td>—</td><td>—</td><td>—</td><td>≈ 67 GiB reserved, ~45 GiB of KV + GDN states</td></tr>
+    </tbody>
+  </table>
+  <h3>SFT: the script</h3>
+  <p>The LoRA target is a regex that matches only the language part: it excludes the <code>model.visual.*</code> tower, the <code>lm_head</code> and GDN's tiny <code>in_proj_a</code>/<code>in_proj_b</code> projections. Two lines prevent the most expensive mistakes: <code>model_init_kwargs={"dtype": torch.bfloat16}</code> (without it, TRL loads in <b>FP32</b> and the weights double) and <code>max_length</code>, whose default of 1024 truncates the <i>answer</i>.</p>
+  <pre data-lang="python"><code># train_sft.py — Qwen3.8-27B, LoRA BF16, DDP on 2 Sparks (TRL 1.14.1)
+TARGETS = r".*language_model\.layers\.\d+\.(self_attn\.(q_proj|k_proj|v_proj|o_proj)|linear_attn\.(in_proj_qkv|in_proj_z|out_proj)|mlp\.(gate_proj|up_proj|down_proj))"
+peft_config = LoraConfig(r=32, lora_alpha=32, lora_dropout=0.0, target_modules=TARGETS, task_type="CAUSAL_LM")
+args = SFTConfig(
+    output_dir="ckpt/q38-sft",
+    model_init_kwargs={"dtype": torch.bfloat16},   # without this: FLOAT32
+    max_length=4096, packing=False, assistant_only_loss=True,
+    per_device_train_batch_size=1, gradient_accumulation_steps=16,   # effective batch = 1 × 16 × 2 nodes = 32
+    num_train_epochs=2, learning_rate=1e-4,        # LoRA ≈ 10× the full-FT LR
+    lr_scheduler_type="cosine",
+    warmup_steps=0.03,                             # float &lt; 1 = fraction of steps [inference]: check the log
+    gradient_checkpointing=True, gradient_checkpointing_kwargs={"use_reentrant": False},
+    bf16=True, logging_steps=5, eval_strategy="steps", eval_steps=100,
+    save_steps=200, save_total_limit=3, ddp_find_unused_parameters=False, seed=42,
+)
+trainer = SFTTrainer(model="Qwen/Qwen3.8-27B", args=args, train_dataset=ds["train"],
+                     eval_dataset=ds["validation"], peft_config=peft_config)
+trainer.train(); trainer.save_model("adapters/q38-sft")
+
+# Spark A:  accelerate launch --config_file cfg/accel_ddp_2nodes.yaml --machine_rank 0 train_sft.py
+# Spark B:  accelerate launch --config_file cfg/accel_ddp_2nodes.yaml --machine_rank 1 train_sft.py</code></pre>
+  <p>The Accelerate YAML declares <code>distributed_type: MULTI_GPU</code>, two machines with one process each, <code>rdzv_backend: static</code> and the IP of Spark A's CX-7 port. <code>packing</code> stays off because concatenating sequences requires resetting GDN's recurrent state at every boundary, which wasn't verified in transformers 5.18. The parameter count is \(r(d_{in}+d_{out})\) per target matrix: <code>q_proj</code> 5120 → 12,288 (gated output) in the 16 attention layers, <code>in_proj_qkv</code> 5120 → 10,240 in the 48 GDN layers, <code>gate</code>/<code>up</code> 5120 → 17,408 in the 64 MLPs. Adding it all up, 6,799,360 per unit of rank: <b>217.6 M at r=32</b>, a ~435 MB BF16 adapter. A different number in <code>model.print_trainable_parameters()</code> means a wrong regex.</p>
+  <p>The other numbers in the config have a reason too. With <code>lora_alpha</code> = <code>r</code>, the scale is \(s = \alpha/r = 1\), and the LR of 1e-4 (TRL's tip for LoRA, ~10× that of full FT) applies without conversion. Rank 32 doubles the capacity of rank 16 for 1.7 GB more training state and a 435 MB adapter: little next to the model's 55.6 GB <b>[interpretation]</b>. Two epochs over ~4,000 examples already call for watching for overfitting, which is why <code>eval_loss</code> runs every 100 steps (the next section's panel shows the signature). <code>warmup_steps=0.03</code> bets on the <code>float</code> signature in transformers 5.x, where a value below 1 becomes a fraction of the steps; the research marks this as an inference, so check in the log how many warmup steps you actually got.</p>
+  <div class="la-eq">
+    \[ C_{\text{token}} \approx 6N,\qquad t \approx \frac{T\cdot 6N}{F_{\text{eff}}\cdot n_{\text{nodes}}} = \frac{7.2\times10^{6}\cdot 1.62\times10^{11}}{(30\ \text{to}\ 60)\times10^{12}\cdot 2} \approx 2.7\ \text{to}\ 5.4\ \text{h} \]
+    <ul class="la-eq-legend">
+      <li>\(6N\): forward (\(2N\)) + activation gradients (\(2N\)) + checkpointing recomputation (\(2N\)); LoRA's weight gradients are negligible</li>
+      <li>\(N\) ≈ 27 billion; \(T\) = 4,000 examples × ~900 tokens × 2 epochs = 7.2 M tokens</li>
+      <li>\(F_{\text{eff}}\): 30–60 effective TFLOPS per GB10; the 60 matches the public measurement of 370 tok/s for LoRA on Qwen3.5-27B <b>[unverified]</b></li>
+    </ul>
+  </div>
+  <div class="la-callout danger"><b class="t">Don't plan with NVIDIA's fine-tuning “peaks”</b><p>NVIDIA's blog post from 2025-10-24 publishes 53,657 tok/s for Llama 3.1 8B with LoRA on the Spark. Do the math: 53,657 × 6 × 8e9 ≈ 2.6 PFLOP/s, more than ten times the GB10's ~125 dense BF16 TFLOPS. Their metric isn't “training tokens per second” in the usual sense, and the definition wasn't published. Use FLOPs and measure.</p></div>
+  <p>To free up a Spark, there's the <b>single-node QLoRA</b> alternative: <code>SFTTrainer</code> accepts <code>quantization_config</code> directly (NF4, double quantization, as in the playbook's 70B script). It's slower, and the adapter gets used to NF4, which exacts a price at merge time.</p>
+  <h3>DPO: fuse the SFT, then train on top of it</h3>
+  <p>The intermediate SFT evaluation doesn't require a merge: vLLM serves base and adapter in the same process (<code>--enable-lora --lora-modules q38-sft=/work/adapters/q38-sft</code>), and the <code>"model"</code> field chooses between the two. For DPO, the merge is mandatory. With PEFT, the DPO reference is <b>the model itself with the adapter disabled</b>; if the SFT stayed as an adapter, disabling it would give back the <i>base</i>. Fuse the SFT into <code>models/q38-sft-bf16</code> and train DPO as a new LoRA on top of it:</p>
+  <pre data-lang="python"><code>args = DPOConfig(output_dir="ckpt/q38-dpo", model_init_kwargs={"dtype": torch.bfloat16},
+    loss_type=["sigmoid"],   # classic DPO (Bradley–Terry)
+    beta=0.1,                # default; ↑beta = stays closer to the reference
+    max_length=2048,         # default 1024
+    per_device_train_batch_size=1, gradient_accumulation_steps=16, num_train_epochs=1,
+    learning_rate=5e-6,      # TRL's tip for DPO adapters: ~1e-5; start below it
+    lr_scheduler_type="cosine", warmup_steps=0.05, gradient_checkpointing=True,
+    eval_strategy="steps", eval_steps=50, save_steps=100, seed=42)
+trainer = DPOTrainer(model="models/q38-sft-bf16", args=args, train_dataset=ds["train"],
+                     eval_dataset=ds["validation"], peft_config=LoraConfig(r=32, lora_alpha=32, target_modules=TARGETS, task_type="CAUSAL_LM"))</code></pre>
+  <p>Switching methods means changing one line: <code>loss_type=["ipo"]</code> (IPO); <code>["sigmoid_norm"]</code> (length-normalized, from Tülu 3, against verbosity); <code>["robust"]</code> with <code>label_smoothing=0.1</code> for noisy judge labels. SimPO lives in <code>trl.experimental.cpo</code>. KTO uses <code>KTOTrainer</code> with a per-device batch ≥ 4, because the KL term is estimated by pairing each prompt with a completion from <b>another</b> example in the batch. Time <b>[estimate]</b>: 2,500 pairs at 8N per token (6N for the policy + 2N for the reference) are equivalent to 6.0 M SFT tokens, or <b>2.3–4.5 h</b>.</p>
+  <h3>GRPO: one Spark generates, the other learns</h3>
+  <p>In RL the roles become <b>asymmetric</b>. Spark B runs a <code>vllm serve</code> that only generates; Spark A runs <code>GRPOTrainer</code> and pushes the updated weights over NCCL at every step (TRL's <code>"server"</code> mode; <code>"colocate"</code> would split the unified memory between training and vLLM). Spark B comes up like this:</p>
+  <pre data-lang="bash"><code># Spark B — vLLM generator with weight transfer (flags required by TRL)
+docker run -d --name gen --gpus all --network host --ipc host --shm-size 16g \
+  --device /dev/infiniband --cap-add IPC_LOCK --ulimit memlock=-1 \
+  -e VLLM_SERVER_DEV_MODE=1 -e NCCL_SOCKET_IFNAME -e GLOO_SOCKET_IFNAME -e NCCL_IB_HCA -e NCCL_IB_GID_INDEX \
+  -v $HOME/.cache/huggingface:/root/.cache/huggingface vllm/vllm-openai:v0.30.0 \
+  Qwen/Qwen3.5-9B --host 0.0.0.0 --port 8000 --tensor-parallel-size 1 \
+  --max-model-len 4096 --gpu-memory-utilization 0.55 --enable-prefix-caching \
+  --weight-transfer-config '{"backend": "nccl"}' --logprobs-mode processed_logprobs --max-logprobs -1</code></pre>
+  <p>Three lines need care. <code>VLLM_SERVER_DEV_MODE=1</code> exposes the weight-update endpoints and other development ones: keep the server on the CX-7 cable's private network. <code>--logprobs-mode processed_logprobs</code> returns logprobs after temperature and the processors, which is what TRL's importance-sampling correction expects. And <code>--device /dev/infiniband</code> with <code>IPC_LOCK</code> gives NCCL the RDMA path from chapter 39. Don't add the production server's <code>--language-model-only</code>: the trainer syncs the weights of the whole model TRL loaded, vision tower included <b>[research inference]</b>.</p>
+  <div class="la-callout warn"><b class="t">The trainer needs vLLM too</b><p>TRL's weight-transfer client imports the <code>vllm</code> package itself, so the SFT's NGC PyTorch image isn't enough on Spark A. Run both nodes on the <code>vllm/vllm-openai:v0.30.0</code> image and, on Spark A, install into it <code>pip install "trl==1.14.1" "peft==0.21.2" math-verify</code>.</p></div>
+  <pre data-lang="python"><code># train_grpo.py (excerpt) — Spark A; GSM8K becomes "prompt" + "solution", the column accuracy_reward reads
+def to_rl(ex):
+    sol = ex["answer"].split("####")[-1].strip().replace(",", "")
+    return {"prompt": [{"role": "user", "content": ex["question"] + "\nSolve it and write the final answer in \\boxed{}."}], "solution": sol}
+train = load_dataset("openai/gsm8k", "main", split="train").map(to_rl, remove_columns=["question", "answer"])
+
+args = GRPOConfig(output_dir="ckpt/q35-9b-grpo", model_init_kwargs={"dtype": torch.bfloat16},
+    use_vllm=True, vllm_mode="server", vllm_server_host="10.10.10.2", vllm_server_port=8000,  # Spark B's CX-7 IP
+    chat_template_kwargs={"enable_thinking": False},
+    num_generations=8,                       # G: group size
+    per_device_train_batch_size=4, gradient_accumulation_steps=32,   # 128 completions = 16 prompts × 8
+    max_completion_length=768, temperature=1.0, top_p=0.95, top_k=20,
+    loss_type="dapo", epsilon=0.2, epsilon_high=0.28,   # DAPO's clip-higher
+    mask_truncated_completions=True,         # DAPO's "overlong filtering"
+    beta=0.001,     # small β: KL enters the loss with minimal weight and gets logged;
+                    # costs an extra reference forward (adapter disabled)
+    learning_rate=1e-5, lr_scheduler_type="constant_with_warmup", warmup_steps=5,
+    max_steps=150, log_completions=True, gradient_checkpointing=True, seed=42)
+trainer = GRPOTrainer(model="Qwen/Qwen3.5-9B",
+    reward_funcs=[accuracy_reward, get_soft_overlong_punishment(max_completion_len=768, soft_punish_cache=128)],
+    args=args, train_dataset=train, peft_config=LoraConfig(r=16, lora_alpha=16, target_modules=TARGETS, task_type="CAUSAL_LM"))
+trainer.train(); trainer.save_model("adapters/q35-9b-grpo")
+
+# Spark A:  accelerate launch --num_processes 1 train_grpo.py      (one process; Spark B only generates)</code></pre>
+  <p>Without <code>to_rl</code>, the dataset arrives with <code>question</code>/<code>answer</code> and <code>accuracy_reward</code> can't find the <code>solution</code> column. Each config parameter answers a question from <a data-ch="grpo-rlvr">chapter 56</a>:</p>
+  <table class="la-params">
+    <thead><tr><th>Parameter</th><th>Value</th><th>Why it matters</th></tr></thead>
+    <tbody>
+      <tr><td><code>num_generations</code> (G)</td><td>8 (default)</td><td>the advantage uses the group's mean and standard deviation, estimated from G samples. With accuracy \(p\) on a prompt, the group teaches nothing with probability \(p^G + (1-p)^G\): for \(p = 0.8\), 0.41 with G = 4 and 0.17 with G = 8. A larger G brings <code>frac_reward_zero_std</code> down, at the cost of more generation per step</td></tr>
+      <tr><td><code>per_device_train_batch_size</code> × <code>gradient_accumulation_steps</code></td><td>4 × 32</td><td>128 completions per optimizer step = 16 prompts × 8</td></tr>
+      <tr><td><code>epsilon</code> · <code>epsilon_high</code></td><td>0.2 · 0.28</td><td>DAPO's <i>clip-higher</i>: a token with \(\pi_{\text{old}} = 0.01\) and positive advantage can rise to 0.0128, not just to 0.012. Rare exploration tokens grow, which fights entropy collapse</td></tr>
+      <tr><td><code>mask_truncated_completions</code></td><td>True</td><td>a completion cut off at 768 tokens has no verifiable final answer; without the mask, it counts as wrong and punishes long reasoning itself, a wrong signal</td></tr>
+      <tr><td><code>get_soft_overlong_punishment</code></td><td>768, 128</td><td>linear penalty over the last 128 tokens: zero up to 640, \((640 - |y|)/128\) between 640 and 768, −1 beyond. It warns that the limit is near before the cutoff</td></tr>
+      <tr><td><code>temperature</code> · <code>top_p</code> · <code>top_k</code></td><td>1.0 · 0.95 · 20</td><td>temperature 1 to explore; <code>top_p</code> and the Qwen card's <code>top_k</code> 20 only trim the tail of unlikely tokens <b>[research recommendation]</b></td></tr>
+      <tr><td><code>beta</code></td><td>0.001</td><td>the default is 0 (no reference). A minimal β turns on the KL term and the <code>kl</code> metric; with PEFT, the reference is the same model with the adapter disabled: zero extra memory, but one more forward (2N FLOPs per token)</td></tr>
+      <tr><td><code>learning_rate</code></td><td>1e-5</td><td>the 1e-6 default is for full FT; LoRA calls for ~10× (<i>LoRA Without Regret</i>)</td></tr>
+    </tbody>
+  </table>
+  <p>With PEFT, at every sync TRL merges the adapter, transmits the merged weights (≈ 19.3 GB) and undoes the merge: 1–2 s per step at ~10–20 GB/s. With 128 completions of ~400 tokens (45–85 s of generation) and training on ~67 thousand tokens at 8N per token (6N for the policy + 2N for the reference forward that β &gt; 0 requires: 87–173 s), that comes to <b>2.2 to 4.3 min per step</b>, and 150 steps take 5.5–11 h <b>[estimate]</b>. With <code>beta=0.0</code> the step goes back to 2–3.6 min, but KL is no longer logged. The <span class="la-term" data-term="vantagem-de-grupo">group advantage</span> from chapter 56 explains the most important metric of this run:</p>
+  <div class="la-eq">
+    \[ \hat A_i = \frac{r_i - \text{mean}(r_1,\dots,r_G)}{\text{std}(r_1,\dots,r_G)},\qquad \texttt{frac\_reward\_zero\_std} = \Pr\big[\text{std}(r_{1..G}) = 0\big] \]
+    <ul class="la-eq-legend">
+      <li>\(r_i\): reward of completion \(i\) in the group (0 or 1 with <code>accuracy_reward</code>, verified with <code>math_verify</code>)</li>
+      <li>\(G\) = 8 completions per prompt; <code>scale_rewards="group"</code> is the default</li>
+      <li>if all 8 are right (or all 8 wrong), the standard deviation is zero and the group teaches nothing: <span class="la-term" data-term="frac-reward-zero-std"><code>frac_reward_zero_std</code></span> → 1 points to a dataset that's too easy or too hard</li>
+    </ul>
+  </div>
+  <p>A domain variant that's great for teaching <i>reward hacking</i>: code-generated problems with exact answers (GB of weights per format, KiB of KV per token) and a reward that requires <b>exactly one</b> <code>\boxed{}</code>. A reward that only checks “the number appears in the answer” gets gamed by listing several numbers.</p>
+</section>
+
+<section class="la-sec">
+  <h2>Watching the training and deciding with gates</h2>
+  <p>An hours-long training run can go wrong in ways the loss doesn't show. Each algorithm has its own problem signature, in the metrics TRL logs:</p>
+  <table class="la-params">
+    <thead><tr><th>Algorithm</th><th>Metric</th><th>Normal</th><th>Suspicious</th><th>Reading and fix</th></tr></thead>
+    <tbody>
+      <tr><td>SFT</td><td><code>loss</code> vs <code>eval_loss</code></td><td>both drop</td><td>train ↓, eval ↑</td><td>overfitting: fewer epochs or a lower LR</td></tr>
+      <tr><td>SFT</td><td><code>mean_token_accuracy</code></td><td>rises slowly</td><td>~1.0 early</td><td>memorization or duplicated data</td></tr>
+      <tr><td>DPO</td><td><code>rewards/accuracies</code></td><td>0.6–0.8</td><td>→ 1.0 fast</td><td>pairs too easy, or length bias being exploited</td></tr>
+      <tr><td>DPO</td><td><code>rewards/margins</code> and <code>logps/chosen</code></td><td>margin rises</td><td>margin rises while <code>logps/chosen</code> plunges</td><td><span class="la-term" data-term="likelihood-displacement">likelihood displacement</span>: ↑β, <code>loss_type=["sigmoid","sft"]</code> or <code>apo_zero</code></td></tr>
+      <tr><td>GRPO</td><td><code>reward</code> and <code>completions/mean_length</code></td><td>reward rises</td><td>rises with length exploding</td><td>length or format hacking: read samples, harden the verifier</td></tr>
+      <tr><td>GRPO</td><td><code>entropy</code></td><td>drops slowly</td><td>collapses early</td><td>entropy collapse: DAPO's clip-higher exists for this</td></tr>
+      <tr><td>GRPO + vLLM</td><td><code>sampling/sampling_logp_difference/mean</code></td><td>~0</td><td>large</td><td>training × inference mismatch (dtype, kernels)</td></tr>
+    </tbody>
+  </table>
+  <p><i>Likelihood displacement</i> deserves an explanation. DPO doesn't optimize the probability of the chosen response; it optimizes the <b>difference</b> between the two responses' implicit rewards:</p>
+  <div class="la-eq">
+    \[ \hat r_\theta(x,y) = \beta\,\log\frac{\pi_\theta(y\mid x)}{\pi_{\text{ref}}(y\mid x)},\qquad \texttt{rewards/margins} = \hat r_\theta(x,y_w) - \hat r_\theta(x,y_l) \]
+    <ul class="la-eq-legend">
+      <li>\(\hat r_\theta\): DPO's <span class="la-term" data-term="recompensa-implicita">implicit reward</span> (it's what TRL logs under <code>rewards/*</code>)</li>
+      <li>\(y_w\), \(y_l\): chosen and rejected response; \(\beta\): strength of the anchor to the reference</li>
+      <li><code>logps/chosen</code> = \(\log\pi_\theta(y_w\mid x)\): it can <b>fall</b> while the margin rises, if \(\log\pi_\theta(y_l)\) falls even faster</li>
+    </ul>
+  </div>
+  <p>If both probabilities fall, the mass goes somewhere, sometimes to responses with the opposite meaning. In the example from the paper that named the phenomenon (arXiv 2410.08847), training to refuse <b>reduced</b> Llama-3-8B-Instruct's refusal rate from 74.4% to 33.4%. Anchoring the chosen response with an NLL term (<code>loss_type=["sigmoid","sft"]</code>), raising β or filtering out very similar pairs (the paper's CHES score) mitigates the problem.</p>
+  <figure class="la-fig" id="fig-painel" data-title="The training dashboard: three algorithms, three diseases">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Four metrics per algorithm, with the names TRL logs (DPO's length comes from the samples), drawn while the training “runs”. The lamps light up when the table's rule fires, and the diagnosis box gives the fix. The curves are <b>illustrative</b>: their shapes follow the signatures described in the research, but the values don't come from a real training run.</figcaption>
+  </figure>
+  <p>Pick DPO and the “problem” scenario, and watch the order in which the lamps light up: the <code>logps/chosen</code> lamp turns amber and then red well before the <code>rewards/accuracies</code> one. The drop in the chosen response's log-prob is the early warning; by the time reward accuracy touches 1.0, the damage is done. In GRPO, the same role belongs to mean length, which shoots up before entropy collapses.</p>
+  <h3>Preregistered gates</h3>
+  <p><a data-ch="avaliacao-pos-treino">Chapter 62</a> discussed evaluation in depth. In the recipe, it becomes a list of <span class="la-term" data-term="portao-de-decisao">gates</span> written <b>before</b> looking at the numbers, so you don't pick the checkpoint that happened to do best on the last benchmark you looked at.</p>
+  <table class="la-params">
+    <thead><tr><th>Axis</th><th>Measure</th><th>Suggested gate [recommendation]</th></tr></thead>
+    <tbody>
+      <tr><td>Target</td><td><span class="la-term" data-term="win-rate">WR</span> and <span class="la-term" data-term="wr-lc">WR-LC</span> against the base on <code>test_dominio</code> (judge from another family, both orders), 95% CI by bootstrap</td><td>lower bound of the WR-LC CI &gt; 50% and WR-LC ≥ 60%</td></tr>
+      <tr><td>Target</td><td>numeric accuracy with 1% tolerance</td><td>rises against the base, with a CI that doesn't cross zero</td></tr>
+      <tr><td>Regression</td><td>IFEval (<code>prompt_level_strict_acc</code>), GSM8K Platinum, AIME 2025 (2 seeds), with and without thinking</td><td>Δ ≥ −2 pp (IFEval, GSM8K); AIME Δ within the CI</td></tr>
+      <tr><td>Safety</td><td>XSTest (refusal on the 250 safe prompts); StrongREJECT (subset)</td><td>refusal on safe prompts doesn't rise more than 2 pp; StrongREJECT score doesn't rise</td></tr>
+      <tr><td>Drift</td><td>per-token KL(base‖candidate) on generic and domain text</td><td>report it; investigate if the generic KL is much larger than SFT's</td></tr>
+      <tr><td>Speed</td><td>MTP acceptance per position, base vs candidate</td><td>report it: it affects serving cost</td></tr>
+    </tbody>
+  </table>
+  <div class="la-eq">
+    \[ \widehat{\mathrm{WR}} = \frac{W + \tfrac12 T}{n},\qquad \text{95\% CI half-width} \approx 1.96\sqrt{\frac{p(1-p)}{n}} \;\xrightarrow{\ p\,=\,0.5\ }\; \pm 9.8\ \text{pp}\ (n=100),\ \ \pm 4.9\ \text{pp}\ (n=400) \]
+    <ul class="la-eq-legend">
+      <li>\(W, T\): the candidate's wins and ties over \(n\) prompts (a tie counts as half a point)</li>
+      <li>in practice, use a <b>per-prompt bootstrap</b> (B = 2,000 resamples, 2.5% and 97.5% percentiles); to compare two candidates, resample the pairs</li>
+      <li>hence the 300–500 domain prompts: differences smaller than the half-width are noise</li>
+    </ul>
+  </div>
+  <p>The logistics catch anyone who didn't plan: the judges occupy both Sparks, and so do the candidates. The order is: serve the candidates and <b>record</b> every answer, run the verifiable tasks, tear everything down, bring up the judge recipe and judge the recorded answers. And remember that the DPO is an adapter on top of the <b>merged SFT</b>: serve it on <code>models/q38-sft-bf16</code>, never on the original Qwen3.8-27B, because an adapter is only valid on the base it was trained on.</p>
+</section>
+
+<section class="la-sec">
+  <h2>Merge: putting the adapter back into the weights</h2>
+  <p>Once past the gates, the adapter goes back inside the matrix. The <span class="la-term" data-term="merge-de-adaptador">merge</span> is the computation \(W' = W_0 + s\,B\,A\): after it, inference pays nothing for LoRA. But the computation is only exact if \(W_0\) is the weight the adapter saw, at a precision able to represent \(s\,BA\). Hence three rules:</p>
+  <ol class="la-steps">
+    <li><b>Load the base in BF16, never the 4-bit from QLoRA training.</b> <code>merge_and_unload</code> on 4-bit weights dequantizes, adds and re-quantizes, losing part of the delta.</li>
+    <li><b>In MLX, use <code>--dequantize</code>.</b> Without it, on a quantized base, <code>mlx_lm.fuse</code> dequantizes the layer, adds the delta and <b>re-quantizes with the same bits, group and mode</b>, recomputing scales and biases from the merged weight (<span class="la-term" data-term="rtn">RTN</span>, no calibration).</li>
+    <li><b>Save everything that isn't a weight:</b> tokenizer, <code>chat_template.jinja</code>, <code>preprocessor_config.json</code> (it's a VLM) and <code>generation_config.json</code>.</li>
+  </ol>
+  <p>Rule 2 comes down to simple math. <code>fuse</code> recomputes the group's scale from the merged weight (\(\Delta' \approx \Delta\), because \(\Delta W\) barely moves the group's min and max) and re-rounds everything. Deltas below ~\(\Delta/2\) get lost and, since the values were already on the old grid and now fall on a slightly shifted grid, the re-rounding also adds new noise. The inequality remains the rule of thumb:</p>
+  <div class="la-eq">
+    \[ \begin{gathered} \hat w' = \Delta'\,\text{round}\!\Big(\frac{\hat w + \Delta W - m'}{\Delta'}\Big) + m',\qquad \Delta = \frac{\max W_g - \min W_g}{2^{b}-1} \\ |\Delta W| \lesssim \tfrac{\Delta}{2}\ \Rightarrow\ \text{the delta is lost in rounding} \end{gathered} \]
+    <ul class="la-eq-legend">
+      <li>\(\hat w = q\,\Delta + m\): the dequantized weight before the merge, with \(q\) an integer from 0 to \(2^b - 1\) and \(m\) the group's minimum (the <i>bias</i> of MLX's affine mode); \(W_g\): the group's 64 weights</li>
+      <li>\(\Delta', m'\): scale and minimum recomputed on the merged weight; \(\Delta' \approx \Delta\), but the grid shifts, and \(\hat w\) no longer falls exactly on a level</li>
+      <li>\(b\) = 4 bits → 15 steps per group, so the step is 1/15 of the range; with 8 bits there are 255 steps, ~17× smaller</li>
+      <li>in a simulation with groups of 64 and weights \(N(0,\,0.02)\), \(|\Delta W|\) at 2% of the standard deviation gives a “preserved” of −0.60 at 4 bits (the merge adds more noise than delta) and +0.93 at 8 bits <b>[illustrative simulation]</b></li>
+      <li>hence track A's “fuse the SFT at 8 bits”: the delta that vanishes on the 4-bit grid survives on the 8-bit one</li>
+    </ul>
+  </div>
+  <figure class="la-fig" id="fig-merge" data-title="LoRA inside out: B·A, the merge and the grid that swallows the delta">
+    <div class="la-fig-stage" style="height:470px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>A real 6×6 matrix, with synthetic weights at the typical scale (std 0.02; values shown ×100). \(B\) starts at zero and grows during “training”; the product \(s\,BA\) has rank \(r\). Below, the integer codes (one row = one group, affine RTN as in MLX: scale and minimum per group, \(2^b - 1\) steps) before and after the merge without <code>--dequantize</code>: <code>mlx_lm.fuse</code> dequantizes, adds \(\Delta W\) and re-quantizes with the same bits, <b>recomputing scale and minimum</b> from the merged weight. The pink rings mark the codes that changed; the dashed outline marks values that moved only because the grid shifted. “ΔW preserved” compares the delta that actually went in with the intended \(\Delta W\); below zero, the merge added more noise than delta. The toy has only 6 weights per group, so its step is smaller than in a real group of 64: read the \(|\Delta W|\)/half-step ratio, not the percentage. The “abliteration” mode swaps LoRA for chapter 19's rank-1 edit. Real arithmetic; matrix and magnitudes are <b>illustrative</b>.</figcaption>
+  </figure>
+  <p>Play with the delta's magnitude and with the grid. Bring \(|\Delta W|\) to 2% of the standard deviation at 4 bits: no code changes, but all 36 values move, because the grid was recomputed, and “preserved” goes negative. The merge made the weight worse instead of applying the delta. Raise the magnitude and the codes start jumping whole steps: the applied delta becomes a caricature of the intended one. At 8 bits the step is ~17× smaller and re-rounding costs little; in BF16, almost everything gets through. This does <i>not</i> rule out serving a fine-tune at 4 bits. A calibrated method (GPTQ, AWQ, DWQ) picks scales and roundings by looking at the <b>merged model</b>, which already contains the delta, and distributes the error so as to preserve the output. What fails is the shortcut: adding the delta onto a frozen 4-bit grid.</p>
+  <div class="la-callout deep"><b class="t">The QLoRA-specific problem</b><p>A QLoRA adapter learned to correct \(\mathrm{deq}(W_{\text{NF4}})\), not \(W_{\text{BF16}}\). Merging into \(W_{\text{BF16}}\) gives \(W_{\text{BF16}} + BA \neq \mathrm{deq}(W_{\text{NF4}}) + BA\), and the difference is the quantization error the adapter may have been compensating for. Merging into \(\mathrm{deq}(W_{\text{NF4}})\) preserves the trained function, but “bakes” the NF4 error into the model. Either way, measure the KLD against the trained model. In track A, the mismatch from merging onto BF16 is small and acceptable.</p></div>
+  <h3>The MTP that transformers throws away</h3>
+  <p>When loading Qwen3.5/3.8, transformers <b>discards</b> the <code>mtp.*</code> tensors (<code>_keys_to_ignore_on_load_unexpected = [r"^mtp.*"]</code>). Saving the merged model without them breaks the <code>--speculative-config '{"method":"mtp",…}'</code> from <a data-ch="mtp-eagle-vocab">chapter 36</a>. <code>RedHatAI/Qwen3.8-27B-NVFP4</code> solves this with 15 <code>mtp.*</code> tensors in a separate shard and a rewritten index, the same technique as the <span class="la-rb glm"></span> recipe's <code>tools/dense_overlay.py</code>.</p>
+  <pre data-lang="python"><code># merge.py (excerpt) — merges in BF16 and preserves MTP, processor and template
+model = Qwen3_5ForConditionalGeneration.from_pretrained(src, dtype=torch.bfloat16, device_map="cuda")   # BF16, never NF4
+model = PeftModel.from_pretrained(model, a.adapter).merge_and_unload()
+model.save_pretrained(a.out, max_shard_size="5GB")
+AutoProcessor.from_pretrained(src).save_pretrained(a.out)
+for f in ("chat_template.jinja", "generation_config.json", "preprocessor_config.json", "video_preprocessor_config.json"):
+    if os.path.exists(os.path.join(src, f)):
+        shutil.copy(os.path.join(src, f), a.out)
+wm = json.load(open(os.path.join(src, "model.safetensors.index.json")))["weight_map"]
+mtp = {}
+for k, shard in wm.items():
+    if k.startswith("mtp."):
+        with safe_open(os.path.join(src, shard), "pt") as f:
+            mtp[k] = f.get_tensor(k)
+if mtp:   # the MTP is still the base's: expect lower acceptance
+    save_file(mtp, os.path.join(a.out, "model_mtp.safetensors"), metadata={"format": "pt"})
+    idx = json.load(open(p := os.path.join(a.out, "model.safetensors.index.json")))
+    idx["weight_map"].update({k: "model_mtp.safetensors" for k in mtp}); json.dump(idx, open(p, "w"), indent=2)
+
+# usage: python merge.py --base models/q38-sft-bf16 --adapter adapters/q38-dpo --out models/q38-final-bf16</code></pre>
+  <p><code>--base</code> is the merged SFT, because the DPO was trained on top of it. Before quantizing, <b>verify the merge</b>: logits for a few prompts with base + adapter via PEFT and with the merged model, one at a time (two 27Bs don't fit together on a Spark). The research recommends a max |Δlogit| on the order of BF16 rounding and identical top-1 at ≥ 99.9% of positions. Also check the saved key names against the original index: transformers 5.x applies conversion mappings on load and on save. Time <b>[estimate]</b>: ~111 GB of I/O at ~4.9 GB/s of NVMe, plus loading and merging, <b>5 to 15 minutes</b>.</p>
+</section>
+
+<section class="la-sec">
+  <h2>Re-quantizing: calibrate again, on the model you trained</h2>
+  <p>The <span class="la-term" data-term="calibracao">calibration</span> from <a data-ch="quantizacao-fundamentos">chapter 20</a> measures activations to choose scales and roundings. After the fine-tune, that measurement is stale. Four principles apply to any format:</p>
+  <ol class="la-steps">
+    <li><b>Nothing from the quantized base can be reused.</b> Per-group scales, Hessians (<span class="la-term" data-term="gptq">GPTQ</span>, EXL3), activation scales (<span class="la-term" data-term="awq">AWQ</span>), NVFP4 global scales and static KV scales were all estimated on the <b>base</b>. Redo everything from the merged BF16.</li>
+    <li><b>Calibration data = usage distribution.</b> Mix samples from your SFT/DPO data, in the real template, with generic chat. Domain-only overfits the quantization to the domain; generic-only underestimates the domain's activations.</li>
+    <li><b>Keep in high precision what the original kept:</b> embeddings, <code>lm_head</code>, GDN's <code>in_proj_a</code>/<code>in_proj_b</code>, the vision tower and the MTP head, which wasn't trained.</li>
+    <li><b>Measure against the BF16 merge</b>, not against the original base (next section).</li>
+  </ol>
+  <p>Principle 2 is a compromise. A calibrated method chooses the scale that minimizes the error <i>on the calibration distribution</i>. If the domain has larger activations (units, numbers, flags that generic text barely contains), calibrating on generic data alone clips those activations, and calibrating on domain data alone stretches the scale and wastes resolution on everything else.</p>
+  <p>Each method in the recipe uses the calibration batch in its own way. The <span class="la-term" data-term="gptq">GPTQ</span> from <a data-ch="quantizacao-fundamentos">chapter 20</a> picks the quantized weights that best preserve the layer's <b>output</b> on the calibration activations:</p>
+  <div class="la-eq">
+    \[ \min_{\hat W}\ \big\|W X - \hat W X\big\|_F^2,\qquad H = 2\,X X^\top \]
+    <ul class="la-eq-legend">
+      <li>\(X\): the layer's input activations on <b>your</b> calibration batch (one column per token); \(\hat W\): the quantized weight</li>
+      <li>\(H\): the Hessian of this loss; GPTQ quantizes column by column and uses \(H^{-1}\) to push the error onto the columns that haven't been quantized yet</li>
+      <li>domain and generic data produce different \(X\), hence different \(H\), and change where GPTQ spends precision</li>
+    </ul>
+  </div>
+  <p><span class="la-term" data-term="awq">AWQ</span> looks for per-channel scales based on the mean magnitude of each input channel measured in \(X\), protecting the channels that carry the most activation. In NVFP4, activations get dynamic scales per block of 16 at every token, and calibration only fixes the static global scale (the checkpoint's <code>input_scale</code>). The toy in the figure below is a per-tensor clip, the same kind of static scale as the recipe's <code>static_minmax</code> FP8 KV.</p>
+  <figure class="la-fig wide" id="fig-calib" data-title="Where each format lives, and what the calibration mix decides">
+    <div class="la-fig-stage" style="height:470px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>On top, the 64 layers of Qwen3.8-27B with the formats from llm-compressor's NVFP4 recipe: attention and GDN in dynamic FP8, MLPs in NVFP4, the <b>last 8 MLPs (56–63) in FP8</b>, and <code>lm_head</code>, MTP, vision and <code>in_proj_a/b</code> left out of quantization; hover over (or tap) a layer. The calibration batch flows through the layers with the mix set by the control. Below, a toy model with real arithmetic: the clip of a 4-bit grid <b>per tensor</b> (a single static scale, like the recipe's <code>static_minmax</code> FP8 KV) is chosen to minimize the error on the calibration mix, and the curves show the resulting error on generic and domain text. The activations are <b>illustrative</b> (the domain has 8% of values ~4× larger).</figcaption>
+  </figure>
+  <p>Drag the fraction to 0%: the clip fits generic data only (2.5σ) and the domain error goes from 5% to almost 19%, nearly four times more. Take it to 100% and generic text pays: the clip stretches to 6.7σ and its error rises from 1.3% to 7.4%. The optimum is in the middle, which is why the research's <code>quant_nvfp4.py</code> uses <b>256 in-house samples + 256 from UltraChat</b>, at sequence length 4096. The recipe starts from llm-compressor's official example for Qwen3.8-27B and changes three things: the calibration data (instead of <code>perfectblend</code>), <code>lm_head</code> and <code>re:^mtp.*</code> in <code>ignore</code> (as in the checkpoint published by RedHatAI), and no <code>moe_calibrate_all_experts</code>, because the 27B isn't MoE:</p>
+  <pre data-lang="python"><code>recipe = [
+    AWQModifier(duo_scaling="both"),
+    GPTQModifier(
+        config_groups={
+            "attention": QuantizationScheme(targets=[
+                r"re:.*self_attn\.(q|k|v|o)_proj$",
+                r"re:.*linear_attn\.(in_proj_qkv|in_proj_z|out_proj)$",
+                r"re:.*layers\.(56|57|58|59|60|61|62|63)\.mlp\..*(gate|up|down)_proj$"], **FP8_DYNAMIC),
+            "mlp": QuantizationScheme(targets=[r"re:.*mlp\..*(gate|up|down)_proj$"], **NVFP4),
+        },
+        ignore=["re:visual.*", "re:model.visual.*", "lm_head", "re:^mtp.*"],
+        kv_cache_scheme={"num_bits": 8, "type": "float", "symmetric": True, "strategy": "tensor",
+                         "dynamic": False, "observer": "static_minmax"},
+    ),
+]
+oneshot(model=model, processor=proc, recipe=recipe, dataset=ds, max_seq_length=4096, num_calibration_samples=len(ds))
+# afterwards: copy chat_template.jinja / *preprocessor_config.json and re-add model_mtp.safetensors</code></pre>
+  <p>Time <b>[rough estimate]</b>: one forward over the ~2.1 M calibration tokens costs ≈ 1.2e17 FLOP (30–60 min), and AWQ and GPTQ solve layer by layer, so the total is <b>several hours</b>. Test first with 128 samples × 2,048 tokens, ≈ 1/8 of the cost. The expected size is comparable to the <b>24.69 GB</b> of <code>RedHatAI/Qwen3.8-27B-NVFP4</code>.</p>
+  <table class="la-params">
+    <thead><tr><th>Format</th><th>Tool</th><th>When to use it</th></tr></thead>
+    <tbody>
+      <tr><td><span class="la-term" data-term="nvfp4">NVFP4</span> W4A4 (MLP) + FP8 (attention/GDN) + FP8 KV</td><td><span class="la-term" data-term="llm-compressor">llm-compressor</span> 0.14.0, your mix, 512 × 4096</td><td>production on vLLM (recommended)</td></tr>
+      <tr><td>NVFP4 (NVIDIA's recipe)</td><td><span class="la-term" data-term="modelopt">ModelOpt</span> from <i>main</i> (the card cites v0.48.0), <code>hf_ptq.py --recipe …/nvfp4_w4a4_mlp_fp8_attn_local_hessian --dataset your.jsonl,cnn_dailymail --calib_size 512,512 --calib_seq 4096</code></td><td>reproducing <code>nvidia/Qwen3.8-27B-NVFP4</code>; beforehand, <code>git ls-tree -r --name-only HEAD modelopt_recipes/models/Qwen/Qwen3.8-27B/</code> confirms the recipe exists in the version you pinned</td></tr>
+      <tr><td>W4A16 INT4 (GPTQ + AWQ)</td><td>llm-compressor</td><td>when NVFP4 isn't an option</td></tr>
+      <tr><td><span class="la-term" data-term="exl3">EXL3</span></td><td>exllamav3 v1.5.3, <code>convert.py -b 4.0 -hb 6</code></td><td>the exact KLD panel; upstream vLLM does <b>not</b> load EXL3</td></tr>
+      <tr><td>dynamic FP8</td><td>llm-compressor, no calibration</td><td>cheap baseline: separates “the fine-tune made it worse” from “the 4-bit made it worse”</td></tr>
+      <tr><td>MLX 4-bit</td><td><code>mlx_lm.dwq</code>, <code>awq</code> or <code>gptq</code></td><td>track A</td></tr>
+    </tbody>
+  </table>
+  <p>To calibrate expectations, the <code>nvidia/Qwen3.8-27B-NVFP4</code> card (2,048 samples from Nemotron-Post-Training-Dataset-v3, <i>local Hessian</i> algorithm) reports, from BF16 to NVFP4: GPQA Diamond 88.92 → 88.01; Terminal-Bench 75.56 → 74.02; IFBench 80.07 → 78.93; AA-LCR 72.63 → 73.38. Drops of ~1 point, sometimes gains within the noise: that's the level to aim for.</p>
+</section>
+
+<section class="la-sec">
+  <h2>Measuring the damage: two KLDs you must not mix up</h2>
+  <p><a data-ch="medindo-qualidade">Chapter 25</a> measured quantization with a single question: “is the served model still the same?”. In post-training there are <b>two</b> questions, each with its own reference, and swapping them is the most common mistake in this phase:</p>
+  <table class="la-params">
+    <thead><tr><th>Question</th><th>P (reference)</th><th>Q (candidate)</th><th>Expected</th></tr></thead>
+    <tbody>
+      <tr><td>What did post-training change?</td><td>original base, BF16</td><td>fine-tuned, BF16 (merge or base + adapter)</td><td>small on generic text; large on the domain, which is the intended effect</td></tr>
+      <tr><td>How much damage did quantization do?</td><td><b>fine-tuned BF16 (merge)</b></td><td>fine-tuned, quantized</td><td>on the order of what the same format causes on the base</td></tr>
+      <tr><td>Does the adapter work on a quantized base?</td><td>BF16 base + LoRA</td><td>quantized base + LoRA</td><td>≈ the KLD of the quantized base alone</td></tr>
+    </tbody>
+  </table>
+  <div class="la-eq">
+    \[ \mathrm{KL}(P\,\|\,Q) = \frac{1}{|\mathcal T|}\sum_{t\in\mathcal T}\ \sum_{v} p_t(v)\,\big(\log p_t(v) - \log q_t(v)\big)\quad[\text{nats}] \]
+    <ul class="la-eq-legend">
+      <li>\(p_t, q_t\): next-token distributions at position \(t\), with the same text forced on both models (teacher-forced)</li>
+      <li>\(\mathcal T\): evaluated positions (generic text, domain text and the model's own answers)</li>
+      <li>also report the per-token median and p90, the perplexity of P and of Q, and top-1 agreement</li>
+    </ul>
+  </div>
+  <p>If you measure quantization against the <i>base</i>, post-training <span class="la-term" data-term="kl-de-deriva">drift</span> enters the computation, and on the domain it's huge by definition. The number comes out high, you blame NVFP4, and NVFP4 wasn't the problem.</p>
+  <figure class="la-fig" id="fig-kld" data-title="Two questions, two references: drift and damage">
+    <div class="la-fig-stage" style="height:450px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>The bars are the next-token distributions at one position: base (lavender), fine-tuned BF16 (mint) and fine-tuned NVFP4 (amber). The meters compute the actual KL over these bars. The bottom ruler (log scale) holds the anchors <b>measured</b> on GLM-5.3-Flash with the recipe's protocol (51,175 positions): EXL3 K6 0.013723, EXL3 4 bpw 0.024555, official FP8 on the same stack 0.024629 (it ties the EXL3 4 bpw, so the two share a label) and NVFP4 0.060535 nats. The distributions are <b>illustrative</b>.</figcaption>
+  </figure>
+  <p>Switch the reference to the base on domain text. The damage meter jumps from 0.013 to 1.04 nats, about 80 times more, and lands far from every anchor on the ruler: it looks as if NVFP4 destroyed the model. On generic text, the same switch barely changes anything (0.008 → 0.013 nats). That's why the mistake goes unnoticed when you only measure on generic text.</p>
+  <p>Three tools, in order of exactness. <b>(1)</b> exllamav3's <span class="la-term" data-term="model-diff"><code>eval/model_diff.py</code></span> compares an EXL3 with the merged BF16 using real weights and kernels (<code>-r 100 -l 2048</code>). In it, <b>B is the reference</b>, so the BF16 goes in <code>-mb</code>; both fit on one Spark (≈ 72 GB). <b>(2)</b> For NVFP4 and W4A16, a two-pass HF script records P's top-64 log-probs and computes the truncated KL plus a tail term: a <span class="la-term" data-term="kl-top-k">lower bound</span> on the true KL, which dequantizes the weights and doesn't use the W4A4 kernels. <b>(3)</b> In situ, with the production kernels: two vLLM servers and <code>POST /v1/completions</code> with <code>"max_tokens": 1</code> and <span class="la-term" data-term="prompt-logprobs"><code>"prompt_logprobs": 20</code></span>; you get exact ΔNLL and top-1, plus a KL “over the common top” that is a proxy and must be reported as such.</p>
+  <p>The floor is still missing. Run P against P (another boot, another <code>max-num-seqs</code>) and treat the value as the <span class="la-term" data-term="piso-de-ruido">noise floor</span>, as the <span class="la-rb glm"></span> recipe does. Repeat the protocol on the public reference (<code>Qwen/Qwen3.8-27B</code> against NVIDIA's and RedHatAI's NVFP4s). The criterion: KL(final_BF16‖final_NVFP4) of the same order as KL(base_BF16‖reference NVFP4), measured with the same script, and the gates repeated <b>on the quantized model</b>. RedHatAI publishes a <i>recovery</i> between 98.27% and 100.88% for the base's NVFP4.</p>
+</section>
+
+<section class="la-sec">
+  <h2>Serving: multi-LoRA, merged, and the drafter left behind</h2>
+  <p>There are three paths to the server:</p>
+  <div class="la-compare">
+    <div><h4>(A) Runtime adapter</h4><p>vLLM loads the base and one or more adapters, and the request's <code>"model"</code> field picks the adapter. Zero merge cost and trivial A/B tests; it costs per-token LoRA kernels and memory per slot.</p></div>
+    <div><h4>(B) Merge → BF16</h4><p>Identical to what was trained, with no overhead, but it takes 55.6 GB and reads all of it at every decode step. It's the KLD <b>reference</b> and the evaluation server.</p></div>
+    <div><h4>(C) Merge → re-quantize</h4><p>Production speed and memory, which is what all of Module 1 optimizes. It requires fresh calibration and an error measured against (B). It's the natural destination on a GB10.</p></div>
+  </div>
+  <p>The deciding factor is decode's <span class="la-term" data-term="teto-de-banda">bandwidth ceiling</span>. With ~230 GB/s effective, a 27B in BF16 gives ≈ 4 steps per second per stream; the reference NVFP4s (21.92 and 24.69 GB) give <b>≈ 9–10 tok/s</b> without speculation.</p>
+  <h3>LoRA in vLLM 0.30.0</h3>
+  <table class="la-params">
+    <thead><tr><th>Flag</th><th>Default</th><th>What it does, and the caveat</th></tr></thead>
+    <tbody>
+      <tr><td><code>--enable-lora</code> · <code>--lora-modules</code></td><td><code>False</code> · —</td><td>turns on the subsystem; registers adapters as <code>name=path</code> or JSON with <code>base_model_name</code></td></tr>
+      <tr><td><span class="la-term" data-term="max-loras"><code>--max-loras</code></span></td><td><b>1</b></td><td>how many <b>distinct</b> adapters can be active in the same batch (slots on the GPU)</td></tr>
+      <tr><td><span class="la-term" data-term="max-lora-rank"><code>--max-lora-rank</code></span></td><td><b>16</b></td><td>1, 8, 16, 32, 64, 128, 256, 320 or 512; sizes the buffers. Use the largest <b>actual</b> rank, not 256 “just in case”</td></tr>
+      <tr><td><code>--max-cpu-loras</code></td><td>= <code>max_loras</code></td><td>LRU cache in CPU RAM, which on the GB10 is the same unified memory: every cached adapter competes with KV and weights</td></tr>
+      <tr><td><code>--fully-sharded-loras</code></td><td><code>False</code></td><td>by default only half of the LoRA computation is sharded under TP</td></tr>
+      <tr><td><code>--enable-mixed-moe-lora-format</code></td><td><code>False</code></td><td>requires declaring <code>is_3d_lora_weight</code> per adapter, with no check: a wrong declaration will “silently produce garbage outputs”</td></tr>
+    </tbody>
+  </table>
+  <p>How does a single forward serve a batch in which every sequence asks for a different adapter? The expensive part, \(W x\), is the same for all of them: vLLM does <b>one</b> base GEMM for the whole batch, as it would without LoRA. The low-rank term comes in on top, token by token, chosen by a slot index:</p>
+  <div class="la-eq">
+    \[ y_t = W x_t + s\,B_{\sigma(t)}\big(A_{\sigma(t)}\,x_t\big),\qquad \sigma(t)\in\{-1,\ 0,\ \dots,\ \texttt{max\_loras}-1\} \]
+    <ul class="la-eq-legend">
+      <li>\(x_t\): token \(t\)'s input activation (5120 values in Qwen3.8-27B); \(W\): the base weight, the same for the whole batch</li>
+      <li>\(\sigma(t)\): the slot of the adapter of the request the token belongs to; \(-1\) means “base only”</li>
+      <li>\(A_k\), \(B_k\): the matrices of the adapter occupying slot \(k\), read from preallocated buffers; \(s\): that adapter's scale \(\alpha/r\)</li>
+    </ul>
+  </div>
+  <p>The buffers are tensors with a slot dimension. Per target module, \(A\) lives in a <code>[max_loras × r_max × d_in]</code> and \(B\) in a <code>[max_loras × d_out × r_max]</code> (the <code>lora_a_stacked</code> and <code>lora_b_stacked</code> in vLLM's code). When an adapter gets a slot, its weights are copied into slice \(k\), and the leftover rows up to \(r_{\max}\) stay at zero. The rest is two batched kernels, descendants of Punica's SGMV/BGMV, the “per-token LoRA kernels” of path (A). The <b><span class="la-term" data-term="shrink-expand">shrink</span></b> computes \(v_t = A_{\sigma(t)}x_t\), with \(r_{\max}\) outputs per token, fetching the right slice by index. The <b>expand</b> adds \(s\,B_{\sigma(t)}v_t\) to \(y_t\). Both skip tokens with \(\sigma = -1\), and a batch with no LoRA at all uses a different CUDA graph (<code>has_lora</code>) <b>[reading of vLLM's code; the research only names the kernels]</b>.</p>
+  <p>That explains each flag. <code>--max-loras</code> is the number of stacked slices: an adapter without a free slice gives the shrink nowhere to read its weights from, and the request waits in the scheduler until a slot frees up. <code>--max-lora-rank</code> fixes the width of every slice: an r = 8 adapter in a buffer with \(r_{\max}\) = 64 takes up 1/8 of the slice, and the rest are zeros that cost memory and go through shrink and expand all the same. In decode, which is bandwidth-bound, every active slot also forces reading whole slices at every step <b>[inference]</b>. The memory of these slices is the research's formula:</p>
+  <div class="la-eq">
+    \[ M_{\text{slots}} = \texttt{max\_loras}\times r_{\max}\sum_{\text{modules}}(d_{in}+d_{out})\times 2\ \text{B}\qquad\xrightarrow{\ \text{27B},\ 4\ \text{slots},\ r_{\max}=32\ }\ 4\times 217.6\,\text{M}\times 2\,\text{B}\approx 1.7\ \text{GB} \]
+    <ul class="la-eq-legend">
+      <li>vLLM preallocates, per target module, \(A\) and \(B\) buffers for each slot, at the maximum rank <b>[research estimate]</b></li>
+      <li>in Qwen3.8-27B with LoRA on all text linears: 108.8 M parameters per slot at r=16, 217.6 M at r=32, 435.2 M at r=64</li>
+      <li>small next to 55.6 GB of weights, but not negligible in a GB10's KV budget</li>
+    </ul>
+  </div>
+  <p>Two interactions with Module 1: the <a data-ch="prefix-caching">prefix cache</a> block hash includes the LoRA ID (the same prompt on two adapters doesn't share cache, because K and V differ), and the CUDA graph dispatcher has <code>has_lora</code> in its key (batches with and without LoRA use different graphs). Dynamic loading (<code>POST /v1/load_lora_adapter</code>) exists, but the documentation advises against it in production outside isolated, trusted environments.</p>
+  <figure class="la-fig" id="fig-servir" data-title="The multi-LoRA bus: slots, queue and the merged path">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Mode A: requests arrive with the adapter name in the <code>model</code> field. The scheduler only boards a request if its adapter already has a slot in the batch, or if there's still a free slot (<code>--max-loras</code>); the others wait. Requests to the base don't need a slot. Below, the cached prefix blocks are kept separate per adapter. “Inside the batch” mode: one layer (<code>q_proj</code>, 5120 → 12,288) in a step with 6 tokens. \(Wx\) is a single GEMM; each token fetches, through the index \(\sigma(t)\), its slice of \(A^\top\) <code>[5120 × r_max]</code> (shrink) and of \(B^\top\) <code>[r_max × 12,288]</code> (expand), and the hatched part is the zero padding up to \(r_{\max}\). Mode C: the merged model has no slots, and the bandwidth ceiling is what rules. Traffic and batch are <b>illustrative</b>; slot memory comes from the formula above.</figcaption>
+  </figure>
+  <p>Two tests in the figure. Set <code>--max-loras</code> to 1 with 3 adapters in the traffic: the batch only accepts one adapter at a time, and the amber counter of requests waiting for a slot shoots up. Then go to “inside the batch” mode, where the adapters have r = 16, and switch <code>--max-lora-rank</code> from 32 to 64: slot memory doubles, shrink and expand start doing twice the math, and the hatched part of the slices goes from half to three quarters, with no gain whatsoever.</p>
+  <p>Support by architecture: <code>Qwen3_5ForConditionalGeneration</code> has LoRA, with <code>packed_modules_mapping</code> covering GDN's fused projections (<code>in_proj_qkvz</code>, <code>in_proj_ba</code>). <code>GlmMoeDsaForCausalLM</code> has it too, but Module 1's GLM-5.3-Flash runs in an overlay class with no verified support: assume there is none. <code>DeepseekV4ForCausalLM</code> doesn't have it. LoRA on NVFP4 or EXL3 bases on sm_121 hasn't been verified.</p>
+  <h3>The production server</h3>
+  <pre data-lang="bash"><code># production: merged NVFP4, TP=1, one server per Spark (2 replicas behind a simple load balancer)
+docker run -d --name tutor --gpus all --network host --ipc host --shm-size 16g --ulimit memlock=-1 \
+  -v /data/work/models:/models vllm/vllm-openai:v0.30.0 \
+  /models/q38-final-nvfp4 --served-model-name tutor-q38 --host 0.0.0.0 --port 8000 \
+  --tensor-parallel-size 1 --max-model-len 65536 --gpu-memory-utilization 0.80 \
+  --kv-cache-dtype fp8_e4m3 --max-num-seqs 16 --enable-prefix-caching \
+  --reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser qwen3_xml --language-model-only \
+  --default-chat-template-kwargs '{"enable_thinking": false}' \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":2}'
+vllm bench serve --model tutor-q38 --dataset-name random --random-input-len 1024 --random-output-len 256 \
+  --num-prompts 64 --request-rate inf      # repeat A/B/A as in chapter 45</code></pre>
+  <p>Every flag has a story in Module 1: FP8 KV (chapter 23), prefix caching (33), reasoning and tool parsers (34), and the <code>--default-chat-template-kwargs</code> that guarantees the same <code>enable_thinking</code> as the data. Speculation needs attention. RedHatAI's card uses MTP with 3 tokens, and there's a 7-token DSpark trained for the base; both were trained on the <b>base</b>'s distribution, and after the fine-tune <span class="la-term" data-term="taxa-de-aceitacao">acceptance</span> tends to drop with the drift (by a magnitude the research didn't measure). That's why the server starts with 2. Measure per-position acceptance with <code>--per-request-spec-decode-metrics</code> and, if it drops a lot, retrain the drafter on the new model's logs. That's what Xiaomi did with MiMo-V2.6: with a block-6 DFlash trained on the SFT policy and tuned on rollouts from early RL, the mean accepted length came out <b>31.3% longer</b> than that of the MTP-3 inherited from SFT.</p>
+  <p>Expectation <b>[unverified]</b>: on an NVIDIA forum (vLLM 0.27.1, 16 concurrent requests), Qwen3.8-27B NVFP4 reached 87.91–134.41 tok/s of aggregate output, versus 65.58–104.44 in FP8. With 1 stream and MTP accepting well, estimate ~1.5–2× the 9–10 tok/s ceiling. Use TP=2 across the Sparks only if one user's latency matters more than throughput: the 27B NVFP4 fits comfortably on one node, and TP=2 would pay for per-layer all-reduces over RoCE.</p>
+  <h3>In the recipes, and abliteration seen from here</h3>
+  <div class="la-inrecipe" data-recipe="glm"><div class="la-inrecipe-h"><span class="la-rb glm"></span><span class="k">Idea</span><code>ABLIT_METHOD=transplant</code></div><div class="la-inrecipe-b"><p>The GLM transplant <b>is a partial merge served at load time</b>: it swaps, byte for byte, the <code>o_proj</code> of layers 15–45 for those of a donor checkpoint (~2.7 GB, 2,560 MiB) and passes 32 of 32 test cases, versus 9 of 32 for the rank-1 projection. It works because <code>o_proj</code> is native BF16 both in the NVFP4 donor and in the served EXL3; if your fine-tune touches quantized matrices, you'll have to re-quantize. The recipe's KLD protocol (5 runs, 25 windows, stock-vs-stock floor) is the model for the previous section, and the logic of the boot canary, which fails DFlash when it accepts ~0, works as a cheap detector of a model broken by the merge <b>[inference]</b>.</p></div></div>
+  <div class="la-inrecipe" data-recipe="qwen"><div class="la-inrecipe-h"><span class="la-rb qwen"></span><span class="k">Family</span><code>model_type: qwen3_5</code></div><div class="la-inrecipe-b"><p>The lab was designed around the Qwen3.8-Flash-Next family: the same GDN-and-attention hybrid, the same MTP that transformers discards, the same template, the same <code>vllm/vllm-openai:v0.30.0</code> image. Whoever completed track B has done, on a smaller scale, every step a Flash-Next fine-tune would require, including exllamav3's <code>-ngb</code> for the PLE.</p></div></div>
+  <div class="la-inrecipe" data-recipe="ds"><div class="la-inrecipe-h"><span class="la-rb ds"></span><span class="k">Role</span><code>deepseek-v4-flash-vision-exp</code> as judge</div><div class="la-inrecipe-b"><p>In the lab, DeepSeek is the only impartial judge. And, since vLLM has no LoRA for <code>DeepseekV4ForCausalLM</code>, any fine-tune of it can only reach the server through path (C): merge and re-quantization.</p></div></div>
+  <p>Seen from Module 2, <a data-ch="abliteracao">abliteration</a> is post-training's gradient-free neighbor: a closed-form <b>rank-1</b> edit (\(W' = W - \alpha\,\hat r\,(\hat r^\top W)\)), estimated from hundreds of prompts in minutes, versus a rank-\(r\) update learned over hours. The merge figure shows it as a “rank-1 LoRA that nobody trained”. Three consequences. <b>Order matters</b>: abliterating and then running SFT can reintroduce refusals, and even benign SFT erodes refusals: Qi et al. broke through GPT-3.5 Turbo's safeguards with 10 adversarial examples for less than US$0.20 and showed that benign data also degrades safety, to a lesser degree; abliterating <i>afterwards</i> requires re-estimating the direction. <b>The direction becomes a probe</b>: projecting activations onto the <span class="la-term" data-term="direcao-de-recusa">refusal direction</span> estimated on the base, before and after the fine-tune, anticipates a safety regression. And <b>abliteration doesn't replace evaluation</b>: the GLM recipe records “KLD not measured with ablit”, and removing refusals without governance is a policy decision, not an engineering one.</p>
+  <h3>The checklist that closes the loop</h3>
+  <ol class="la-steps">
+    <li><b>Before training:</b> NCCL on <code>NET/IB</code>; torch pinned; GDN fast path measured; BF16 <code>dtype</code> in <b>every</b> config; ~217.6 M trainable parameters at r=32; the same <code>chat_template_kwargs</code> in data, evaluation and server; baseline recorded; data decontaminated and split by term; disk ≥ 4 × 56 GB.</li>
+    <li><b>During:</b> <code>eval_loss</code> falling; in DPO, <code>rewards/accuracies</code> below ~0.95 and <code>logps/chosen</code> stable; in GRPO, <code>frac_reward_zero_std</code> below ~0.5, no entropy collapse, and samples read; checkpoints every 100–200 steps.</li>
+    <li><b>After:</b> gates with CIs and the decision recorded <b>before</b> quantizing; merge verified and MTP re-added; calibration with domain + generic data; KLD against the merge comparable to the reference NVFP4's; gates repeated on the quantized model; MTP acceptance measured; <code>vllm bench serve</code> A/B/A; versions and hashes recorded; and a rollback plan.</li>
+  </ol>
+  <p>With this, Module 2 closes the circle Module 1 opened. The <a data-ch="receita-do-zero">recipe from scratch</a> started from a checkpoint someone else had post-trained (MiMo's MOPD was itself a post-training stage). Now you know how to produce that checkpoint, measure what changed, measure what quantization took away, and serve it with the engineering of the previous chapters. Module 2 ends here: the serve → post-train → re-quantize → serve cycle is complete. What lies beneath the stack, the pretraining and the data behind the base model that this whole module took as given, is the next territory to explore.</p>
+</section>

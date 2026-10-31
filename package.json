@@ -1,0 +1,15 @@
+{
+  "name": "latent-atlas",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Latent Atlas — plataforma de estudo para AI Researchers (do neurônio ao cluster)",
+  "scripts": {
+    "build": "node build.js",
+    "qa": "node tools/qa.js",
+    "serve": "./serve.sh",
+    "mock-llm": "node tools/mock-llm.js"
+  },
+  "devDependencies": {
+    "puppeteer-core": "^25.12.0"
+  }
+}

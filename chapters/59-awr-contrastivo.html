@@ -1,0 +1,426 @@
+<p class="la-lead">O estágio 3 do DeepSeek-R1 parece banal. O modelo gera muitas respostas, as erradas vão para o lixo e o que sobra vira SFT: cerca de 600 mil amostras de raciocínio (só as corretas) e 200 mil gerais, duas épocas sobre o DeepSeek-V3-Base. O Llama 2 usou só rodadas desse mesmo <i>rejection sampling fine-tuning</i> até a versão V4 do seu RLHF; depois combinou os dois em sequência, aplicando PPO sobre o checkpoint do rejection sampling. Ninguém chama isso de RL, mas é parente próximo. É o caso extremo de uma família que nasceu na robótica (a RWR, de 2007), virou a <span class="la-term" data-term="awr">regressão ponderada pela vantagem</span> (AWR, 2019) e mira o mesmo ótimo que o <a data-ch="dpo">DPO</a> persegue. Neste capítulo você vai percorrer as duas estradas que levam ao alinhamento sem PPO. Na da <b>regressão</b>, o método amostra, pesa e imita. Na do <b>contraste</b>, empurra o bom para cima e o ruim para baixo, um contra muitos (InfoNCE, SLiC, CPL, unlikelihood). No fim, um mapa de parentesco liga todos eles ao DPO, e você vai saber quando vale trocar um laço de RL por uma regressão ou por um contraste.</p>
+
+<section class="la-sec">
+  <h2>Duas estradas para o mesmo cume</h2>
+  <p>Comece pelo objetivo que o <a data-ch="ppo-rlhf">RLHF com PPO</a> otimiza e que o <a data-ch="dpo">capítulo do DPO</a> resolveu em forma fechada. Para cada prompt \(x\), queremos uma política que ganhe recompensa sem se afastar demais do modelo de referência:</p>
+  <div class="la-eq">
+    \[ \max_{\pi}\ \mathbb E_{x\sim\mathcal D}\Big[\ \mathbb E_{y\sim\pi(\cdot\mid x)}\big[r(x,y)\big]\;-\;\beta\,\mathbb D_{\text{KL}}\big(\pi(\cdot\mid x)\,\|\,\pi_{\text{ref}}(\cdot\mid x)\big)\Big] \]
+    <ul class="la-eq-legend">
+      <li>\(x\): o prompt, sorteado do conjunto de prompts \(\mathcal D\); \(y\): uma resposta completa</li>
+      <li>\(r(x,y)\): a recompensa (nota de um reward model, veredito de um verificador, juiz…)</li>
+      <li>\(\pi_{\text{ref}}\): a política de referência congelada, em geral o modelo SFT</li>
+      <li>\(\beta\): o “preço” do afastamento, medido pela <span class="la-term" data-term="kld">divergência KL</span></li>
+    </ul>
+  </div>
+  <p>Entre todas as distribuições possíveis, a solução é a referência <span class="la-term" data-term="inclinacao-exponencial">inclinada exponencialmente</span> pela recompensa (a derivação, pela desigualdade de Gibbs, está no capítulo do DPO):</p>
+  <div class="la-eq">
+    \[ \pi^*(y\mid x)=\frac{\pi_{\text{ref}}(y\mid x)\,e^{r(x,y)/\beta}}{Z(x)},\qquad Z(x)=\sum_{y}\pi_{\text{ref}}(y\mid x)\,e^{r(x,y)/\beta} \]
+    <ul class="la-eq-legend">
+      <li>\(\pi^*\): a política ótima do objetivo acima, sem nenhuma restrição de arquitetura</li>
+      <li>\(e^{r/\beta}\): o fator de inclinação; cresce exponencialmente com a recompensa</li>
+      <li>\(Z(x)\): a constante que faz as probabilidades somarem 1; soma sobre <i>todas</i> as respostas possíveis</li>
+    </ul>
+  </div>
+  <p>Leia a fórmula como uma receita em três passos: pegue a probabilidade que a referência já dava a cada resposta, multiplique por \(e^{r/\beta}\) e renormalize. Com \(\beta\) grande, \(e^{r/\beta}\approx 1\) para todo mundo e nada muda. Com \(\beta\) pequeno, a resposta de maior recompensa engole a massa. Repare que \(\pi^* \propto \exp\big(\log\pi_{\text{ref}} + r/\beta\big)\): é uma <span class="la-term" data-term="softmax">softmax</span> sobre respostas inteiras, em que \(\log\pi_{\text{ref}}\) faz o papel de “prior” e \(\beta\) faz o papel da <span class="la-term" data-term="temperatura">temperatura</span> do <a data-ch="geracao-amostragem">capítulo 9</a>. Mexa no \(\beta\) e veja a massa escorrer.</p>
+  <figure class="la-fig" id="fig-inclinacao" data-title="A mesa inclinada: a referência pesada pela recompensa">
+    <div class="la-fig-stage" style="height:420px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Seis respostas para o mesmo prompt. Barras lilás tracejadas: a referência \(\pi_{\text{ref}}\). Barras menta: a política inclinada \(\pi^*\). As bolinhas são “grãos” de probabilidade (cada um vale 1/60 da massa) e rolam para as respostas de maior recompensa quando \(\beta\) diminui. Embaixo, o fator \(e^{r/\beta}\) de cada resposta, em escala log. Ligue “subtrair a linha de base”: os fatores e \(Z(x)\) mudam, mas \(\pi^*\) não se mexe, porque a linha de base cancela na normalização (a mesma conta da seção da AWR). Probabilidades e recompensas <b>ilustrativas</b>; \(\mathbb E[r]\), KL e entropia são calculados na hora.</figcaption>
+  </figure>
+  <div class="la-callout analogy"><b class="t">Analogia: a mesa de bolinhas</b><p>Imagine a massa de probabilidade como bolinhas espalhadas numa mesa, onde a referência as colocou. A recompensa inclina a mesa, e as bolinhas rolam para as respostas boas. O \(\beta\) é o atrito: com muito atrito (\(\beta\) grande), elas quase não saem do lugar; sem atrito (\(\beta\to 0\)), todas despencam no canto mais baixo, o argmax da recompensa. Uma resposta que a referência nunca gera (\(\pi_{\text{ref}}=0\)) não recebe bolinha nenhuma, por maior que seja a recompensa: a inclinação só redistribui o que já existe.</p></div>
+  <h3>Três maneiras de chegar lá</h3>
+  <p>Por que não usar a fórmula direto? Porque \(Z(x)\) soma sobre todas as respostas possíveis, um número de termos da ordem de \(|\mathcal V|^{|y|}\), e porque não temos uma tabela com \(\pi^*(y\mid x)\): temos uma rede neural de bilhões de parâmetros. O que dá para fazer é <b>amostrar</b> respostas e <b>ajustar</b> a rede. Há três jeitos de organizar isso, e cada um define uma família de métodos do módulo:</p>
+  <ol class="la-steps">
+    <li><b>RL (PPO, GRPO).</b> Amostra da própria política \(\pi_\theta\), mede a recompensa e sobe o gradiente de política. Uma identidade de duas linhas mostra que maximizar o objetivo é o mesmo que <i>minimizar</i> \(\mathbb D_{\text{KL}}(\pi_\theta\,\|\,\pi^*)\), o <span class="la-term" data-term="kl-reverso">KL reverso</span> (equação abaixo).</li>
+    <li><b>Regressão (RWR, AWR, RAFT, ReST).</b> Amostra da referência, dá a cada amostra o peso \(e^{r/\beta}\) e faz máxima verossimilhança ponderada. É minimizar o <span class="la-term" data-term="kl-direto">KL direto</span> \(\mathbb D_{\text{KL}}(\pi^*\,\|\,\pi_\theta)\). Se as amostras vêm de outra política \(q\) (a de algumas iterações atrás, um log antigo), o mesmo peso mira \(q\,e^{r/\beta}\): a âncora passa a ser quem amostrou, como o \(\mu\) da AWR. Para manter \(\pi_{\text{ref}}\) como âncora seria preciso multiplicar pelo peso de importância \(\pi_{\text{ref}}/q\).</li>
+    <li><b>Reparametrização e contraste (DPO, CPL, InfoNCE).</b> Inverte a fórmula, escreve a recompensa em função da própria política e ajusta comparações entre respostas. O \(Z(x)\) cancela na diferença.</li>
+  </ol>
+  <div class="la-eq">
+    \[ \underbrace{\mathbb E_{y\sim\pi}[r]-\beta\,\mathbb D_{\text{KL}}(\pi\,\|\,\pi_{\text{ref}})\;=\;\beta\log Z(x)-\beta\,\mathbb D_{\text{KL}}(\pi\,\|\,\pi^*)}_{\text{estrada do RL}}\qquad\qquad \underbrace{\min_\theta\ \mathbb D_{\text{KL}}(\pi^*\,\|\,\pi_\theta)\;\Longleftrightarrow\;\max_\theta\ \mathbb E_{y\sim\pi_{\text{ref}}}\Big[\tfrac{e^{r(x,y)/\beta}}{Z(x)}\,\log\pi_\theta(y\mid x)\Big]}_{\text{estrada da regressão}} \]
+    <ul class="la-eq-legend">
+      <li>esquerda: como \(\beta\log Z(x)\) não depende de \(\pi\), maximizar o objetivo é encostar \(\pi\) em \(\pi^*\) pelo KL reverso</li>
+      <li>direita: \(\mathbb D_{\text{KL}}(\pi^*\|\pi_\theta) = \text{const} - \sum_y \pi^*(y)\log\pi_\theta(y)\), e \(\pi^* = \pi_{\text{ref}}\,e^{r/\beta}/Z\) transforma a soma numa esperança sob \(\pi_{\text{ref}}\), que dá para amostrar</li>
+      <li>\(e^{r/\beta}/Z(x)\): o peso de cada amostra; o termo \(\log\pi_\theta\) é a mesma log-verossimilhança do SFT</li>
+    </ul>
+  </div>
+  <p>O peso ainda depende de \(Z(x)\), que segue desconhecido. Mas, para um prompt fixo, \(Z(x)\) é a mesma constante em todas as amostras. Basta então normalizar os pesos das \(K\) amostras daquele prompt, \(\hat w_i = e^{r_i/\beta}/\sum_j e^{r_j/\beta}\), o que se chama <span class="la-term" data-term="amostragem-por-importancia">amostragem por importância</span> autonormalizada. Os pesos normalizados são, de novo, uma softmax das recompensas com temperatura \(\beta\). Guarde essa frase, porque o resto da seção de regressão é variação sobre ela.</p>
+  <h3>Cobrir a massa ou caçar o modo</h3>
+  <p>Se a rede conseguisse representar \(\pi^*\) exatamente, com dados infinitos, as duas estradas chegariam ao mesmo lugar: KL zero, nos dois sentidos. A diferença aparece na vida real, quando o modelo <b>não</b> consegue (capacidade finita, poucas amostras, poucos passos). O KL direto pune o modelo por dar probabilidade baixa onde o alvo tem massa, e por isso ele <i>cobre a massa</i> (<i>mass-covering</i>): espalha probabilidade por todos os modos, inclusive pelo vale entre eles. O KL reverso pune o modelo por pôr massa onde o alvo não tem, e por isso ele <i>caça o modo</i> (<i>mode-seeking</i>): escolhe um pico e o cobre bem. É a mesma distinção que separa o SFT, que minimiza um KL direto até os dados, do RL com KL e da destilação on-policy, que minimizam um KL reverso.</p>
+  <figure class="la-fig" id="fig-direcao-kl" data-title="Cobertor curto: KL direto × KL reverso">
+    <div class="la-fig-stage" style="height:400px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Alvo \(\pi^*\) (área lilás) com dois modos sobre um eixo de “respostas”. O modelo (curva menta) só sabe fazer um morro: uma gaussiana discretizada com média \(\mu\) e largura \(\sigma\). O ajuste roda por descida de gradiente ao vivo, com o rastro do caminho no painel do plano \((\mu,\sigma)\). KL direto (estrada da regressão): o morro alarga e cobre os dois picos. KL reverso (estrada do RL): o morro escolhe um pico; qual deles depende do ponto de partida. Formas <b>ilustrativas</b>; os KLs são calculados na grade.</figcaption>
+  </figure>
+  <div class="la-callout why"><b class="t">Por que isso importa</b><p>A estrada da regressão herda o temperamento do SFT. É estável (no fundo é uma entropia cruzada), cobre todos os modos que as amostras boas exibem e <b>não sai do suporte das amostras</b>: se nenhuma das \(K\) respostas resolveu o problema, não há o que imitar. A estrada do RL pode concentrar a massa e explorar on-policy, mas também pode colapsar num modo e perder diversidade. Essa diferença de temperamento vai reaparecer em cada método do capítulo.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Do RWR ao AWR: imitar com pesos</h2>
+  <p>No nome AWR, “regressão” não quer dizer prever um número com erro quadrático. Quer dizer <b>ajuste supervisionado</b>: encaixar a política nos dados por máxima verossimilhança, exatamente como no <a data-ch="sft">SFT</a>. A única novidade é um peso por exemplo. Exemplos com peso alto puxam o modelo com força; exemplos com peso quase zero são praticamente ignorados.</p>
+  <h3>RWR: o peso é o retorno</h3>
+  <p>A <span class="la-term" data-term="rwr">Reward-Weighted Regression</span> (Peters &amp; Schaal, 2007) nasceu do controle de robôs. Numa iteração, a política atual \(\pi_k\) gera trajetórias, e a próxima política é a máxima verossimilhança dessas mesmas ações, pesadas pelo exponencial do retorno (na forma como o paper do AWR a apresenta, Eq. 2):</p>
+  <div class="la-eq">
+    \[ \pi_{k+1}=\arg\max_\pi\ \mathbb E_{s\sim d_{\pi_k},\,a\sim\pi_k}\Big[\log\pi(a\mid s)\,\exp\!\big(\tfrac{1}{\beta}\,\mathcal R_{s,a}\big)\Big],\qquad \mathcal R_{s,a}=\sum_t\gamma^t r_t \]
+    <ul class="la-eq-legend">
+      <li>\(s\), \(a\): estado e ação (num LLM, prefixo e próximo token, ou prompt e resposta inteira)</li>
+      <li>\(d_{\pi_k}\): a distribuição de estados que a política \(\pi_k\) visita</li>
+      <li>\(\mathcal R_{s,a}\): o retorno a partir de \((s,a)\), soma das recompensas futuras descontadas por \(\gamma\)</li>
+      <li>\(\beta\): a temperatura dos pesos</li>
+    </ul>
+  </div>
+  <p>A derivação original vem de um arcabouço de <span class="la-term" data-term="esperanca-maximizacao">esperança-maximização</span> (EM): o passo E repesa as amostras pelo retorno, o passo M ajusta a política. O aprofundamento abaixo mostra de onde saem os pesos, e a mesma conta vai reaparecer no ReST-EM.</p>
+  <div class="la-callout deep"><b class="t">Aprofundamento: EM, ou por que aparecem pesos</b><p>Invente uma variável binária \(O\) (“o resultado foi bom”) com \(p(O{=}1\mid x,y)\) crescente na recompensa, por exemplo \(\propto e^{r(x,y)/\beta}\), ou \(\mathbb 1[\text{correto}]\) com um verificador. Queremos a política que torna “bom” mais provável, isto é, que maximiza \(\log p(O{=}1\mid x)=\log\sum_y p(O{=}1\mid x,y)\,\pi_\theta(y\mid x)\). O log de uma soma é difícil de otimizar. Para qualquer distribuição \(q(y)\), a desigualdade de Jensen dá um piso:</p><p>\[ \log p(O{=}1\mid x)\ \ge\ F(q,\theta)=\mathbb E_{y\sim q}\big[\log p(O{=}1\mid x,y)+\log\pi_\theta(y\mid x)-\log q(y)\big] \]</p><p>O EM sobe esse piso por <b>coordenadas</b>, alternando. <b>Passo E</b> (com \(\theta\) fixo, otimiza \(q\)): o piso encosta no valor verdadeiro quando \(q\) é a posterior, \(q(y)\propto p(O{=}1\mid x,y)\,\pi_{\theta_t}(y\mid x)\), ou seja, “as respostas da política atual, condicionadas a terem dado certo”. <b>Passo M</b> (com \(q\) fixo, otimiza \(\theta\)): só o termo \(\mathbb E_q[\log\pi_\theta]\) depende de \(\theta\), e maximizá-lo é uma máxima verossimilhança. Como as amostras vêm de \(\pi_{\theta_t}\), cada uma entra com o peso de importância \(q/\pi_{\theta_t}\propto p(O{=}1\mid x,y)\). É daí que saem os pesos: \(e^{r/\beta}\) na RWR, \(\mathbb 1[\text{correto}]\) no filtro binário. Cada passo não diminui \(F\), e o passo E o deixa justo, então \(\log p(O{=}1\mid x)\) nunca cai de uma iteração para a outra.</p></div>
+  <p>O problema prático da RWR está na escala. \(e^{\mathcal R/\beta}\) depende do valor absoluto do retorno, e um estado em que todas as ações rendem muito domina o lote inteiro, mesmo que ali não haja nada a aprender.</p>
+  <h3>AWR: maximize a melhora, não o retorno</h3>
+  <p>A <span class="la-term" data-term="awr-algoritmo">AWR</span> (Peng, Kumar, Zhang &amp; Levine, 2019) muda a pergunta. Em vez de maximizar o retorno, maximiza a <b>melhora esperada</b> em relação à política \(\mu\) que coletou os dados, \(\eta(\pi) = J(\pi) - J(\mu) = \mathbb E_{s\sim d_\pi}\mathbb E_{a\sim\pi}[A^\mu(s,a)]\) (Eq. 3), onde \(A^\mu\) é a <span class="la-term" data-term="vantagem">vantagem</span>, o quanto a ação \(a\) é melhor que a média de \(\mu\) no estado \(s\). Troca-se \(d_\pi\) por \(d_\mu\), uma aproximação válida enquanto as políticas forem parecidas, e põe-se uma restrição de KL para garantir isso:</p>
+  <div class="la-eq">
+    \[ \arg\max_\pi\int_s d_\mu(s)\int_a\pi(a\mid s)\big[\mathcal R^\mu_{s,a}-V^\mu(s)\big]\,da\,ds\quad\text{s.a.}\quad\int_s d_\mu(s)\,\mathbb D_{\text{KL}}\big(\pi(\cdot\mid s)\,\|\,\mu(\cdot\mid s)\big)\,ds\le\epsilon \]
+    <ul class="la-eq-legend">
+      <li>\(\mu\): a política de comportamento, que gerou os dados (no AWR, a mistura das políticas antigas guardadas no buffer)</li>
+      <li>\(V^\mu(s)\): a <span class="la-term" data-term="funcao-valor">função valor</span>, o retorno médio de \(\mu\) a partir de \(s\); \(\mathcal R-V\) estima a vantagem</li>
+      <li>\(\epsilon\): o orçamento de KL por passo; a mesma ideia de região de confiança do TRPO</li>
+    </ul>
+  </div>
+  <p>O Lagrangiano dessa restrição (Eq. 7) tem solução fechada (Eq. 8), e ela tem a cara que você já conhece:</p>
+  <div class="la-eq">
+    \[ \pi^*(a\mid s)=\frac{1}{Z(s)}\,\mu(a\mid s)\,\exp\!\Big(\frac{1}{\beta}\big(\mathcal R^\mu_{s,a}-V^\mu(s)\big)\Big) \]
+    <ul class="la-eq-legend">
+      <li>é a inclinação exponencial da seção anterior, com \(\mu\) no lugar de \(\pi_{\text{ref}}\) e a vantagem no lugar da recompensa</li>
+      <li>\(\beta\): agora é o multiplicador de Lagrange da restrição de KL; \(\beta\) pequeno equivale a um orçamento \(\epsilon\) folgado</li>
+    </ul>
+  </div>
+  <div class="la-callout math"><b class="t">A conta do Lagrangiano, em três linhas</b><p>Escreva \(A=\mathcal R^\mu_{s,a}-V^\mu(s)\) e acrescente à restrição de KL a de que \(\pi(\cdot\mid s)\) soma 1 em cada estado (multiplicador \(\alpha_s\)):</p><p>\[ \begin{aligned}\mathcal L=&\int_s d_\mu(s)\!\int_a\pi(a\mid s)\,A\\&+\beta\Big(\epsilon-\int_s d_\mu(s)\!\int_a\pi(a\mid s)\log\tfrac{\pi(a\mid s)}{\mu(a\mid s)}\Big)\\&+\int_s\alpha_s\Big(1-\int_a\pi(a\mid s)\Big)\end{aligned} \]</p><p>Derive em relação a um único valor \(\pi(a\mid s)\) e iguale a zero: \(d_\mu(s)\,A-\beta\,d_\mu(s)\big(\log\pi(a\mid s)-\log\mu(a\mid s)+1\big)-\alpha_s=0\). Isolando o log, \(\log\pi(a\mid s)=\log\mu(a\mid s)+A/\beta-\big(1+\alpha_s/(\beta\,d_\mu(s))\big)\). O último parêntese só depende de \(s\), e exponenciar dá \(\pi^*=\mu\,e^{A/\beta}/Z(s)\), com \(Z(s)\) fixado pela condição de soma 1. É o mesmo resultado que o capítulo do DPO obteve pela desigualdade de Gibbs, agora com \(\mu\) no lugar de \(\pi_{\text{ref}}\).</p></div>
+  <p>Falta trazer \(\pi^*\) para dentro da rede. A projeção \(\arg\min_\pi \mathbb E_s[\mathbb D_{\text{KL}}(\pi^*\,\|\,\pi)]\) (Eq. 9–10) vira, pela mesma conta da seção anterior, uma máxima verossimilhança ponderada nas amostras de \(\mu\). O Algoritmo 1 do paper alterna duas regressões supervisionadas por iteração, mais um corte nos pesos:</p>
+  <div class="la-eq">
+    \[ V_k^{\mathcal D}\leftarrow\arg\min_V\ \mathbb E_{s,a\sim\mathcal D}\big\|\mathcal R^{\mathcal D}_{s,a}-V(s)\big\|^2,\qquad \pi_{k+1}\leftarrow\arg\max_\pi\ \mathbb E_{s,a\sim\mathcal D}\Big[\log\pi(a\mid s)\,\min\!\Big(\exp\!\big(\tfrac{1}{\beta}\big(\mathcal R^{\mathcal D}_{s,a}-V_k^{\mathcal D}(s)\big)\big),\ \omega_{\max}\Big)\Big] \]
+    <ul class="la-eq-legend">
+      <li>\(\mathcal D\): o <span class="la-term" data-term="replay-buffer">replay buffer</span> FIFO com as trajetórias recentes</li>
+      <li>regressão 1: o crítico \(V\) aprende a prever o retorno de cada estado (erro quadrático)</li>
+      <li>regressão 2: a política imita as ações do buffer, cada uma com peso \(e^{A/\beta}\)</li>
+      <li>\(\omega_{\max}\): o <span class="la-term" data-term="corte-de-pesos">corte de pesos</span>, que impede um único exemplo de dominar o gradiente</li>
+    </ul>
+  </div>
+  <table class="la-params">
+    <thead><tr><th>Detalhe</th><th>Valor no paper</th><th>Por que importa</th></tr></thead>
+    <tbody>
+      <tr><td>\(\beta\) (temperatura)</td><td>0,05, <b>fixo</b> em todos os experimentos</td><td>não é adaptado, ao contrário dos antecessores REPS (<i>Relative Entropy Policy Search</i>, Peters et al., 2010) e MPO (<i>Maximum a posteriori Policy Optimisation</i>, Abdolmaleki et al., 2018), que tratam \(\beta\) como multiplicador de Lagrange e o recalculam a cada iteração, resolvendo o problema dual para gastar exatamente o orçamento \(\epsilon\); fixo é mais simples, mas a escala da vantagem passa a importar</td></tr>
+      <tr><td>\(\omega_{\max}\)</td><td>20</td><td>com \(\beta\) pequeno, \(e^{A/\beta}\) explode; o corte troca um pouco de viés por estabilidade</td></tr>
+      <tr><td>retornos</td><td>TD(λ) com \(V_{k-1}\), λ = 0,95</td><td>o alvo do crítico mistura retorno observado e bootstrap, como no GAE do <a data-ch="rl-fundamentos">capítulo 54</a></td></tr>
+      <tr><td>buffer</td><td>50 mil amostras; ~2.000 novas por iteração</td><td>dados off-policy, tratados como amostras de uma mistura de políticas passadas</td></tr>
+      <tr><td>otimização</td><td>minibatch 256; 200 passos de valor e 1.000 de política por iteração</td><td>tudo é regressão supervisionada: nada de razão de importância, nada de clipping de razão</td></tr>
+    </tbody>
+  </table>
+  <h3>Por que a linha de base \(V(s)\) importa</h3>
+  <p>O paper diz que trocar o retorno pela vantagem é “crucial” na prática. Há uma sutileza que vale a pena ver com números. Para um <b>mesmo estado</b>, a linha de base é irrelevante depois da normalização: \(e^{(\mathcal R-V)/\beta} = e^{\mathcal R/\beta}\cdot e^{-V/\beta}\), e o fator \(e^{-V/\beta}\) é igual para todas as ações daquele estado. Quatro amostras com recompensas \((1{,}0;\ 0{,}0;\ 0{,}5;\ 0{,}2)\) e \(\beta = 0{,}5\) dão pesos RWR \((7{,}389;\ 1{,}0;\ 2{,}718;\ 1{,}492)\) e, normalizados, \((0{,}5865;\ 0{,}0794;\ 0{,}2158;\ 0{,}1184)\), exatamente os mesmos da AWR. A <span class="la-term" data-term="linha-de-base">linha de base</span> importa <b>entre estados</b> (ou entre prompts), por dois motivos que a figura mostra:</p>
+  <ul>
+    <li><b>Escala do gradiente.</b> Numa rede compartilhada, um estado “fácil” com retornos altos gera pesos \(e^{\mathcal R/\beta}\) astronômicos e monopoliza o gradiente. Com a vantagem, cada estado contribui na escala do quanto ainda há a aprender nele.</li>
+    <li><b>Interação com o corte.</b> Com \(\beta = 0{,}05\), uma ação de retorno 0,9 tem peso RWR \(e^{18}\approx 6{,}6\times10^{7}\), e todas as ações razoáveis de um estado fácil batem no teto \(\omega_{\max} = 20\). Pesos iguais não ensinam nada. Centrando pela média, as vantagens voltam a separar as ações (exemplo de brinquedo nosso, a partir das fórmulas do paper).</li>
+  </ul>
+  <p>Ligada a essa escolha existe uma leitura elegante, que é derivação nossa e não do paper: o normalizador “correto” de cada estado é \(Z(s)\), e \(e^{\mathcal R/\beta}/Z(s) = e^{(\mathcal R - \beta\log Z(s))/\beta}\). Ou seja, a linha de base ideal seria o <i>valor suave</i> \(\beta\log\mathbb E_\mu[e^{\mathcal R/\beta}]\), que tende à média \(\mathbb E_\mu[\mathcal R]\) quando \(\beta\) cresce. A AWR usa a média, a aproximação de \(\beta\) grande, e confia no corte para segurar o resto.</p>
+  <figure class="la-fig" id="fig-awr-laco" data-title="O laço da AWR, uma iteração por dentro">
+    <div class="la-fig-stage" style="height:470px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Um mundo de brinquedo com três estados (fácil, médio, difícil) e três ações. No buffer, desenhado como matriz, cada linha é uma amostra \((s, a, \mathcal R)\), e as colunas \(V\), \(A\) e \(w\) são preenchidas passo a passo. No painel da política, as barras mostram \(\pi(a\mid s)\) de cada estado antes (tracejado, 1/3) e depois da regressão ponderada (cheio), e a fatia do gradiente que cada estado leva. Troque a linha de base para RWR e veja os pesos do estado fácil baterem todos no teto \(\omega_{\max}\). Retornos <b>ilustrativos</b>; a política nova é o máximo exato da verossimilhança ponderada (caso tabular).</figcaption>
+  </figure>
+  <h3>AWAC: o mesmo peso, com um crítico Q</h3>
+  <p>A <span class="la-term" data-term="awac">AWAC</span> (Nair, Gupta, Dalal &amp; Levine) leva a ideia para o RL offline-para-online. Em vez de estimar a vantagem com retornos Monte Carlo menos \(V\), usa a vantagem de um crítico \(Q\). A atualização da política (Eq. 13) e a sua solução fechada são:</p>
+  <div class="la-eq">
+    \[ \theta_{k+1}=\arg\max_\theta\ \mathbb E_{s,a\sim\pi_\beta}\Big[\log\pi_\theta(a\mid s)\,\exp\!\big(\tfrac{1}{\lambda}A^{\pi_k}(s,a)\big)\Big],\qquad \pi^*\propto\pi_\beta\,e^{A/\lambda} \]
+    <ul class="la-eq-legend">
+      <li>\(\pi_\beta\): a política comportamental, isto é, os dados do buffer (no paper, a letra \(\beta\) designa esses dados, e não a temperatura)</li>
+      <li>\(\lambda\): a temperatura; 0,3 nas tarefas de manipulação, 1,0 no MuJoCo</li>
+      <li>\(A^{\pi_k}=Q^{\pi_k}(s,a)-\mathbb E_{a'\sim\pi_k}Q^{\pi_k}(s,a')\): vantagem calculada com o crítico</li>
+    </ul>
+  </div>
+  <p>A vantagem prática é que a restrição a \(\pi_\beta\) aparece implicitamente nos pesos, sem precisar modelar a política comportamental. Um cuidado de leitura: o texto principal chama a projeção \(\mathbb D_{\text{KL}}(\pi^*\|\pi_\theta)\) de “forward KL”, e o apêndice chama a mesma projeção de “reverse KL”. Descreva sempre pela fórmula, não pelo rótulo.</p>
+</section>
+
+<section class="la-sec">
+  <h2>O SFT ponderado dos LLMs: filtrar, ranquear, reamostrar</h2>
+  <p>Num LLM, o MDP do <a data-ch="rl-fundamentos">capítulo 54</a> pode ser lido como um <span class="la-term" data-term="bandit-contextual">bandit contextual</span>: o estado é o prompt \(x\), a ação é a resposta inteira \(y\), e a recompensa chega no fim. Como \(\log\pi_\theta(y\mid x) = \sum_t\log\pi_\theta(y_t\mid x, y_{&lt;t})\), a máxima verossimilhança ponderada é só um SFT em que todos os tokens da resposta \(i\) carregam o mesmo peso \(w_i\):</p>
+  <div class="la-eq">
+    \[ \mathcal L(\theta)=-\sum_{x}\sum_{i=1}^{K}w_i(x)\sum_{t=1}^{|y_i|}\log\pi_\theta\big(y_{i,t}\mid x,\,y_{i,&lt;t}\big),\qquad y_1,\dots,y_K\sim\pi_{\text{amostra}}(\cdot\mid x) \]
+    <ul class="la-eq-legend">
+      <li>\(K\): respostas amostradas por prompt (do modelo atual ou de uma versão anterior)</li>
+      <li>\(w_i(x)\): o peso da resposta \(i\); a tabela abaixo mostra as escolhas</li>
+      <li>\(\pi_{\text{amostra}}\): quem gerou as respostas; com amostras do próprio modelo, o método é <i>semi-on-policy</i></li>
+    </ul>
+  </div>
+  <p>O paper do GRPO (DeepSeekMath) oferece uma lente útil para comparar tudo isso: o <b>coeficiente de gradiente</b> de cada token. No SFT ele vale 1 em todo token do alvo. No <span class="la-term" data-term="rft">RFT</span> vale 1 nas respostas corretas e 0 nas erradas. No PPO é a vantagem \(\hat A_t\), que pode ser negativa. No SFT ponderado é \(w_i\), constante ao longo da resposta e <b>nunca negativo</b>. Esse detalhe vai pesar na hora de escolher.</p>
+  <table class="la-params">
+    <thead><tr><th>Esquema</th><th>Peso \(w_i\)</th><th>Exemplos</th></tr></thead>
+    <tbody>
+      <tr><td>SFT puro / “Preferred-FT”</td><td>1 nas respostas escolhidas</td><td>o baseline do DPO; a inicialização de \(\pi_{\text{ref}}\)</td></tr>
+      <tr><td>AWR</td><td>\(e^{A_i/\beta}\), com corte</td><td>AWR/AWAC; <span class="la-term" data-term="a-lol">A-LoL</span>, que trata a sequência inteira como uma ação e treina só nos dados de vantagem positiva</td></tr>
+      <tr><td>RWR / ReST-EM</td><td>\(\propto r_i\) (recompensas ≥ 0) ou \(e^{r_i/\beta}\)</td><td><span class="la-term" data-term="rest-em">ReST-EM</span>: passo E \(q\propto p(O{=}1\mid x,y)\,p_{\theta_t}(y\mid x)\), passo M = NLL ponderada</td></tr>
+      <tr><td>Filtro por limiar</td><td>\(\mathbb 1[R(x,y)&gt;\tau]\)</td><td><span class="la-term" data-term="rest">ReST</span>: Grow (gerar) + Improve (filtrar com limiares \(\tau_1&lt;\tau_2&lt;\dots\) e ajustar)</td></tr>
+      <tr><td>Binário (verificável)</td><td>\(\mathbb 1[\text{correto}]\)</td><td>ReST-EM (MATH e APPS, PaLM 2), <span class="la-term" data-term="star">STaR</span>, RFT</td></tr>
+      <tr><td>Argmax (<span class="la-term" data-term="best-of-n">best-of-K</span>)</td><td>\(\mathbb 1[i=\arg\max_j r_j]\)</td><td><span class="la-term" data-term="raft">RAFT</span>; o rejection sampling fine-tuning do Llama 2</td></tr>
+    </tbody>
+  </table>
+  <p>A tabela parece um zoológico, mas é uma família só. Com pesos \(e^{A/\beta}\) normalizados, \(\beta\to 0\) vira o argmax (RAFT, best-of-K) e \(\beta\to\infty\) vira SFT uniforme em tudo o que foi amostrado. Os valores intermediários interpolam, e o filtro por limiar e o binário são “degraus” no lugar da exponencial. Veja com as mesmas quatro amostras de antes, \(R = (1{,}0;\ 0{,}0;\ 0{,}5;\ 0{,}2)\), linha de base \(V = 0{,}425\) e vantagens \(A = (0{,}575;\ -0{,}425;\ 0{,}075;\ -0{,}225)\):</p>
+  <figure class="la-fig" id="fig-espectro" data-title="O espectro do SFT ponderado: do uniforme ao best-of-K">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Quatro respostas do mesmo prompt (os personagens), com as recompensas do exemplo de brinquedo. As faixas de tokens são pintadas pelo coeficiente de gradiente de cada esquema (a intensidade é o peso normalizado). Com AWR, o slider de \(\beta\) varre o espectro; com o corte ligado, \(\omega_{\max}=20\). No ReST, o seletor sobe o limiar \(\tau_1&lt;\tau_2&lt;\tau_3\) como nos passos Improve, e o subconjunto guardado encolhe; no ReST-EM, a regra é fixa (um verificador binário que aqui aprova \(R\ge0{,}5\)). O <span class="la-term" data-term="tamanho-efetivo-amostra">tamanho efetivo da amostra</span> diz quantas respostas “de verdade” sustentam o gradiente. Exemplo <b>ilustrativo</b>; os pesos são calculados na hora.</figcaption>
+  </figure>
+  <p>Três números da figura merecem atenção. Com \(\beta = 0{,}05\) sem corte, os pesos crus são \((98.715{,}8;\ 0{,}0002;\ 4{,}48;\ 0{,}011)\), e a normalização dá \((1;\ 0;\ 0;\ 0)\): virou best-of-4. Com o corte \(\omega_{\max} = 20\), a primeira resposta é rebaixada para 20 e a terceira fica com 4,48, e os pesos normalizados passam a \((0{,}8166;\ 0{,}0;\ 0{,}1830;\ 0{,}0005)\): o corte devolve voz à segunda melhor. Com \(\beta = 10\), sobra \((0{,}2646;\ 0{,}2394;\ 0{,}2517;\ 0{,}2443)\), quase um SFT uniforme, que imita também a resposta de recompensa zero.</p>
+  <h3>RAFT: o melhor de K</h3>
+  <p>O <span class="la-term" data-term="raft">RAFT</span> (<i>Reward rAnked FineTuning</i>, Dong et al.) é o caso \(\beta\to0\) assumido. Ele gera \(K\) respostas com temperatura de amostragem \(\lambda\), fica com a de maior recompensa e faz fine-tuning nela. Os experimentos usam \(K\in\{8, 16, 32\}\) com \(\lambda = 0{,}85\). Quanto a política resultante se afasta da referência? Para o <span class="la-term" data-term="best-of-n">best-of-n</span> existe uma fórmula clássica, usada por Stiennon et al. e por Gao et al.:</p>
+  <div class="la-eq">
+    \[ \mathbb D_{\text{KL}}\big(\pi_{\text{bon}}\,\|\,\pi_{\text{ref}}\big)\ \le\ \log n-\frac{n-1}{n} \]
+    <ul class="la-eq-legend">
+      <li>\(\pi_{\text{bon}}\): a distribuição de “gere \(n\) e fique com a melhor”</li>
+      <li>o limite vale: \(n = 4\): 0,6363 nat; \(n = 16\): 1,8351; \(n = 64\): 3,1745; \(n = 1.000\): 5,9088</li>
+      <li>a Tabela 9 de Stiennon et al. lista 1,2 / 3,2 / 3,9 nats para \(N\) = 8 / 64 / 128, os valores da fórmula (1,20 / 3,17 / 3,86)</li>
+    </ul>
+  </div>
+  <p>A fórmula costuma ser citada como igualdade, mas Beirami et al. (2024) mostram que é um <span class="la-term" data-term="kl-best-of-n">limite superior</span>: quase exato quando as \(n\) respostas são todas distintas e a recompensa não empata (respostas longas de LLM), folgado com recompensa binária ou poucas respostas possíveis. Com um verificador que só diz “certo” ou “errado” e desempate aleatório, o best-of-\(n\) devolve uma resposta correta qualquer, e o KL não passa de \(-\log P(\text{correto})\), por maior que seja \(n\); a figura de expert iteration mostra os dois números lado a lado. Para respostas longas, o KL cresce só com \(\log n\): andar uns 6 nats pede pelo menos mil amostras por prompt. O ganho de recompensa também satura: o RAFT mostra que, com recompensa limitada, o ganho médio do best-of-\(K\) é limitado por algo proporcional a \(\sqrt{\log K}\), e o retorno marginal de aumentar \(K\) cai rápido. É por isso que se <b>itera</b>: em vez de um best-of-1000, dez rodadas de best-of-16, cada uma partindo do modelo da rodada anterior.</p>
+  <h3>ReST e ReST-EM: o laço como EM</h3>
+  <p>O <span class="la-term" data-term="rest">ReST</span> (<i>Reinforced Self-Training</i>, Gulcehre et al.) separa o laço em dois tempos. No <b>Grow</b>, a política gera um dataset. No <b>Improve</b>, o dataset é filtrado por limiares crescentes \(\tau_1&lt;\tau_2&lt;\dots\), com \(\tau_1\) acima do valor médio da política, e o modelo é ajustado em subconjuntos cada vez menores e melhores, cada nova política partindo da anterior com LR menor. Entre as perdas testadas no Improve (OAC, BVMPO, GOLD), a de <i>behavior cloning</i> simples (NLL) foi a melhor, em tradução automática. Os autores alertam que filtrar por limiar pode favorecer resultados de alta variância em ambientes estocásticos, e tratam a tradução como determinística.</p>
+  <p>O <span class="la-term" data-term="rest-em">ReST-EM</span> (Singh et al., “Beyond Human Data”) lê o mesmo laço como EM, com recompensa binária em MATH e APPS. O passo E monta \(q(y\mid x)\propto p(O{=}1\mid x,y)\,\pi_{\theta_t}(y\mid x)\), onde \(O=1\) é “a resposta é boa”. O passo M ajusta o modelo por NLL ponderada. É exatamente a conta do aprofundamento sobre EM na seção da RWR, com \(p(O{=}1\mid x,y)=\mathbb 1[\text{correto}]\). Agora junte as peças. Se você escolher \(p(O{=}1\mid x,y)\propto e^{r/\beta}\), o passo E vira \(q\propto\pi_{\theta_t}\,e^{r/\beta}\): a mesma inclinação da primeira seção, com a <b>política atual</b> como referência. Iterar, no limite não paramétrico, compõe as inclinações (derivação nossa):</p>
+  <div class="la-eq">
+    \[ \pi_{k}\ \propto\ \pi_{k-1}\,e^{r/\beta}\ \propto\ \pi_0\,e^{k\,r/\beta}=\pi_0\,e^{r/(\beta/k)} \]
+    <ul class="la-eq-legend">
+      <li>\(\pi_0\): o modelo inicial; \(k\): o número de iterações do laço gerar → filtrar → ajustar</li>
+      <li>cada rodada divide a temperatura efetiva: depois de \(k\) rodadas, é como um único passo com \(\beta/k\)</li>
+      <li>consequência: o laço caminha para o argmax e, junto, <b>a diversidade cai</b>; na prática, o ajuste parcial e o ruído de amostragem freiam esse colapso</li>
+    </ul>
+  </div>
+  <h3>STaR, RFT e o estágio 3 do R1</h3>
+  <p>O mesmo laço, com verificador binário, tem vários nomes, que costumam ser agrupados como <span class="la-term" data-term="expert-iteration">expert iteration</span>: amostrar \(k\) respostas por prompt, manter as corretas, fazer SFT nelas (às vezes misturadas aos dados originais) e repetir com o modelo novo. O <span class="la-term" data-term="star">STaR</span> (Zelikman et al., 2022) acrescenta a “racionalização”: para as perguntas que o modelo erra, ele recebe a resposta certa como dica, gera uma justificativa e treina nela. Isso ataca o buraco do filtro, porque os prompts difíceis, sem nenhuma amostra correta, não gerariam dado nenhum. O <span class="la-term" data-term="rft">RFT</span> (Yuan et al., 2023) levou o LLaMA-7B de 35,9% (SFT) para 49,3% no GSM8K combinando amostras aceitas de vários modelos; o ganho cresce com o número de caminhos de raciocínio <i>distintos</i> e é maior em modelos mais fracos. No Llama 2, o rejection sampling fine-tuning dava a <b>amplitude</b> (\(K\) amostras por prompt, fica a melhor segundo o reward model) e o PPO a <b>profundidade</b>: até a V4 do RLHF só havia rejection sampling; depois, o PPO passou a rodar sobre o checkpoint dele antes de amostrar de novo. E o estágio 3 do DeepSeek-R1 é RFT em escala, como na abertura do capítulo. Os modelos <code>R1-Distill-*</code> (Qwen e Llama) são só SFT nesses ~800 mil exemplos.</p>
+  <figure class="la-fig" id="fig-iteracao" data-title="Expert iteration ao vivo: gerar, filtrar, imitar">
+    <div class="la-fig-stage" style="height:480px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Um modelo de brinquedo escolhe entre 8 “estratégias” de solução, cada uma com uma chance de acerto (losangos âmbar). A cada rodada: 12 prompts de dificuldades diferentes recebem \(K\) amostras cada (matriz de células, ✓ verde e ✗ vermelho); o filtro guarda as corretas (ou pesa todas por \(e^{A/\beta}\) no modo AWR); a política (barras menta) é reajustada nas amostras guardadas. Os gráficos acompanham a taxa de acerto e a entropia da política por rodada. Linhas cinzas na matriz são prompts sem nenhum acerto, que não geram dados em nenhum modo. No modo AWR, a opacidade de cada célula é o seu peso, e prompts sem variância de recompensa (todas erradas ou todas certas) ficam de fora, como no código da última seção: sem isso, a vantagem zero viraria peso uniforme e um SFT nas respostas erradas. O mostrador “KL do alvo” é o KL exato entre o alvo esperado da rodada e \(\pi\). No modo best-of-K ele aparece ao lado do limite \(\log K-(K-1)/K\): com verificador binário o alvo é só “\(\pi\) condicionada a acertar”, e neste brinquedo o KL quase não depende de \(K\). Tudo <b>ilustrativo</b>; o ajuste é o máximo de verossimilhança ponderada com mistura \(\eta = 0{,}6\), que imita passos finitos de SFT.</figcaption>
+  </figure>
+  <div class="la-callout warn"><b class="t">Os limites da estrada da regressão</b><p><b>Teto das amostras:</b> o método só imita o que já foi gerado. Se a resposta certa nunca aparece entre as \(K\), o prompt não ensina nada (o STaR existe por isso). <b>Metade do sinal:</b> o RFT joga fora as respostas erradas. Ele é um gradiente de política com recompensa binária em que só os positivos ficaram (interpretação nossa), e não “empurra para baixo” os erros. O PPO e o GRPO usam os dois sinais (o GRPO, só nos prompts em que há acertos e erros misturados). <b>Diversidade:</b> iterar esfria a temperatura efetiva, e a entropia cai rodada após rodada. Meça pass@k, não só pass@1. <b>Juiz enganável:</b> com um reward model no lugar de um verificador, o filtro seleciona também os erros do RM. É a sobre-otimização de Goodhart do <a data-ch="preferencias-reward-models">capítulo 53</a>, e no best-of-n ela é estudada em função de \(\sqrt{\mathrm{KL}}\), com o KL estimado pela fórmula acima.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Contraste: um contra muitos (InfoNCE)</h2>
+  <p>A segunda estrada não pondera exemplos: ela os <b>compara</b>. A ideia mais limpa dessa família vem do aprendizado de representações. No CPC (<i>Contrastive Predictive Coding</i>, van den Oord, Li &amp; Vinyals, 2018), dado um contexto \(c_t\), monta-se um conjunto \(X=\{x_1,\dots,x_N\}\) com <b>um positivo</b>, sorteado da distribuição condicional verdadeira \(p(x_{t+k}\mid c_t)\), e \(N-1\) <b>negativos</b>, sorteados de uma proposta \(p(x_{t+k})\). A perda <span class="la-term" data-term="infonce">InfoNCE</span> (Eq. 4) é a entropia cruzada de “achar o positivo no meio da multidão”:</p>
+  <div class="la-eq">
+    \[ \mathcal L_N=-\mathbb E_X\Big[\log\frac{f_k(x_{t+k},c_t)}{\sum_{x_j\in X}f_k(x_j,c_t)}\Big],\qquad I(x_{t+k};c_t)\ \ge\ \log N-\mathcal L_N \]
+    <ul class="la-eq-legend">
+      <li>\(f_k(x,c)\): um escore positivo qualquer; na prática \(f=e^{s}\), e \(s\) sai de uma rede</li>
+      <li>\(N\): o tamanho do conjunto (1 positivo e \(N-1\) negativos)</li>
+      <li>\(I(\cdot;\cdot)\): a <span class="la-term" data-term="informacao-mutua">informação mútua</span>; \(\log N-\mathcal L_N\) é um limite inferior, mais apertado com \(N\) maior</li>
+    </ul>
+  </div>
+  <p>O ótimo da perda é \(f_k\propto p(x_{t+k}\mid c_t)/p(x_{t+k})\), uma razão de densidades, qualquer que seja \(N\). E o gradiente em relação aos escores \(s_j=\log f_j\) mostra o mecanismo (é a derivada padrão da entropia cruzada com softmax):</p>
+  <div class="la-eq">
+    \[ \frac{\partial\mathcal L}{\partial s_j}=p_j-\mathbb 1[j=+],\qquad p_j=\frac{e^{s_j}}{\sum_{k}e^{s_k}} \]
+    <ul class="la-eq-legend">
+      <li>positivo (\(j=+\)): empurrado para cima com força \(1-p_+\), o quanto ele ainda não “ganhou”</li>
+      <li>cada negativo: empurrado para baixo com força \(p_j\), a probabilidade que ele está roubando</li>
+      <li>os negativos mais confusos, os <span class="la-term" data-term="negativo-dificil">negativos difíceis</span>, levam os maiores empurrões; os já descartados quase não recebem gradiente</li>
+    </ul>
+  </div>
+  <p>Agora a ponte. Com <b>um único negativo</b> e o escore \(s(y)=\beta\log\frac{\pi_\theta(y\mid x)}{\pi_{\text{ref}}(y\mid x)}\), a InfoNCE vira exatamente a perda do DPO:</p>
+  <div class="la-eq">
+    \[ -\log\frac{e^{s(y_w)}}{e^{s(y_w)}+e^{s(y_l)}}=-\log\sigma\big(s(y_w)-s(y_l)\big)=-\log\sigma\Big(\beta\log\tfrac{\pi_\theta(y_w\mid x)}{\pi_{\text{ref}}(y_w\mid x)}-\beta\log\tfrac{\pi_\theta(y_l\mid x)}{\pi_{\text{ref}}(y_l\mid x)}\Big) \]
+    <ul class="la-eq-legend">
+      <li>\(\sigma\): a <span class="la-term" data-term="sigmoide">sigmoide</span>; \(e^{a}/(e^{a}+e^{b})=\sigma(a-b)\)</li>
+      <li>o “peso adaptativo” do DPO, \(\sigma(-\beta\Delta h)\), é o \(1-p_+\) da InfoNCE com \(N=2\)</li>
+      <li>com rankings de \(K\) respostas, o Plackett–Luce do DPO é uma soma de InfoNCEs aninhadas: cada termo é uma softmax do item contra todos os piores</li>
+    </ul>
+  </div>
+  <p>Em números (exemplo ilustrativo): positivo com escore 2,0 e negativos com 1,0, 0,5 e −0,5. Com \(N=4\), \(\mathcal L = 0{,}5147\), e o limite de informação mútua é \(\log 4 - 0{,}5147 = 0{,}8716\) nat. Com só o primeiro negativo, \(\mathcal L = 0{,}3133 = -\log\sigma(2{,}0-1{,}0)\), o mesmo número de um DPO com margem 1.</p>
+  <figure class="la-fig" id="fig-infonce" data-title="Um contra muitos: a softmax que acha o positivo">
+    <div class="la-fig-stage" style="height:430px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>O positivo (menta, no centro) e \(N-1\) negativos (rosa) numa roda; o tamanho de cada personagem é a sua fatia da softmax \(p_j\). As setas mostram o gradiente: o positivo sobe com \(1-p_+\), cada negativo desce com \(p_j\). “Treinar” aplica passos de descida nos escores e mostra a perda caindo. Os três primeiros negativos são os do exemplo do texto (1,0; 0,5; −0,5); os demais são <b>ilustrativos</b>. Com \(N=2\), o painel mostra a equivalência com a perda do DPO.</figcaption>
+  </figure>
+  <div class="la-callout deep"><b class="t">Aprofundamento: por que a razão de densidades?</b><p>Pense no classificador ideal que olha os \(N\) candidatos e precisa dizer qual veio de \(p(x\mid c)\). A probabilidade a posteriori de o candidato \(j\) ser o positivo é proporcional a \(p(x_j\mid c)\prod_{k\ne j}p(x_k)\), que, dividida pelo produto de todos os \(p(x_k)\), fica proporcional a \(p(x_j\mid c)/p(x_j)\). É por isso que o escore ótimo é a razão, e é por isso que o CPC aprende representações: para estimar bem a razão, a rede precisa capturar o que \(c\) diz sobre \(x\), ou seja, a informação mútua. No DPO, o “contexto” é o prompt, e a razão que o escore aprende é \(\pi_\theta/\pi_{\text{ref}}\).</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>SLiC e SLiC-HF: calibrar com margem e âncora</h2>
+  <p>Antes do DPO, já se fazia alinhamento por contraste com o <span class="la-term" data-term="slic">SLiC</span> (<i>Sequence Likelihood Calibration</i>, Zhao et al., 2022). A motivação era outra: modelos treinados por máxima verossimilhança dão probabilidades de <i>sequência</i> mal calibradas. Uma resposta pode ser mais provável que outra melhor. O SLiC é um terceiro estágio, depois do fine-tuning: decodifica \(m\) candidatos \(\{\hat y\}_m\) do próprio modelo e treina com uma perda de calibração mais uma regularização:</p>
+  <div class="la-eq">
+    \[ \mathcal L(\theta)=\sum_b\mathcal L^{\text{cal}}\big(\theta,s;x,\bar y,\{\hat y\}_m\big)+\lambda\,\mathcal L^{\text{reg}}\big(\theta,\theta_{ft};x,\bar y\big),\qquad \mathcal L^{\text{cal}}_{\text{rank}}=\max\big(0,\ \beta-\log P_\theta(\hat y^+\mid x)+\log P_\theta(\hat y^-\mid x)\big) \]
+    <ul class="la-eq-legend">
+      <li>\(\bar y\): o alvo de referência; \(s\): similaridade do candidato com o alvo, no estilo do BERTScore (que compara dois textos casando os vetores contextuais de seus tokens, em vez de contar n-gramas iguais), aqui sobre estados ocultos do próprio decoder</li>
+      <li>\(\hat y^+,\hat y^-\): dois candidatos, o mais parecido e o menos parecido com o alvo</li>
+      <li>\(\beta\) (aqui): a margem do ranking; \(\theta_{ft}\): os pesos do modelo ajustado, usados pela regularização</li>
+      <li>\(\mathcal L^{\text{reg}}\): entropia cruzada nos tokens do alvo, ou KL por token até o modelo ajustado</li>
+    </ul>
+  </div>
+  <p>O paper testou quatro perdas de calibração: <i>rank</i> (a da equação), <i>margin</i> (a margem passa a ser proporcional à diferença de similaridade), <i>list rank</i> (a perda do BRIO, um método de 2022 para sumarização que treina o modelo a ordenar candidatos pela qualidade, com margem \(\beta|i-j|\) entre as posições \(i\) e \(j\) do ranking) e <i>expected reward</i>. A <b>rank</b> foi a melhor, seguida de margin, list rank e expected reward. É a <span class="la-term" data-term="perda-hinge">perda hinge</span> clássica: zero se o positivo já vence o negativo pela margem, linear caso contrário.</p>
+  <h3>SLiC-HF: a mesma dobradiça, com preferências humanas</h3>
+  <p>O <span class="la-term" data-term="slic">SLiC-HF</span> (Zhao et al., 2023) troca a similaridade com o alvo por preferências humanas (Eq. 4):</p>
+  <div class="la-eq">
+    \[ \mathcal L(\theta)=\max\big(0,\ \delta-\log P_\theta(y^+\mid x)+\log P_\theta(y^-\mid x)\big)\;-\;\lambda\log P_\theta(y_{\text{ref}}\mid x) \]
+    <ul class="la-eq-legend">
+      <li>\(y^+,y^-\): a resposta preferida e a preterida; \(\delta\): a margem (1,0 no paper)</li>
+      <li>\(y_{\text{ref}}\): o alvo do termo de regularização (a resposta do SFT, ou o melhor candidato segundo um ranker ou RM)</li>
+      <li>\(\lambda\): o peso da âncora; a entropia cruzada faz o papel do KL “sem precisar de uma cópia extra dos pesos do SFT”</li>
+    </ul>
+  </div>
+  <p>Há duas variantes. Na <i>sample-rank</i>, os candidatos são amostrados do SFT e ranqueados por um RM pontual ou por um ranker par-a-par (um T5-XXL, o mais preciso). Na <i>direct</i>, a perda usa direto os pares humanos: mais simples, mas off-policy. Os valores reportados (T5, TL;DR) são LR \(10^{-5}\), margem 1,0 e 8 amostras com temperatura 0,7 e top-k 40. O KL no lugar da entropia cruzada, testado no SLiC original, teve desempenho parecido.</p>
+  <p>Compare com o DPO em três pontos. <b>1.</b> O SLiC usa a log-prob <i>crua</i>, sem referência, e a âncora vem só da entropia cruzada. Trocando-a pela log-razão \(h=\log\pi_\theta/\pi_{\text{ref}}\), sai a perda <code>hinge</code> do RSO e do TRL, \(\max(0,\ 1-\beta\,\Delta h)\), em que \(\beta\) é o recíproco da margem. <b>2.</b> A dobradiça <b>zera</b> o gradiente além da margem, enquanto a logística do DPO só decai e nunca para de empurrar. <b>3.</b> Segundo a análise do KTO, o SLiC não é uma <span class="la-term" data-term="halo">HALO</span>: a entropia cruzada não respeita as restrições dessa família.</p>
+  <figure class="la-fig" id="fig-dobradica" data-title="Rampa, dobradiça e parábola">
+    <div class="la-fig-stage" style="height:420px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Perda em função da margem \(m\) entre preferida e preterida: logística do DPO \(-\log\sigma(\beta m)\) (menta), dobradiça do SLiC \(\max(0,\delta-m)\) (rosa) e, para comparação, a parábola do IPO \((m-\tfrac{1}{2\tau})^2\) com \(\tau=1\) (lavanda). Embaixo, a força que cada perda faz sobre o par (\(-\partial\mathcal L/\partial m\)). A bolinha é um par em treino: “treinar” move a margem por descida de gradiente em cada perda. A dobradiça estaciona na margem; a logística segue andando cada vez mais devagar. Curvas exatas; a dinâmica é <b>ilustrativa</b>.</figcaption>
+  </figure>
+  <p>A ausência de referência tem um efeito colateral que um exemplo de brinquedo deixa claro. Considere um par em que a preferida tem 20 tokens e log-prob \(-25\) e a preterida tem 10 tokens e log-prob \(-17\). A preferida é mais longa, logo menos provável como sequência. O que muda entre os métodos é o <b>sinal da margem</b>. O SLiC-HF olha a log-prob crua e vê o par invertido: \(m = -25-(-17) = -8\), perda \(\max(0,\ 1+8) = 9{,}0\) e gradiente 1 por unidade de margem, como se o par estivesse muito errado. Com a referência (log-probs \(-26\) e \(-15\)), a log-razão dá \(\Delta h = (-25+26)-(-17+15) = +3\): o par está na ordem certa. O DPO, com \(\beta = 0{,}5\), mal empurra (força 0,09 na figura). A <code>hinge</code> do TRL com \(\beta=0{,}1\) ainda dá \(\max(0,\ 1-0{,}3) = 0{,}7\), porque a margem efetiva em \(\Delta h\) é \(1/\beta = 10\), mas o gradiente por unidade de \(\Delta h\) é só \(\beta = 0{,}1\). Comparar 9,0 com 0,7 mistura escalas; o fato robusto é que a referência “desconta” o comprimento e desvira o par. Sem ela, o método é empurrado a inflar a probabilidade de sequências longas, o mesmo problema que o SimPO resolveu com a média por token no <a data-ch="ipo-kto-simpo">capítulo 58</a>.</p>
+</section>
+
+<section class="la-sec">
+  <h2>CPL: preferências como arrependimento</h2>
+  <p>Os métodos até aqui tratam a resposta inteira como uma ação. O <span class="la-term" data-term="cpl">CPL</span> (<i>Contrastive Preference Learning</i>, Hejna et al., ICLR 2024) volta ao RL de verdade, com estados e ações em sequência (robôs, agentes), e faz uma pergunta de modelagem: <i>o que</i> um humano compara quando prefere um trecho de comportamento a outro? A suposição clássica do RLHF é que ele compara a soma das recompensas do trecho. O CPL adota a alternativa defendida por Knox et al.: o humano compara o <span class="la-term" data-term="arrependimento">arrependimento</span> (<i>regret</i>), o quanto cada trecho se afasta do comportamento ótimo. Isso dá um modelo de preferência pela <b>vantagem ótima</b> (Eq. 2):</p>
+  <div class="la-eq">
+    \[ P_{A^*}\big[\sigma^+\succ\sigma^-\big]=\frac{\exp\sum_{\sigma^+}\gamma^tA^*(s^+_t,a^+_t)}{\exp\sum_{\sigma^+}\gamma^tA^*(s^+_t,a^+_t)+\exp\sum_{\sigma^-}\gamma^tA^*(s^-_t,a^-_t)} \]
+    <ul class="la-eq-legend">
+      <li>\(\sigma^+,\sigma^-\): os segmentos preferido e preterido, sequências de pares \((s_t,a_t)\)</li>
+      <li>\(A^*\): a vantagem sob a política ótima; somar \(A^*\) ao longo do segmento mede o “quanto se perdeu” em relação ao ótimo</li>
+      <li>\(\gamma\): o desconto</li>
+    </ul>
+  </div>
+  <p>Agora vem o truque. No <span class="la-term" data-term="rl-maxima-entropia">RL de máxima entropia</span> (Ziebart), a política ótima é \(\pi^*(a\mid s)=e^{A^*_r(s,a)/\alpha}\), logo \(A^*_r(s,a)=\alpha\log\pi^*(a\mid s)\) (Eq. 3). É uma bijeção entre vantagem e política, e ela permite trocar a vantagem pela log-probabilidade na fórmula de preferência. Não é preciso aprender recompensa, nem vantagem, nem fazer RL. Sai uma perda puramente supervisionada (Eq. 5):</p>
+  <div class="la-eq">
+    \[ \mathcal L_{\text{CPL}}=\mathbb E_{(\sigma^+,\sigma^-)}\Bigg[-\log\frac{\exp\sum_{\sigma^+}\gamma^t\alpha\log\pi_\theta(a^+_t\mid s^+_t)}{\exp\sum_{\sigma^+}\gamma^t\alpha\log\pi_\theta(a^+_t\mid s^+_t)+\exp\sum_{\sigma^-}\gamma^t\alpha\log\pi_\theta(a^-_t\mid s^-_t)}\Bigg] \]
+    <ul class="la-eq-legend">
+      <li>\(\alpha\): a temperatura da máxima entropia; escala as log-probs como o \(\beta\) do DPO</li>
+      <li>é uma instância de <span class="la-term" data-term="nce">NCE</span> (<i>noise-contrastive estimation</i>, Gutmann &amp; Hyvärinen, 2010: aprender um modelo não normalizado treinando-o a distinguir dados reais de amostras de “ruído”), aqui com um negativo; com rankings e Plackett–Luce, o CPL recupera a InfoNCE, a versão “um contra muitos”</li>
+      <li>convexa, totalmente off-policy, e vale para MDPs arbitrários (segmentos sequenciais)</li>
+    </ul>
+  </div>
+  <p>As garantias: com dados ilimitados vindos de um modelo de arrependimento <span class="la-term" data-term="ruidoso-racional">ruidoso-racional</span> (o humano escolhe o trecho de menor arrependimento com mais frequência, mas não sempre: com a probabilidade da Eq. 2, como num Bradley–Terry), o CPL recupera \(\pi^*\) (Teorema 1), e sempre aprende uma vantagem <i>consistente</i>, ou seja, a política ótima de <i>alguma</i> recompensa (Proposição 1). O problema aparece com dados finitos. A matriz de comparações tem núcleo não trivial, há infinitos minimizadores, e alguns põem massa em ações que nunca apareceram no dataset. A correção é um regularizador conservador “bias”, que multiplica o termo do negativo por \(\lambda\in(0,1)\) (Eq. 6):</p>
+  <div class="la-eq">
+    \[ \mathcal L_{\text{CPL}(\lambda)}=\mathbb E\Bigg[-\log\frac{\exp\sum_{\sigma^+}\gamma^t\alpha\log\pi_\theta(a^+_t\mid s^+_t)}{\exp\sum_{\sigma^+}\gamma^t\alpha\log\pi_\theta(a^+_t\mid s^+_t)+\exp\lambda\sum_{\sigma^-}\gamma^t\alpha\log\pi_\theta(a^-_t\mid s^-_t)}\Bigg] \]
+    <ul class="la-eq-legend">
+      <li>\(\lambda=1\): o CPL “vanilla”; \(\lambda&lt;1\): o termo do negativo encolhe</li>
+      <li>efeito: subir a log-prob do positivo <i>e</i> do negativo pela mesma quantidade passa a reduzir a perda, o que favorece ações vistas no dataset</li>
+    </ul>
+  </div>
+  <p>Números (exemplo ilustrativo, \(\alpha=0{,}1\), somas de log-prob \(-25\) e \(-17\), \(\gamma=1\)): a perda vanilla é 1,1711, e com \(\lambda=0{,}5\) é 1,8257. Some 1 nat às duas log-probs. A vanilla continua em 1,1711, porque só a diferença importa. A conservadora cai para 1,7839: o regularizador recompensa pôr massa nas respostas do dataset.</p>
+  <figure class="la-fig" id="fig-cpl" data-title="Segmentos, arrependimento e o viés conservador">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Dois segmentos como fileiras de células: cada célula é \(\log\pi_\theta(a_t\mid s_t)\) de um passo, e as fileiras somam \(-25\) (preferido, 20 passos) e \(-17\) (preterido, 10 passos), como no exemplo de brinquedo. A varredura luminosa percorre cada fileira, e ao lado dela a soma parcial “Σ até t” vai acumulando \(\sum_t\gamma^t\log\pi_\theta\) passo a passo (\(\gamma=1\)) até chegar ao total da fileira, que depois é multiplicado por \(\alpha\). No gráfico, a perda em função de um deslocamento comum somado às duas fileiras; o botão “+1 nat nas duas” anima esse deslocamento: com \(\lambda=1\), a perda fica parada; com \(\lambda&lt;1\), ela cai. Valores por célula <b>ilustrativos</b> (sorteados com soma exata); perdas calculadas na hora.</figcaption>
+  </figure>
+  <p>O parentesco com o DPO é explícito no paper: o DPO é caso especial do CPL (Apêndice A.6), o caso do bandit contextual, com episódio de um passo e mesmo estado inicial, em que \(A^*=r_E(s,a)-V^*(s)\) e o \(V^*\) cancela entre os dois lados. Dá para ir um passo além com uma derivação nossa no MDP de tokens de um LLM (\(s_t=(x,y_{&lt;t})\), \(a_t=y_t\), \(\gamma=1\)). Ali a soma \(\sum_t\alpha\log\pi_\theta(y_t\mid x,y_{&lt;t})\) é \(\alpha\log\pi_\theta(y\mid x)\), e o CPL com segmentos iguais a respostas completas vira exatamente \(-\log\sigma(\alpha\log\pi_\theta(y_w\mid x)-\alpha\log\pi_\theta(y_l\mid x))\). É a perda de preferência do CPO, ou seja, um DPO com <b>referência uniforme</b>. Faz sentido: máxima entropia é regularização KL contra a uniforme. E é por isso que o CPL “puro” num LLM herda o problema do comprimento do SLiC: sem referência, a resposta longa parece pior.</p>
+</section>
+
+<section class="la-sec">
+  <h2>Unlikelihood: ensinar o modelo a dizer “isso não”</h2>
+  <p>A máxima verossimilhança só sabe dizer “faça mais disso”. O <span class="la-term" data-term="unlikelihood">treinamento por unlikelihood</span> (Welleck et al., 2019) dá ao modelo uma maneira direta de aprender “faça <b>menos</b> disso”. A motivação era a degeneração de texto que o <a data-ch="geracao-amostragem">capítulo 9</a> combateu com penalidades no amostrador. Com decodificação gulosa, um modelo treinado só por máxima verossimilhança repetia n-gramas em 43% dos casos, contra 0,5% no texto humano. O próximo token previsto já tinha aparecido nos 128 tokens anteriores 62% das vezes, contra 49% no texto real. E o vocabulário encolhia: cerca de 40% menos tokens únicos (11,6 mil contra 18,9 mil). A unlikelihood leva a correção do amostrador para dentro dos pesos.</p>
+  <div class="la-eq">
+    \[ \mathcal L^t_{\text{UL}}=-\sum_{c\in\mathcal C^t}\log\big(1-p_\theta(c\mid x_{&lt;t})\big),\qquad \mathcal L^t_{\text{UL-token}}=-\alpha\sum_{c\in\mathcal C^t}\log\big(1-p_\theta(c\mid x_{&lt;t})\big)-\log p_\theta(x_t\mid x_{&lt;t}) \]
+    <ul class="la-eq-legend">
+      <li>\(\mathcal C^t\): os candidatos negativos no passo \(t\); na versão por token, os tokens do contexto anterior, \(\{x_1,\dots,x_{t-1}\}\setminus\{x_t\}\) (Eq. 5)</li>
+      <li>\(-\log(1-p)\): cresce quando \(p(c)\) cresce; vale 0,0513 em \(p=0{,}05\), 0,3567 em \(p=0{,}3\) e 2,3026 em \(p=0{,}9\)</li>
+      <li>\(\alpha\): o peso do termo negativo; o segundo termo é a entropia cruzada usual, a âncora</li>
+    </ul>
+  </div>
+  <p>Repare na forma de \(-\log(1-p)\). Para \(p\) pequeno ela vale quase \(p\), um empurrão suave. Para \(p\) perto de 1 ela explode, um empurrão violento. É o “lado negativo” de uma entropia cruzada binária, que pune com mais força o candidato proibido que está dominando. O gradiente nos logits \(a\), com um único negativo (Eq. 6 do paper), mostra para onde a massa vai:</p>
+  <div class="la-eq">
+    \[ -\nabla_a\mathcal L=x^*-m\odot p,\qquad m_i=\begin{cases}1-\alpha\,\dfrac{p_{\text{neg}}}{1-p_{\text{neg}}} & i\ne i_{\text{neg}}\\[6pt] 1+\alpha & i=i_{\text{neg}}\end{cases} \]
+    <ul class="la-eq-legend">
+      <li>\(x^*\): o vetor one-hot do token-alvo; \(p\): a softmax atual; \(\odot\): produto elemento a elemento</li>
+      <li>\(-\nabla_a\mathcal L\) é a direção em que os logits andam num passo de descida (conferimos o sinal derivando a perda)</li>
+      <li>o negativo desce com força \((1+\alpha)\,p_{\text{neg}}\), mais que na entropia cruzada pura; os outros tokens descem <i>menos</i> (\(m_i&lt;1\)) e herdam a massa liberada</li>
+      <li>se \(\alpha\,p_{\text{neg}}/(1-p_{\text{neg}})&gt;1\) (por exemplo, \(\alpha=1\) e \(p_{\text{neg}}&gt;0{,}5\)), \(m_i\) fica negativo e os logits dos outros tokens chegam a <b>subir</b>: o negativo dominante é drenado ativamente. A figura abaixo começa nesse regime</li>
+    </ul>
+  </div>
+  <p>A versão de sequência (Eq. 7–8) penaliza os tokens que formam n-gramas repetidos em continuações <b>decodificadas pelo próprio modelo</b>. Isso ataca a discrepância entre treino e geração: o modelo é corrigido justamente nos erros que comete quando gera, e não só nos textos de referência.</p>
+  <figure class="la-fig" id="fig-unlikelihood" data-title="Dizer “isso não”: a massa que sai do token proibido">
+    <div class="la-fig-stage" style="height:460px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Em cima, uma continuação degenerada (ilustrativa) com um n-grama repetido em vermelho. No meio, o passo \(t\): logits de 8 tokens como células com valores, a softmax \(p\) em barras, o alvo \(x^*\) (verde) e o negativo \(c\) do contexto anterior (contorno vermelho). A linha de células “\(-\nabla\)” é \(x^*-m\odot p\). “Passo” aplica descidas de gradiente nos logits. Embaixo, \(-\log(1-p)\) contra \(-\log p\), com os três valores do texto marcados. Logits <b>ilustrativos</b>; gradientes exatos.</figcaption>
+  </figure>
+  <h3>O parente que deu errado: o baseline “Unlikelihood” do DPO</h3>
+  <p>O paper do DPO testa um baseline com esse nome: maximizar \(\log p(y_w)\) e minimizar \(\log p(y_l)\) diretamente, <b>sem</b> o peso adaptativo \(\sigma(-\beta\Delta h)\), com o coeficiente \(\alpha\in[0,1]\) varrido em \(\{0{,}05;\ 0{,}1;\ 0{,}5;\ 1\}\) no experimento de sentimento. Ele ficou de fora dos experimentos de resumo e diálogo porque gerava respostas “em geral sem sentido” (a Tabela 3 mostra um “when when when…”), o que os autores atribuem à minimização irrestrita da verossimilhança. A lição é a da InfoNCE: um contraste sem freio continua empurrando pares já resolvidos, e a massa que sai de \(y_l\) vai para lugares que ninguém escolheu. O freio é o peso que se apaga quando o par está bem ordenado (no DPO) ou a âncora de entropia cruzada (na unlikelihood de Welleck). Leitura nossa: \(-\log(1-p)\) tem o espírito do lado indesejável do KTO, mas sem referência e sem saturação.</p>
+</section>
+
+<section class="la-sec">
+  <h2>O mapa de parentesco e a escolha do caminho</h2>
+  <p>Quase tudo neste módulo cabe numa fórmula de três peças: um <b>escore</b> \(s_\theta(x,y)\), uma <b>função de contraste</b> que compara escores (ou pondera exemplos) e um <b>regularizador</b> que segura o modelo perto de algum lugar seguro. A tabela é uma síntese nossa.</p>
+  <table class="la-params">
+    <thead><tr><th>Método</th><th>Escore \(s_\theta(x,y)\)</th><th>Contraste</th><th>Âncora / regularização</th></tr></thead>
+    <tbody>
+      <tr><td>DPO</td><td>\(\beta\log\frac{\pi_\theta}{\pi_{\text{ref}}}\)</td><td>logística em \(s_w-s_l\)</td><td>\(\pi_{\text{ref}}\), dentro do escore</td></tr>
+      <tr><td>IPO</td><td>\(\log\frac{\pi_\theta}{\pi_{\text{ref}}}\)</td><td>quadrática para o alvo \(1/(2\tau)\)</td><td>\(\pi_{\text{ref}}\) + alvo finito</td></tr>
+      <tr><td>KTO</td><td>\(\log\frac{\pi_\theta}{\pi_{\text{ref}}}\)</td><td>sigmoide contra o ponto de referência \(z_0\)</td><td>\(\pi_{\text{ref}}\) + \(z_0\) (KL)</td></tr>
+      <tr><td>SimPO</td><td>\(\frac{\beta}{|y|}\log\pi_\theta\)</td><td>logística com margem \(\gamma\)</td><td>nenhuma explícita (LR pequeno)</td></tr>
+      <tr><td>CPO / CPL (bandit)</td><td>\(\beta\log\pi_\theta\)</td><td>logística</td><td>NLL (CPO) / viés \(\lambda\) nos negativos (CPL)</td></tr>
+      <tr><td>SLiC-HF</td><td>\(\log\pi_\theta\)</td><td>dobradiça com margem \(\delta\)</td><td>entropia cruzada no alvo</td></tr>
+      <tr><td>InfoNCE</td><td>\(f(x,c)\) qualquer</td><td>softmax 1 contra \(N\)</td><td>—</td></tr>
+      <tr><td>Unlikelihood</td><td>\(p_\theta(c)\) por token</td><td>\(-\log(1-p)\)</td><td>NLL do alvo</td></tr>
+      <tr><td>AWR / RAFT / ReST</td><td>— (não contrasta)</td><td>peso \(e^{A/\beta}\), \(\mathbb 1[\cdot]\) ou argmax</td><td>é o próprio SFT: fica no suporte dos dados</td></tr>
+    </tbody>
+  </table>
+  <p>A figura liga os métodos pelas transformações que levam de um ao outro. Algumas arestas estão escritas nos papers: o DPO é caso especial do CPL; com rankings, o CPL recupera a InfoNCE; a forma fechada usada pelo DPO vem de Peng et al. e de Peters &amp; Schaal, como registra o paper do KTO; e, nos créditos do DPO, um dos autores “iniciou a discussão de usar métodos de regressão ponderada como alternativa ao PPO”. Outras são derivações nossas, marcadas como tal: “DPO = InfoNCE com um negativo”, “CPL no MDP de tokens = CPO” e “AWR, ReST-EM e DPO compartilham o ótimo inclinado”.</p>
+  <figure class="la-fig wide" id="fig-parentesco" data-title="O mapa de parentesco: regressão, contraste e RL">
+    <div class="la-fig-stage" style="height:500px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Clique num método (ou escolha na lista) para acender os parentes e ler, em cada aresta, a transformação que leva de um ao outro. Na visão “o que cada um exige”, a mesma lista vira uma matriz de células: precisa de \(\pi_{\text{ref}}\)? de reward model ou verificador? de geração durante o treino? que tipo de dado? Arestas tracejadas são <b>derivações</b> nossas; as cheias estão escritas nos papers.</figcaption>
+  </figure>
+  <h3>Quando regredir ou contrastar em vez de fazer RL</h3>
+  <p>O guia abaixo é interpretação nossa, montada a partir das recomendações dos próprios papers. Não é uma regra.</p>
+  <ol class="la-steps">
+    <li><b>Recompensa verificável e geração barata</b> (matemática, código com testes): comece por RFT, ReST-EM ou RAFT. É SFT, portanto estável, barato de depurar e sem crítico nem reward model. Quando o laço estagnar, separe os dois sintomas. <b>(a)</b> Nos prompts com acertos e erros misturados, as respostas erradas são jogadas fora: passe ao <a data-ch="grpo-rlvr">GRPO</a> (ou ao PPO) para aproveitá-las como sinal negativo. <b>(b)</b> Nos prompts sem nenhum acerto, o GRPO não ajuda: todas as recompensas do grupo são iguais, toda vantagem é zero e o prompt não dá gradiente, o mesmo buraco do filtro. Aí aumente \(K\) ou a temperatura, dê a resposta como dica (a racionalização do STaR), use um currículo com variantes mais fáceis, recompensas parciais ou de processo, ou faça SFT em soluções de referência.</li>
+    <li><b>Recompensa escalar e logs offline</b> (um RM, notas de usuários, dados de outra política): pondere à moda da AWR (vantagem centrada por prompt, \(\beta\) e \(\omega_{\max}\), ou A-LoL com vantagem positiva). Lembre que o método não sai do suporte das amostras.</li>
+    <li><b>Pares de preferência</b>: a família DPO dos capítulos <a data-ch="dpo">57</a> e <a data-ch="ipo-kto-simpo">58</a>. A dobradiça do SLiC-HF é uma alternativa histórica: uma versão com referência dela (a do RSO, sobre log-razões) vive no TRL como <code>loss_type="hinge"</code>, mas o SLiC-HF original (log-prob crua + entropia cruzada) não tem trainer dedicado. Se as comparações são entre <i>trechos</i> de comportamento num ambiente multipasso (robôs, agentes), o CPL é a formulação natural.</li>
+    <li><b>Um comportamento específico a suprimir</b> (repetição, um token, um padrão): um termo de unlikelihood com \(\alpha\) pequeno, sempre ancorado na entropia cruzada. Sem âncora, o contraste degenera.</li>
+    <li><b>Precisa explorar além do que o modelo já gera, ou crédito por token</b>: aí não há atalho, e o caminho é o RL on-policy dos capítulos <a data-ch="ppo-rlhf">55</a> e <a data-ch="grpo-rlvr">56</a>.</li>
+  </ol>
+  <table class="la-params">
+    <thead><tr><th>Método</th><th>Precisa de \(\pi_{\text{ref}}\)?</th><th>Dado</th><th>Custo por passo</th><th>Hiperparâmetros (publicados)</th><th>Estabilidade / risco</th></tr></thead>
+    <tbody>
+      <tr><td>AWR / filtered BC (RAFT, ReST)</td><td>não necessariamente</td><td>recompensa escalar ou verificável</td><td>\(K\) gerações + RM ou verificador + SFT ponderado</td><td>\(\beta\) (0,05 no AWR), \(\omega_{\max}\) (20), \(K\) (8–32 no RAFT), limiar \(\tau\)</td><td>muito estável (é SFT); limitado pela qualidade das amostras</td></tr>
+      <tr><td>SLiC-HF</td><td>não (regulariza por entropia cruzada; há opção de KL)</td><td>pares</td><td>2 forwards da política + CE</td><td>\(\delta\) = 1,0; LR \(10^{-5}\) (T5)</td><td>não é HALO; a dobradiça corta o gradiente sem suavidade</td></tr>
+      <tr><td>CPL</td><td>não (máxima entropia = referência uniforme)</td><td>pares de segmentos</td><td>forwards dos dois segmentos</td><td>\(\alpha\), \(\lambda\) (viés conservador)</td><td>convexo e off-policy; com dados finitos, pede o regularizador</td></tr>
+      <tr><td>Unlikelihood</td><td>não</td><td>alvo + negativos (contexto ou n-gramas decodificados)</td><td>1 forward (+ decodificação na versão de sequência)</td><td>\(\alpha\) (sweep 0,05–1 no baseline do DPO)</td><td>sem âncora, degenera</td></tr>
+    </tbody>
+  </table>
+  <h3>Na prática: o laço em código</h3>
+  <p>A perda do SFT ponderado é a do SFT com uma multiplicação a mais. O esboço abaixo é ilustrativo (PyTorch), no mesmo estilo do pseudocódigo do capítulo do DPO: os pesos são calculados por prompt, com vantagem centrada e corte, e entram como constantes, sem gradiente.</p>
+  <pre data-lang="python"><code>import torch, torch.nn.functional as F
+
+def awr_weights(rewards, beta=0.5, w_max=20.0):
+    # rewards: [P, K]  (P prompts, K amostras cada)
+    adv = rewards - rewards.mean(dim=1, keepdim=True)       # A = R - V(x), V = média do prompt
+    w = torch.exp(adv / beta).clamp(max=w_max)              # corte omega_max
+    # Prompt sem variância (K erradas, ou K certas): A = 0 em tudo e e^0 = 1, ou seja,
+    # behavior cloning puro de mu (a âncora implícita da AWR). Se mu só errou, isso é
+    # SFT nas respostas erradas. A máscara faz o que a vantagem zero do GRPO faz.
+    valid = (rewards.std(dim=1, keepdim=True) &gt; 0).float()
+    w = w * valid
+    return w / w.sum(dim=1, keepdim=True).clamp(min=1e-8)   # autonormalização por prompt
+
+def weighted_sft_loss(logits, labels, mask, w):
+    # logits [B,T,V] já deslocados; mask = 1 nos tokens da RESPOSTA; w [B] (sem gradiente)
+    lp = torch.gather(logits.log_softmax(-1), 2, labels.unsqueeze(-1)).squeeze(-1)
+    seq_lp = (lp * mask).sum(-1)                            # log pi(y|x)
+    return -(w.detach() * seq_lp).sum() / mask.sum()        # normaliza pelos tokens do lote
+
+# uso: R [P, K] -&gt; um peso por sequência, na MESMA ordem do lote de P*K respostas
+w = awr_weights(R).flatten()                                # [P*K]: prompt 0 (K amostras), prompt 1, ...
+loss = weighted_sft_loss(logits, labels, mask, w)</code></pre>
+  <p>Por que a máscara <code>valid</code>? Num prompt em que as \(K\) amostras erraram, toda vantagem é zero, os pesos viram \(1/K\) e o prompt pesa tanto quanto um resolvido: imitação das falhas. Na AWR original, sem normalização por prompt, esse “peso 1 em tudo” é só a âncora implícita até \(\mu\), dominada pelas ações boas (pesos até 20). A máscara também descarta os prompts em que todas acertaram; com recompensa binária, para mantê-los como SFT simples, use <code>rewards.max(dim=1, keepdim=True).values &gt; 0</code>.</p>
+  <p>O laço externo é onde o <a data-ch="vllm-arquitetura">Módulo 1</a> volta. Gerar \(K\) respostas por prompt é a parte cara: no OpenRLHF, a fase de inferência responde por mais de 90% do tempo de RLHF ou RLVR, e no Llama 2 gerar com o próprio motor de treino (FSDP) ficou cerca de 20× mais lento. Por isso RAFT, ReST e ReST-EM rodam a geração num motor de inferência. O <span class="la-term" data-term="continuous-batching">batching contínuo</span> enche a GPU com as \(K\) amostras de muitos prompts, e as amostras de um mesmo prompt compartilham o prefixo, o que o <a data-ch="prefix-caching">prefix caching</a> aproveita (interpretação nossa sobre o arranjo; o TRL, por exemplo, expõe <code>use_vllm</code> nos trainers online). Um esboço do laço externo:</p>
+  <pre data-lang="python"><code># esboço ilustrativo de expert iteration (RFT / ReST-EM) com um motor de inferência
+import gc, torch
+from vllm import LLM, SamplingParams
+
+for rodada in range(R):
+    llm = LLM(model=ckpt_atual)                                # pesos da rodada anterior
+    outs = llm.generate(prompts, SamplingParams(n=K, temperature=0.85, max_tokens=1024))
+    # O motor reservou ~90% da GPU (gpu_memory_utilization=0.9 por padrão) para
+    # pesos + pool de KV. Libere antes de treinar na mesma GPU, senão o sft() dá OOM.
+    # Alternativas: vLLM num processo/servidor separado, ou enable_sleep_mode=True
+    # e llm.sleep(level=2) entre as rodadas.
+    del llm; gc.collect(); torch.cuda.empty_cache()
+    dados = [(p.prompt, o.text) for p in outs for o in p.outputs
+             if verificador(p.prompt, o.text)]                 # filtro binário: só as corretas
+    log(fracao_prompts_sem_acerto(outs), pass_at_k(outs))      # vigie o buraco do filtro
+    ckpt_atual = sft(ckpt_atual, dados, lr=lr_rodada(rodada))  # ReST: LR menor a cada rodada</code></pre>
+  <p>As três linhas do meio são a ponte mais concreta com o Módulo 1. Na partida, o <span class="la-term" data-term="profile-run">profile run</span> mede quanto sobra depois dos pesos e o vLLM pré-aloca o <a data-ch="paged-attention-kv">pool de blocos de KV</a> inteiro, até a fração <span class="la-term" data-term="gpu-memory-utilization">gpu_memory_utilization</span> da memória, para que o <a data-ch="vllm-arquitetura">escalonador</a> nunca peça memória no meio de um passo. Ótimo para servir, péssimo para um laço que alterna gerar e treinar no mesmo dispositivo: enquanto <code>llm</code> existir, os 90% seguem reservados. Na memória unificada do GB10 há um agravante, visto no <a data-ch="ppo-rlhf">capítulo 55</a>: o <span class="la-term" data-term="sleep-mode">sleep mode</span> de nível 1 não libera memória física; só o nível 2 libera.</p>
+  <p>O que vigiar, além da recompensa média: a <b>fração de prompts sem nenhuma amostra aceita</b> (é o buraco que o STaR tapa); o <b>tamanho efetivo da amostra</b> dos pesos, \((\sum w)^2/\sum w^2\), e a fração de pesos cortados, que mostram se um punhado de exemplos está sustentando o gradiente (sugestão nossa, não dos papers); a <b>entropia</b> ou a diversidade das gerações, e pass@k junto com pass@1, porque iterar esfria a temperatura efetiva; e a <b>KL até o modelo inicial</b> (cada rodada de best-of-n anda, sozinha, no máximo \(\approx\log n - (n-1)/n\) a partir do modelo de onde partiu).</p>
+  <div class="la-callout recipe" data-recipe="glm"><b class="t"><span class="la-rb glm"></span> Ponte com as receitas</b><p>O SFT do GLM-5, o relatório que o card do GLM-5.3-Flash aponta como tech report, usou dados de agentes melhorados com RL de especialistas e rejection sampling. Os <b>segmentos errados das trajetórias ficam no contexto, mas mascarados na perda</b>. Na lente do coeficiente de gradiente, é um SFT ponderado com peso 0 por token, que ensina a corrigir o erro sem reforçá-lo. Do lado da edição de pesos, a receita GLM do Módulo 1 tem <a data-ch="abliteracao">abliteração</a> em tempo de carga (<code>ABLIT=1</code>): ortogonaliza <code>o_proj</code> contra uma direção de recusa, \(W'=(I-\alpha rr^\top/\|r\|^2)W\), sem treino nenhum. Unlikelihood e DPO fazem o oposto: treinam para tornar um comportamento menos provável, e a massa liberada vai para onde a geometria do modelo mandar. Servir o resultado não muda a receita de inferência: são os mesmos pesos, com a mesma arquitetura.</p></div>
+  <p>Você viu que regressão e contraste são dois jeitos de alcançar o ótimo inclinado sem PPO, e que o “juiz” que pondera ou compara pode ser um verificador, um reward model ou um humano. O <a data-ch="constitutional-ai">próximo capítulo</a> troca o juiz por um conjunto de princípios escritos. Na Constitutional AI, o próprio modelo critica e revisa suas respostas e faz SFT nas revisões (uma regressão sobre dados reescritos, não apenas filtrados), e depois rotula preferências que alimentam um RL.</p>
+</section>

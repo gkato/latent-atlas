@@ -1,0 +1,330 @@
+<p class="la-lead">Você atravessou a trilha inteira: bits e mantissas, atenção, MoE, quantização, kernels, o vLLM por dentro, especulação, paralelismo. Este capítulo é uma <b>bancada de laboratório</b>. Aqui cada fórmula que você aprendeu vira um mostrador que se mexe. Você escolhe um modelo (ou digita um), um formato de pesos, quantos nós, quanto contexto, quantos usuários e qual rascunhador, e a bancada responde ao vivo as três perguntas de toda receita: <i>cabe?</i>, <i>quantos cabem?</i> e <i>quão rápido?</i>. No fim ela escreve o esqueleto do <code>.env</code> e do <code>vllm serve</code>, com um comentário em cada linha. O ganho principal, porém, vai além do comando: você vai saber <b>de onde vem cada número</b>, o que foi medido, o que é estimativa e como calibrar a estimativa com o log de boot.</p>
+
+<section class="la-sec">
+  <h2>A bancada: do config.json ao comando</h2>
+  <p>As três receitas do laboratório da Mia (GLM-5.3-Flash, Qwen3.8-Flash-Next e DeepSeek-V4-Flash) e o tutorial do MiMo-V2.6-Flash começaram do mesmo jeito. Alguém abriu um <code>config.json</code>, fez contas no papel e só depois apertou o botão. Este capítulo transforma esse papel numa ferramenta viva. Ela funciona como uma linha de montagem com cinco estações de cálculo (pesar, orçar o nó, contar o KV, cronometrar e fatiar), mais duas paradas nas pontas: ler o config e escrever o esqueleto. Na figura são sete paradas. Cada estação recebe uma pergunta, aplica uma fórmula que você já viu em algum capítulo e passa um número para a seguinte.</p>
+  <p>Na figura abaixo, o cartão <code>config.json</code> percorre a esteira. Use os botões do passo a passo (ou deixe no automático) e observe o que cada estação lê e o que ela entrega. Os números no balão são calculados pelo próprio modelo do laboratório, usando o preset do GLM-5.3-Flash como exemplo.</p>
+  <figure class="la-fig" id="fig-esteira" data-title="A linha de montagem de uma receita">
+    <div class="la-fig-stage" style="height:390px"><canvas></canvas></div>
+    <figcaption>Sete paradas: ler o config, pesar os pesos, orçar o nó, contar o KV, cronometrar o passo de decode, fatiar entre os nós e escrever o esqueleto. A seta tracejada de volta ao início indica o último passo de verdade: <b>medir o boot e recalibrar</b> (e serve também quando a parada de fatiar recusa o \(P\) escolhido). Os valores do balão saem do modelo do laboratório (estimativas), não do log real.</figcaption>
+  </figure>
+  <p>Repare em duas coisas. As estações são <b>quase sequenciais</b>. Não adianta cronometrar o decode antes de saber quanto sobra para o <span class="la-term" data-term="kv-cache">KV cache</span>, porque o tamanho do lote em decode depende de quantas requisições cabem no pool. A exceção é o número de nós \(P\): a Estação 1 já precisa dele, mas só a Estação 5 confirma que o modelo se deixa fatiar em \(P\) pedaços. Trate-o como palpite inicial; se a Estação 5 recusar, volte à Estação 1. E a esteira <b>volta ao começo</b>: a última etapa é medir o boot e recalibrar. Uma receita nasce de uma hipótese que depois passa pelo teste do log.</p>
+  <div class="la-callout analogy"><b class="t">Analogia: a planilha do engenheiro de pontes</b><p>Antes de erguer uma ponte, o engenheiro calcula cargas com fórmulas simplificadas e margens de segurança. Depois instrumenta a ponte e compara o previsto com o medido. Ninguém constrói uma ponte para ver se ela cai, e também não faz sentido dar boot num par de DGX Spark só para descobrir se o modelo cabe. O laboratório é essa planilha: simplificada de propósito, com as hipóteses à vista e com as medições das receitas para conferir.</p></div>
+  <div class="la-callout why"><b class="t">Por que prever antes de medir</b><p>Cada tentativa sai cara. Um <code>restart</code> do GLM levava 259 s e, depois de muita otimização, 122 s. O cold start do Qwen mediu 10m55s e o DeepSeek leva cerca de 6 minutos até carregar. Em <span class="la-term" data-term="memoria-unificada">memória unificada</span> o custo de errar também é maior: passar do limite nem sempre produz um OOM limpo. A receita Qwen registrou que, com <code>MemAvailable</code> perto de zero, o GB10 entra na zona em que pode dar <i>hard reset</i>. Uma conta de 30 segundos poupa uma tarde de reboots.</p></div>
+  <h3>O que o laboratório calcula (e o que ele não calcula)</h3>
+  <dl class="la-kv">
+    <dt>calcula</dt><dd>memória por nó (pesos, overhead, pool de KV, folga do host), bytes de KV por token e por requisição, capacidade do pool em tokens, concorrência máxima para um contexto, teto de tokens/s de decode pela banda (com e sem especulação), checagens de divisibilidade por TP/EP e um esqueleto de <code>.env</code> + <code>vllm serve</code>.</dd>
+    <dt>não calcula</dt><dd>qualidade (KLD, perplexidade: veja <a data-ch="medindo-qualidade">Medindo o estrago</a>), a correção de kernels e overlays, TTFT e prefill (limitados por compute, veja <a data-ch="benchmarking">Benchmarking</a>), filas, preempções dinâmicas, a variação de boot a boot (±0,6 GiB no pool do DeepSeek) e o efeito do MNBT e do chunk de prefill na memória. Eles mudam o pico de ativação e os workspaces: a necessidade de KV do GLM é dada "at MNBT 7168", e no DeepSeek um chunk de prefill de 2048 custou ~1,5 GB de RAM do host (MemAvailable 2,55 → 0,99 GB), porque esses workspaces vivem fora do orçamento. No construtor, mudar o MNBT só acende alertas.</dd>
+    <dt>rótulos</dt><dd><b>medido</b> quando o número vem de um log ou benchmark das receitas (com a configuração junto); <b>estimativa</b> quando sai das fórmulas deste capítulo; <b>calibrado</b> quando é um fator ajustado para a estimativa bater com uma medição.</dd>
+  </dl>
+</section>
+
+<section class="la-sec">
+  <h2>Estação 1 · O preço de um parâmetro</h2>
+  <p>A primeira pergunta é a mais bruta: quantos bytes ocupam os <span class="la-term" data-term="pesos">pesos</span>? A resposta ingênua, parâmetros × bits ÷ 8, está quase certa. O "quase" tem dois motivos. Os formatos de 4 e 8 bits carregam <b>escalas</b>, então cada peso paga alguns bits a mais. E nenhum checkpoint de fronteira usa um formato só: os experts vão para 4 bits, as partes sensíveis continuam em 8 ou 16.</p>
+  <h3>Bits efetivos: o imposto das escalas</h3>
+  <p>Num formato com microescala, um bloco de \(n\) elementos divide uma escala. Quem paga essa escala é o bloco inteiro, e o custo por elemento vira a quantidade de <span class="la-term" data-term="bits-efetivos">bits efetivos</span>:</p>
+  <div class="la-eq">
+    \[ b_{\text{ef}} \;=\; b_{\text{elem}} \;+\; \frac{b_{\text{escala}}}{n_{\text{bloco}}} \;+\; \frac{b_{\text{global}}}{N_{\text{tensor}}} \]
+    <ul class="la-eq-legend">
+      <li>\(b_{\text{elem}}\): bits de cada elemento (4 no E2M1, 8 no E4M3, 16 no BF16)</li>
+      <li>\(b_{\text{escala}}\): bits da escala do bloco (8 no E8M0 e no E4M3, 32 no FP32)</li>
+      <li>\(n_{\text{bloco}}\): quantos pesos dividem a escala (16, 32, 128×128…)</li>
+      <li>\(b_{\text{global}}/N_{\text{tensor}}\): escala por tensor diluída no tensor inteiro (desprezível)</li>
+    </ul>
+  </div>
+  <table class="la-params">
+    <thead><tr><th>Formato</th><th>Elemento</th><th>Escala / bloco</th><th>Bits efetivos</th><th>Onde aparece</th></tr></thead>
+    <tbody>
+      <tr><td><code>BF16</code></td><td>1+8+7 bits</td><td>—</td><td>16</td><td>partes densas do GLM (no disco) e do Qwen</td></tr>
+      <tr><td><code>FP8 E4M3</code> em blocos</td><td>8 bits</td><td>FP32 por bloco 128×128</td><td>8 + 32/16.384 ≈ 8,002</td><td>lineares do DeepSeek, <code>qkv_proj</code> do MiMo</td></tr>
+      <tr><td><code>MXFP4</code></td><td>E2M1 (4)</td><td>E8M0 a cada 32</td><td>4 + 8/32 = 4,25</td><td>experts do DeepSeek e do MiMo</td></tr>
+      <tr><td><code>NVFP4</code></td><td>E2M1 (4)</td><td>E4M3 a cada 16 + FP32 global</td><td>4 + 8/16 = 4,5</td><td>experts do Qwen (checkpoint <code>nvidia/…-NVFP4</code>)</td></tr>
+      <tr><td><code>EXL3</code> (treliça)</td><td>≈ bpw</td><td>tiles 16×16 + sinais de Hadamard <code>suh</code>/<code>svh</code> em FP16</td><td>4 + ≈0,012</td><td>experts do GLM (TR3 K4)</td></tr>
+    </tbody>
+  </table>
+  <p>O "+0,012" do EXL3 é conta nossa: os vetores de sinais somam 0,457 GB para 311,65 B parâmetros de experts. Na figura, a metade de cima mostra o mecanismo num vetor de 32 pesos sintéticos: as células coloridas são os valores, os quadradinhos âmbar são as escalas e a faixa de baixo é o erro depois de quantizar e dequantizar. A metade de baixo aplica a mesma conta ao checkpoint inteiro do modelo escolhido e compara com a memória de um e de dois nós.</p>
+  <figure class="la-fig" id="fig-bits" data-title="O imposto das escalas e o que cabe">
+    <div class="la-fig-stage" style="height:470px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Em cima: um bloco quantizado de verdade com <code>LA.num</code> (passe o mouse sobre uma coluna para ver o valor original, o código e o dequantizado). Embaixo: tamanho estimado do checkpoint em cada formato (parâmetros × bits efetivos, mantendo os densos no formato nativo), com os tamanhos <b>publicados</b> marcados em losango e as linhas de 1 e 2 nós de 121,69 GiB. Barra verde: cabe em 2 nós com folga (até 85 % de 2 × 121,69 GiB); vermelha: não cabe. A estrela marca o formato que a receita usa.</figcaption>
+  </figure>
+  <p>O GLM mostra bem o padrão. Em BF16 ele pesa 642,6 GB e no FP8 oficial, 328,3 GB: os dois passam da linha de dois nós. Só os formatos de ~4 bits cabem, e o EXL3 4 bpw fica em 175,6 GB (163,6 GiB em 120 shards no TR3 dos retratos; o pacote próprio do laboratório, padrão das duas lanes desde outubro, tem o mesmo tamanho, ~164 GiB, em 83 shards). O MiMo segue o mesmo caminho: cerca de 620 GB em BF16, 310 GB em FP8 e 173 GB no MXFP4 oficial. Nos dois casos, a quantização é o que permite rodar o modelo em dois nós.</p>
+  <h3>Quantize onde estão os parâmetros</h3>
+  <p>Em MoE, quase todo o peso mora nos experts roteados: <b>97 %</b> no GLM (311,65 de 321,32 B), cerca de 277 de 284 B no tronco do DeepSeek e 302,8 B de ~310 B no MiMo. Por isso as receitas quantizam agressivamente só os experts e deixam o resto em 8 ou 16 bits. Cada grupo de tensores tem então o seu formato, e a conta vira uma soma:</p>
+  <div class="la-eq">
+    \[ W \;=\; \sum_{g} N_g\,\frac{b_{\text{ef},g}}{8} \qquad\qquad W_{\text{rank}} \;=\; \frac{W - W_{\text{rep}}}{P} \;+\; W_{\text{rep}} \]
+    <ul class="la-eq-legend">
+      <li>\(N_g\): parâmetros do grupo \(g\) (experts, densos, tabelas, rascunhador…)</li>
+      <li>\(b_{\text{ef},g}\): bits efetivos do formato desse grupo</li>
+      <li>\(P\): número de ranks de <span class="la-term" data-term="tensor-parallel">tensor parallel</span> (aqui, 1 GPU por nó)</li>
+      <li>\(W_{\text{rep}}\): bytes <span class="la-term" data-term="replicado">replicados</span> em todo rank (não encolhem com TP)</li>
+    </ul>
+  </div>
+  <p>O termo \(W_{\text{rep}}\) mudou decisões reais. No Qwen, as <span class="la-term" data-term="hiper-conexoes">hyper-connections</span> (1,19 GiB), os roteadores e a torre de visão ficam replicados. A visão é replicada de propósito com <code>--mm-encoder-tp-mode data</code>, porque fatiá-la quebraria um kernel (veja a Estação 5). No DeepSeek, as projeções do KV latente e o indexador também são replicados.</p>
+  <table class="la-params">
+    <thead><tr><th>Modelo</th><th>Experts</th><th>Resto</th><th>Total</th><th>Por rank (TP2)</th></tr></thead>
+    <tbody>
+      <tr><td><span class="la-rb glm"></span></td><td>311,65 B em EXL3 4 bpw</td><td>9,67 B BF16 no disco (FP8 em memória com <code>GLM53_DENSE_FP8=all</code>)</td><td>175,6 GB (+2,34 GB do rascunhador <span class="la-term" data-term="dflash2">DFlash2</span>, repositório separado)</td><td>medido 79,65 GiB; 82,94 GiB com a cópia BF16 do <span class="la-term" data-term="kda">KDA</span></td></tr>
+      <tr><td><span class="la-rb qwen"></span></td><td>120,80 B em NVFP4 (63,28 GiB)</td><td>4,95 B BF16 + tabela <span class="la-term" data-term="ngram-embedding">N-gram</span> 51,2 B em FP8 (47,68 GiB) + <span class="la-term" data-term="mtp">MTP</span> 2,51 GiB + visão 0,84 GiB</td><td>123,53 GiB</td><td>medido 64,46 GiB</td></tr>
+      <tr><td><span class="la-rb ds"></span></td><td>~296 B em MXFP4 (tronco 277 B + estágios <span class="la-term" data-term="dspark">DSpark</span>)</td><td>~9 B em FP8 (lineares) e BF16 (embedding, <code>lm_head</code>, visão)</td><td>~157 GiB</td><td>medido 79,17 GiB</td></tr>
+      <tr><td>MiMo</td><td>302,8 B em MXFP4 (149,8 GiB)</td><td>~6 B em FP8 (<code>qkv</code>, MLP) e BF16 (<code>o_proj</code>, embeddings) + encoders 1,7 GB + DFlash 2,94 GB</td><td>169,8 GB (backbone)</td><td>estimado 82,0 GiB; medido 82,7 GiB (SGLang)</td></tr>
+    </tbody>
+  </table>
+  <div class="la-inrecipe" data-recipe="glm"><div class="la-inrecipe-h"><span class="la-rb glm"></span><span class="k">Formato</span><code>--quantization exl3</code></div><div class="la-inrecipe-b"><p>O método é registrado por um overlay e só os experts são EXL3. A receita ainda re-quantiza os densos para FP8 weight-only (kernel <span class="la-term" data-term="marlin">Marlin</span>) na carga (<code>GLM53_DENSE_FP8=all</code>), o que baixa bytes por passo de decode. A regra do README é "never marlin" para os experts: <code>--moe-backend marlin</code> é para NVFP4. No painel de KLD, o 4 bpw servido mede 0,024555, praticamente o mesmo do FP8 oficial (0,024629), com 54 % dos bytes.</p></div></div>
+  <div class="la-inrecipe" data-recipe="qwen"><div class="la-inrecipe-h"><span class="la-rb qwen"></span><span class="k">Formato</span><code>--hf-overrides '{"text_config":{"ple_embedding_dtype":"float8_e4m3fn"}}'</code></div><div class="la-inrecipe-b"><p>Os experts são NVFP4 e a tabela N-gram de 51 B parâmetros fica em FP8, formato que o vLLM do dia 0 não reconhecia. O <code>start.sh</code> detecta o dtype no checkpoint (<code>detect_ple_dtype.py</code>) e o injeta via override; um <code>ple_layer.py</code> patchado despacha pelo dtype. São ~24 GiB por GPU dessa tabela.</p></div></div>
+  <div class="la-inrecipe" data-recipe="ds"><div class="la-inrecipe-h"><span class="la-rb ds"></span><span class="k">Formato</span><code>--moe-backend flashinfer_b12x</code></div><div class="la-inrecipe-b"><p>Os experts vêm em MXFP4 (<code>fp4_e8m0_k32</code>) e o B12X roda W4A16: dequantiza para BF16 dentro do kernel. O log confirma <code>Using 'B12X_MXFP4' Mxfp4 MoE backend</code>. Os demais lineares são FP8 em blocos 128×128.</p></div></div>
+  <div class="la-callout warn"><b class="t">Armadilha: GB × GiB</b><p>1 GiB = 1,0737 GB. O checkpoint do Qwen aparece como 124 GiB, ~126 GiB, 133 GB e 135 GB em lugares diferentes do repositório: são unidades e revisões misturadas. O CUDA reporta GiB (os 121,69 do GB10), o Hugging Face reporta GB. Nas contas deste capítulo, bytes de pesos saem em GB e o orçamento do nó em GiB. Converta sempre antes de comparar.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Estação 2 · O orçamento de um nó</h2>
+  <p>Num DGX Spark, CPU e GPU usam a mesma LPDDR5X. Dos 128 GB, o CUDA enxerga <b>121,69 GiB</b>, e o sistema operacional, o page cache, o Docker e o processo da API disputam essa mesma memória com o vLLM. O parâmetro <span class="la-term" data-term="gpu-memory-utilization">GMU</span> (<code>--gpu-memory-utilization</code>) é a fração desse total que o vLLM pode orçar. No boot ele carrega os pesos e faz uma rodada de <i>profiling</i> com um lote do tamanho do MNBT (<span class="la-term" data-term="max-num-batched-tokens"><code>--max-num-batched-tokens</code></span>: o orçamento de tokens por passo, que também é o tamanho do chunk de prefill) para medir as ativações de pico. Opcionalmente desconta uma estimativa da memória dos CUDA graphs e entrega o que sobra ao <span class="la-term" data-term="pool-de-kv">pool de KV</span>:</p>
+  <div class="la-eq">
+    \[ \underbrace{\text{GMU}\times M_{\text{vis}}}_{\text{orçamento}} \;=\; W_{\text{rank}} \;+\; \underbrace{O_{\text{não-torch}} + A_{\text{pico}}}_{O\ (\text{overhead})} \;+\; \underbrace{\epsilon\,G_{\text{est}}}_{\text{só se estimar graphs}} \;+\; \text{KV}_{\text{pool}} \]
+    \[ F_{\text{host}} \;\approx\; M_{\text{vis}} \;-\; \big(W_{\text{rank}} + O + \text{KV}_{\text{pool}} + G_{\text{real}}\big) \;-\; H_{\text{ext}} \]
+    <ul class="la-eq-legend">
+      <li>\(M_{\text{vis}}\): 121,69 GiB visíveis ao CUDA por GB10</li>
+      <li>\(W_{\text{rank}}\): pesos carregados neste rank (Estação 1)</li>
+      <li>\(O\): contexto CUDA/NCCL fora do torch + ativações de pico do profiling (inclui workspaces, que crescem com o MNBT)</li>
+      <li>\(\epsilon\): 1 se <code>VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1</code> (o profiler desconta a <span class="la-term" data-term="estimativa-de-graphs">estimativa de graphs</span> \(G_{\text{est}}\)), 0 se não; \(G_{\text{real}}\) é o que os graphs ocupam de fato</li>
+      <li>\(\text{KV}_{\text{pool}}\): o resto, ou um valor fixo com <code>--kv-cache-memory-bytes</code></li>
+      <li>\(H_{\text{ext}}\): memória que o processo e o driver alocam além do orçamento GMU. No Qwen, com o nó ocioso, 114,5 − 101,61 = 12,9 GiB, dos quais 0,54 são os graphs não descontados; o LAB usa 12,4 GiB mais \(G_{\text{real}}\)</li>
+      <li>\(F_{\text{host}}\): <span class="la-term" data-term="folga-do-host">folga do host</span> estimada com o nó ocioso. É dela que o SO, o page cache e a carga vão comer</li>
+    </ul>
+  </div>
+  <p>A receita Qwen imprimiu cada termo no boot, o que a torna o melhor gabarito para essa equação:</p>
+  <table>
+    <thead><tr><th>Linha do boot (Qwen, GMU 0,835)</th><th>GiB</th></tr></thead>
+    <tbody>
+      <tr><td>memória visível ao CUDA</td><td>121,69</td></tr>
+      <tr><td>livre no início</td><td>108,79</td></tr>
+      <tr><td>orçada (0,835 × 121,69)</td><td>101,61</td></tr>
+      <tr><td>pesos</td><td>64,46</td></tr>
+      <tr><td>pesos + não-torch</td><td>68,52</td></tr>
+      <tr><td>pico de ativação</td><td>1,07</td></tr>
+      <tr><td>CUDA graphs</td><td>0,54</td></tr>
+      <tr><td><b>KV cache</b></td><td><b>32,02</b></td></tr>
+    </tbody>
+  </table>
+  <p>Some e confira: 101,61 − 68,52 − 1,07 = <b>32,02 GiB, exatamente o reportado</b>. Nesse boot os graphs (0,54 GiB) não foram descontados do pool: a receita não documenta <code>VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS</code>, mas a aritmética mostra que o desconto não entrou. O overhead dentro do orçamento é 4,06 + 1,07 = 5,13 GiB, e os graphs ficam fora dele, pagos pela folga do host. No DeepSeek, que desliga o desconto de propósito, 101,61 − 79,17 − 17,04 = 5,40 GiB. Na figura, a torre é um nó: mexa no GMU e observe o andar do KV subir e descer, enquanto a folga do host encolhe na direção oposta. O interruptor de graphs mostra a outra parametrização.</p>
+  <figure class="la-fig" id="fig-orcamento" data-title="O prédio de 121,69 GiB">
+    <div class="la-fig-stage" style="height:410px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Andares de baixo para cima: pesos por rank (estimativa da Estação 1, com o valor medido em tique), overhead, CUDA graphs (rosa, quando ocupam memória), pool de KV, a faixa hachurada de ~12,4 GiB que o processo e o driver seguram além do GMU e a folga do host com o nó ocioso. O semáforo usa limites calibrados nas histórias das receitas (interpretação nossa): vermelho abaixo de 8 GiB, âmbar de 8 a 11, verde a partir de 11.</figcaption>
+  </figure>
+  <p>A folga da figura é a <b>ociosa</b>; sob carga, page cache, API e workspaces comem mais alguns GiB, quanto depende da receita. Por isso os limites do semáforo reproduzem o que aconteceu nas receitas. O Qwen a 0,835 tem ≈ 7,2 GiB ociosos e o soak de 6 workers levou o <code>MemAvailable</code> a 0,3–0,9 GiB, zona de hard reset: vermelho. A 0,80 ele tem ≈ 11,4 e mediu 4,5 GiB mínimos numa hora de soak: verde. O GLM, com ≈ 8,7 GiB estimados, manteve ≥ 6,2 GiB livres sob carga: âmbar. O preset DeepSeek cai no vermelho (≈ 7,7): a receita roda a 0,835 com 3,8–5,2 GB após o boot e ~1 GB com chunk de prefill 2048, e manda baixar para ~0,78 se a captura de graphs der OOM. Vermelho não significa "não sobe", e sim "sem margem para carga extra: meça antes". E o \(H_{\text{ext}}\) não é constante física: foi medido num nó Qwen ocioso; confira o seu com <code>MemAvailable</code>.</p>
+  <div class="la-inrecipe" data-recipe="qwen"><div class="la-inrecipe-h"><span class="la-rb qwen"></span><span class="k">Memória</span><code>--gpu-memory-utilization 0.80</code> (era 0,835)</div><div class="la-inrecipe-b"><p>Em 2026-09-26 a receita baixou o GMU. A 0,835, um soak com 6 workers deixou o <code>MemAvailable</code> em 0,3–0,9 GiB, zona em que o GB10 pode dar hard reset. A 0,80 sobraram 4,5 GiB (head) e 7,8 GiB (worker) em uma hora. O KV encolhe ~4 GiB por nó, mas <b>o decode não depende do GMU</b>: ele depende de bytes por passo (Estação 4). Regra de bolso da receita: +0,01 de GMU ≈ +0,83 GiB ≈ +95 mil tokens FP8. Pela aritmética, 0,01 × 121,69 = 1,22 GiB de orçamento; a receita registrou só +0,83 GiB de KV e não explica a diferença (interpretação: parte do orçamento extra vai para ativações e workspaces do profiling). O LAB põe os 1,22 GiB inteiros no KV.</p></div></div>
+  <div class="la-inrecipe" data-recipe="glm"><div class="la-inrecipe-h"><span class="la-rb glm"></span><span class="k">Memória</span><code>--gpu-memory-utilization 0.85 --kv-cache-memory-bytes 11811160064</code></div><div class="la-inrecipe-b"><p>A história em quatro atos. (1) Com o loader <span class="la-term" data-term="instanttensor">InstantTensor</span>, o pool perfilado a 850k/0,85 caiu para ~12,4 GiB, abaixo dos 13,56 GiB que uma requisição de 850k exige, e o <b>boot recusou</b>. (2) A receita fixou o pool em 14 GiB. (3) Com páginas compactas do rascunhador, 14 GiB passaram a render 1,85× a 850k. (4) Ela desceu para 11 GiB (1.233.779 tokens, 1,45×) e usou os 3 GiB liberados para pagar a cópia BF16 do KDA (+3,3 GiB/rank), que acelera o prefill em ~12 %. Na prática, a receita converteu memória de KV em velocidade de prefill. Cada 0,01 de GMU equivale a 1,2 GiB de folga do host; a 0,87, um prefill de 256k com <code>MemAvailable</code> zerado derrubou o head.</p></div></div>
+  <div class="la-inrecipe" data-recipe="ds"><div class="la-inrecipe-h"><span class="la-rb ds"></span><span class="k">Memória</span><code>--gpu-memory-utilization 0.835</code></div><div class="la-inrecipe-b"><p>Pesos de 79,17 GiB por rank deixam 17,04 GiB de KV. Cada +0,01 de GMU rende ≈ +1,2 GiB ≈ +165 mil tokens. Se a captura de graphs der OOM, a receita manda baixar para ~0,78. Depois do boot, o <code>MemAvailable</code> típico a 0,83 ficou em 3,8–5,2 GB.</p></div></div>
+  <div class="la-inrecipe" data-recipe="glm"><div class="la-inrecipe-h"><span class="la-rb glm"></span><span class="k">Graphs</span><code>CG_ESTIMATE</code> → <code>VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS</code></div><div class="la-inrecipe-b"><p>Com o padrão (1), o profiler grava uma captura de teste, estima quanto os CUDA graphs vão ocupar e desconta isso do pool. No GLM a estimativa foi 2,43 GiB, mas os graphs capturados de fato consomem −0,19 GiB: "~2,6 GiB of KV is reserved and never used". Com <code>CG_ESTIMATE=0</code> os graphs continuam ligados e só o desconto some (e o overlay <code>patch_skip_cudagraph_profile.py</code> pula a captura de teste, 18 → 7 s de profiling). O DeepSeek fixa <code>VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0</code>: o pool fica maior e a memória real dos graphs sai da folga do host. A troca: com 1 você perde KV para uma estimativa pessimista; com 0 ganha KV e paga os graphs com a margem do SO. Com o pool fixo em bytes, a estimativa não mexe no KV.</p></div></div>
+  <div class="la-callout deep"><b class="t">Aprofundamento: por que fixar o pool</b><p>No UMA o profiling é instável. O pico de ativação depende do loader (InstantTensor custou ~5 GiB de KV ao GLM), do profiling multimodal (que "infla o pico" no MiMo) e do estado do page cache. O vLLM também <b>recusa subir</b> se a memória livre no início for menor que GMU × total: com 108,79 GiB livres, o teto prático fica perto de GMU 0,89. Fixar o pool em bytes torna o boot determinístico, mas o GMU deixa de governar o KV, e a folga do host passa a ser responsabilidade sua. Detalhes em <a data-ch="memoria-unificada">Memória unificada</a> e <a data-ch="paged-attention-kv">PagedAttention</a>. Atenção ao nome: a receita GLM usa <code>--kv-cache-memory-bytes</code>, e o log do Qwen sugere <code>--kv-cache-memory=&lt;bytes&gt;</code>. Confira com <code>vllm serve --help=all</code> na sua imagem.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Estação 3 · KV: bytes por token, capacidade e concorrência</h2>
+  <p>Toda requisição ocupa o pool de dois jeitos. Uma parte <b>cresce com o contexto</b>: as camadas de atenção plena, MLA ou comprimida guardam alguma coisa por token. Outra parte é <b>fixa</b>: o estado das camadas de atenção linear (uma matriz por cabeça, qualquer que seja o tamanho do contexto) e as janelas deslizantes (SWA) do alvo e do rascunhador. A contabilidade por tipo de camada é esta:</p>
+  <div class="la-eq">
+    \[ b^{\text{GQA}}_{\ell} = \Big\lceil \tfrac{h_{kv}}{P} \Big\rceil (d_k + d_v)\,\beta \qquad b^{\text{MLA}}_{\ell} = (d_c + d_{\text{rope}})\,\beta \;+\; \text{escalas} \qquad b^{\text{comp}}_{\ell} = \frac{b^{\text{linha}}}{r} \]
+    \[ s^{\text{linear}}_{\ell} = \frac{h_{\text{lin}}}{P}\,d_k\,d_v\,\beta_{\text{estado}} \qquad s^{\text{SWA}}_{\ell} = w\cdot b_\ell \]
+    \[ b_{\text{tok}} = \sum_{\ell\,\in\,\text{crescem}} b_\ell \qquad S_{\text{seq}} = \sum_{\ell\,\in\,\text{fixas}} s_\ell \]
+    <ul class="la-eq-legend">
+      <li>\(h_{kv}\): cabeças de K/V (se \(h_{kv} &lt; P\), cada rank guarda uma cópia)</li>
+      <li>\(d_k, d_v\): dimensões de K e V por cabeça (192 e 128 no MiMo)</li>
+      <li>\(\beta\): bytes por elemento do KV (2 em BF16, 1 em FP8)</li>
+      <li>\(d_c + d_{\text{rope}}\): latente MLA (512) + parte RoPE (64); o latente é igual em todos os ranks</li>
+      <li>\(r\): razão de compressão (4 ou 128 no DeepSeek)</li>
+      <li>\(w\): janela da SWA (128 no DeepSeek e no MiMo)</li>
+      <li>\(b_{\text{tok}}\): <span class="la-term" data-term="bytes-por-token">bytes por token</span> por rank; \(S_{\text{seq}}\): <span class="la-term" data-term="estado-fixo">estado fixo</span> por requisição</li>
+    </ul>
+  </div>
+  <p>Com isso, cada requisição custa uma parte que cresce e uma parte fixa, e a concorrência para um contexto \(L\) sai de uma divisão:</p>
+  <div class="la-eq">
+    \[ \text{KV}_{\text{req}}(L) \;=\; g\,b_{\text{tok}}\,L \;+\; S_{\text{fix}} \qquad C(L) \;=\; \frac{\text{KV}_{\text{pool}}}{\text{KV}_{\text{req}}(L)} \qquad N_{\text{log}} \;=\; C(L_{\max})\,L_{\max} \qquad B_{\text{ef}} = \min\big(\texttt{max\_num\_seqs},\ \lfloor C(L) \rfloor\big) \]
+    <ul class="la-eq-legend">
+      <li>\(g\): <span class="la-term" data-term="fator-do-alocador">fator do alocador por token</span> (≥ 1): o enchimento de página ou de grupo que cresce com o contexto</li>
+      <li>\(S_{\text{fix}} \ge S_{\text{seq}}\): <span class="la-term" data-term="custo-fixo-por-requisicao">custo fixo por requisição</span>, o estado físico mais os IDs de bloco que o alocador cobra de cada grupo</li>
+      <li>\(C(L)\): quantas requisições de \(L\) tokens cabem ao mesmo tempo (o "Maximum concurrency" do log, com \(L = L_{\max}\))</li>
+      <li>\(N_{\text{log}}\): o "GPU KV cache size" do log. Não é o tamanho do pool: é concorrência × teto</li>
+      <li>\(B_{\text{ef}}\): o lote real de decode, limitado pelo scheduler ou pelo pool</li>
+    </ul>
+  </div>
+  <table class="la-params">
+    <thead><tr><th>Modelo</th><th>Cresce (B/token/rank)</th><th>Estado físico por requisição</th><th>Fixo cobrado (calibrado)</th><th>Pool → tokens do log (medido)</th><th>Quem limita</th></tr></thead>
+    <tbody>
+      <tr><td><span class="la-rb glm"></span></td><td>11 × (656 + 33) = <b>7.579</b> (<code>fp8_ds_mla</code> + indexador)</td><td>estado KDA 34 × 2,34 MB = 76 MiB + ~20 MiB de janela do DFlash2</td><td>≈ 1,58 GiB com páginas compactas do rascunhador; ≈ 7,6 GiB sem elas (<i>g</i> = 1)</td><td>11 GiB → 1.233.779 (1,45× a 850k)</td><td>o pool</td></tr>
+      <tr><td><span class="la-rb qwen"></span></td><td>13 × 2 × 1 × 256 × 1 B = 6.656 (KV principal FP8) + cache comprimido do indexador <span class="la-term" data-term="qsa">QSA</span> 13 × 128 × 2 B / 4 = 832 (12 QSA + MTP, estimado) → <b>7.488</b></td><td>estado <span class="la-term" data-term="gdn">GDN</span> 36 × 1,5 MiB = 54 MiB (FP32) ou 27 MiB (BF16)</td><td>≈ 0,47 GiB (SSM FP32); ≈ 0,09 GiB (SSM BF16) (<i>g</i> = 1)</td><td>32,02 GiB → 3.652.200 (SSM FP32) · 4.378.829 (SSM BF16)</td><td><code>max-num-seqs 8</code> (13,93× a 262k)</td></tr>
+      <tr><td><span class="la-rb ds"></span></td><td>21×584/4 + 20×584/128 + 21×132/4 ≈ <b>3.850</b></td><td>janelas SWA 46 × 128 × 584 B ≈ 3,44 MB</td><td>não separável (boots só a 1M); o LAB usa <i>g</i> ≈ 2,04 por token</td><td>17,04 GiB → 2.331.430 (2,22× a 1M)</td><td>o pool, a 1M; <code>max-num-seqs 6</code> em contexto curto</td></tr>
+      <tr><td>MiMo</td><td>9 × 2 × (192+128) × 1 B = <b>5.760</b> (FP8)</td><td>SWA ≈ 10–13 MB + DFlash ≈ 11 MB</td><td><i>g</i> ≈ 1,15 por token (calibrado no #58128, FP8 a 262k, descontados os fixos; o enchimento de grupo do tutorial é 10/9 ≈ 1,11)</td><td>17 GiB → 2.731.530 FP8 · 1.365.757 BF16</td><td>plano: <code>max-num-seqs 8</code></td></tr>
+    </tbody>
+  </table>
+  <p>Agora veja o mecanismo. Na figura, o pool é um estacionamento de páginas (PagedAttention). Cada requisição é um carro de cor própria: ocupa quadradinhos cheios para a parte que cresce, hachurados para o estado físico e pontilhados para os IDs de bloco que o alocador cobra além do estado. Aumente o contexto ou o número de requisições até faltar vaga. Quem não cabe vai para a fila, e o vLLM não dá OOM nesse caso: ele <b>preempta</b> e refaz o prefill depois. Troque para o GLM e encurte o contexto: os pontilhados não encolhem.</p>
+  <figure class="la-fig" id="fig-estacionamento" data-title="O estacionamento de tokens">
+    <div class="la-fig-stage" style="height:470px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Cada quadradinho é uma fatia do pool. Cheios: a parte que cresce com o contexto (\(g\,b_{\text{tok}}L\)); hachurados: o estado físico; pontilhados: os IDs de bloco do termo fixo. Os carros na faixa de baixo não couberam e esperam (preempção). A linha "termo fixo" diz de onde veio o número: calibrado num boot da receita, estimativa estrutural ou hipótese.</figcaption>
+  </figure>
+  <p>O DeepSeek é o exemplo mais bonito: com 1M de teto e 6 slots, 6 × 50k cabem com folga, 6 × 200k (1,2M tokens) também cabem, 6 × 500k fica no limite e 6 × 1M é impossível. É o que o README da receita diz e o que a figura mostra. A compressão explica por que 1M cabe: sem ela, 43 camadas × 584 B dariam ~25 KB por token (26 GB por requisição de 1M), e uma GQA-8 BF16 típica daria ~176 KB por token.</p>
+  <h3>O imposto do alocador: por token e por requisição</h3>
+  <p>Se você dividir 17,04 GiB por 3.850 B, chega a ~4,75 milhões de tokens. O boot do DeepSeek diz 2.331.430. A diferença vem do <b>alocador híbrido</b> do vLLM, que cobra de dois jeitos. <b>Por token</b>: ele exige a mesma página física para todos os grupos de KV e sobe o bloco da atenção até a página comportar o maior estado (3584 tokens no GLM, 1600 a 3200 no Qwen, páginas de 37.376 B no DeepSeek). Quando a igualação ou o agrupamento de camadas (as 9 globais do MiMo) deixa enchimento que cresce com o contexto, isso é o \(g\). <b>Por requisição</b>: cada grupo de estado ocupa alguns IDs de bloco, qualquer que seja o contexto, e cada ID custa uma página de todas as camadas do grupo. No GLM um ID custa 7.579 B × 3584 = 25,9 MiB, e cada requisição leva 1 ID do kpool, 4 grupos KDA × (2 + k) IDs e mais os IDs das janelas do rascunhador.</p>
+  <div class="la-eq">
+    \[ S_{\text{fix}} \;\approx\; n_{\text{IDs}}\;p_{\text{blk}}, \quad p_{\text{blk}} = n_{\text{camadas/grupo}}\; b_\ell\; B_{\text{pág}} \qquad\qquad \text{um boot: } \frac{\text{KV}_{\text{pool}}}{C_{\text{log}}} \;=\; g\,b_{\text{tok}}\,L_{\max} + S_{\text{fix}} \]
+    <ul class="la-eq-legend">
+      <li>\(n_{\text{IDs}}\): IDs de bloco fixos por requisição (grupos de estado × (2 + k), kpool, janelas)</li>
+      <li>\(B_{\text{pág}}\): tokens por bloco depois da igualação de página (3584 no GLM TP2)</li>
+      <li>\(C_{\text{log}}\): "Maximum concurrency for \(L_{\max}\) tokens" do boot</li>
+    </ul>
+  </div>
+  <p>Um boot só não separa os dois termos (com \(L_{\max}\) fixo, qualquer mistura de \(g\) e \(S_{\text{fix}}\) reproduz a mesma linha); dois boots separam. No Qwen há dois boots do mesmo dia a 262k, com KV FP8 e BF16 (o estado aparentemente em FP32; o README não explicita). Fixando \(g = 1\) e calibrando \(S_{\text{fix}}\) no boot FP8 (≈ 0,47 GiB), o modelo prevê o boot BF16 com erro de 0,6 % (Figura 47.10); resolvendo os dois juntos, \(g = 0{,}985\). No GLM, o README dá a decomposição pronta: "~7.4 GiB fixed + 7.1 GiB per 1M" (MNBT 7168, sem páginas compactas), e os 7,1 GiB por 1M são exatamente os 7.579 B/token físicos, ou seja, \(g = 1\). Calibrando \(S_{\text{fix}}\) num boot a 850k (14 GiB → 1,03×, que dá 7,57 GiB fixos), o modelo prevê 14,6 GiB para uma requisição de 1M e 11,1 GiB para 500k. O README mede 14,52 e 10,98. Com as páginas compactas, o termo fixo cai para ~1,58 GiB, e dois boots (11 GiB → 1,45× e 14 GiB → 1,85×) dão o mesmo valor. No DeepSeek e no MiMo todos os boots publicados usam o mesmo \(L_{\max}\), então o LAB segue a leitura das próprias receitas e trata o excesso como custo por token (\(g \approx 2{,}04\) e \(\approx 1{,}15\)); o doc do DeepSeek observa que a concorrência física a 1M deve ser maior que os 2,22× do log. No seu modelo, suba o mesmo pool com dois <code>max-model-len</code> e resolva as duas equações.</p>
+  <div class="la-callout warn"><b class="t">Tetos, não reservas</b><p><code>--max-model-len</code> e <code>--max-num-seqs</code> são limites de admissão e não reservam memória. A restrição real é que a soma dos custos das requisições vivas caiba no pool. O termo fixo explica o aviso da receita GLM para <b>não</b> baixar o teto para 256k "para liberar slots": encurtar o contexto não mexe nos IDs de bloco dos grupos de estado. No LAB, com 11 GiB e páginas compactas, 850k → 256k leva a concorrência de 1,45× para ~3,2×, e não para os ~4,6× de uma conta só por token. O "GPU KV cache size" cai de 1,23 M para ~0,84 M, porque é \(C(L_{\max}) \times L_{\max}\) e encolhe junto com o teto sem que nada físico mude. Sem as páginas compactas (~7,6 GiB fixos), uma requisição de 256k custaria ~70 % de uma de 850k.</p></div>
+  <div class="la-inrecipe" data-recipe="qwen"><div class="la-inrecipe-h"><span class="la-rb qwen"></span><span class="k">Estado</span><code>--mamba-ssm-cache-dtype bfloat16</code></div><div class="la-inrecipe-b"><p>O estado recorrente das 36 camadas GDN vem em FP32 no checkpoint. Guardá-lo em BF16 corta pela metade a página "Mamba", o vLLM escolhe um bloco de atenção menor, e o mesmo pool passa de 3,65 M para 4,24–4,38 M tokens. No modelo acima, o que muda é o termo fixo (≈ 0,47 → ≈ 0,09 GiB por requisição), porque cada ID de bloco passa a custar uma página menor. O ganho de decode medido no kit de um nó foi de +6,8 % em um stream. Se você escrever um <code>.env</code> do zero sem essa chave, o <code>start.sh</code> cai no FP32 em silêncio.</p></div></div>
+</section>
+
+<section class="la-sec">
+  <h2>Estação 4 · O teto de velocidade</h2>
+  <p>O <span class="la-term" data-term="decode">decode</span> é limitado pela banda de memória: a cada passo, a GPU precisa ler de novo todos os pesos ativos, o KV e o estado das requisições. Os FLOPs quase não pesam. O laboratório usa um <span class="la-term" data-term="modelo-de-custo">modelo de custo do passo</span> que soma os bytes lidos, divide pela banda efetiva e acrescenta a latência das coletivas:</p>
+  <div class="la-eq">
+    \[ t_{\text{passo}} \;\approx\; \frac{B_{\text{exp}} + B_{\text{denso}} + B_{\text{rasc}} + B_{\text{KV}} + B_{\text{estado}}}{\mathrm{BW}_{\text{ef}}} \;+\; n_{\text{col}}\;t_{\text{col}} \]
+    \[ \bar E \;=\; E\,\Big[1 - \big(1 - \tfrac{1}{E}\big)^{k_e\,T}\Big], \quad T = B\,(k+1) \qquad\qquad B_{\text{exp}} \;=\; n_{\text{MoE}}\;\bar E\;\frac{s_{\text{exp}}}{P} \]
+    <ul class="la-eq-legend">
+      <li>\(\mathrm{BW}_{\text{ef}}\): banda efetiva (273 GB/s teóricos no GB10; 230–245 GB/s realistas)</li>
+      <li>\(\bar E\): <span class="la-term" data-term="experts-distintos">experts distintos</span> tocados por camada no passo</li>
+      <li>\(E, k_e\): experts por camada e top-k do roteador</li>
+      <li>\(T\): tokens verificados no passo (\(B\) sequências × \(k+1\) posições)</li>
+      <li>\(s_{\text{exp}}\): bytes de um expert no formato escolhido</li>
+      <li>\(n_{\text{col}}, t_{\text{col}}\): coletivas por passo (~2 por camada) e latência de cada uma</li>
+    </ul>
+  </div>
+  <p>A fórmula de \(\bar E\) é a do "sorteio com reposição": \(k_e T\) escolhas entre \(E\) experts, supondo roteamento uniforme e independente. Com 1 token e top-8 você lê 8 experts por camada. Com 8 tokens (especulação k=7) você não lê 64: no GLM, com 288 experts, o valor esperado é \(\bar E \approx 57\). Esse é o motivo pelo qual especular em MoE rende menos do que em modelo denso, porque verificar mais tokens obriga a ler mais experts.</p>
+  <div class="la-eq">
+    \[ \tau \;=\; 1 + \sum_{i=1}^{k} a_i \;\overset{\text{geom.}}{=}\; \frac{1 - \alpha^{k+1}}{1 - \alpha} \qquad\quad \text{tok/s por stream} = \frac{\tau}{t_{\text{passo}}} \qquad\quad \text{agregado} = B\,\frac{\tau}{t_{\text{passo}}} \]
+    <ul class="la-eq-legend">
+      <li>\(\tau\): <span class="la-term" data-term="tokens-por-passo">tokens por passo</span> (aceitos + 1 corrigido/bônus)</li>
+      <li>\(a_i\): fração de passos em que a posição \(i\) foi aceita (curva medida)</li>
+      <li>\(\alpha\): aceitação condicional constante por posição (modelo geométrico)</li>
+    </ul>
+  </div>
+  <p>Façamos uma conta à mão com o DeepSeek (TP2, DSpark k=6, 1 sequência). O passo verifica 7 tokens × top-6 = 42 escolhas entre 256 experts, o que dá \(\bar E = 256\,[1-(255/256)^{42}] \approx 38{,}8\). Um expert MXFP4 tem 25,17 M × 4,25/8 ≈ 13,4 MB, ou 6,68 MB por rank. Ler 43 camadas × 38,8 × 6,68 MB dá ≈ 11,2 GB. Somando atenção FP8 (2,4 GB), <code>lm_head</code> (0,53 GB) e rascunhador (1,63 GB), chegamos a ≈ 15,7 GB por rank. A 230 GB/s isso leva 68 ms; com 108 coletivas de ~40 µs, o passo fica em ≈ 73 ms. A curva de aceitação por posição mais próxima que existe vem da sonda TP=3 do relatório fable5-1 (0,92 / 0,74 / 0,60 / 0,41 / 0,28 / 0,21), ou seja, de outra topologia. Ela dá \(\tau \approx 4{,}16\), e o resultado é <b>≈ 57 tok/s</b>. O relatório estimou 16,5–17 GB, 68–74 ms e ~4,15 tokens por passo, o que dá 56–61 tok/s. A mediana medida em 2026-09-02 foi 56 tok/s, mas na mesma A/B a aceitação em prosa natural ficou em 24,7–27,2 %, e o \(\tau\) daquela corrida não foi publicado. A concordância é indicativa, não uma validação. Na figura abaixo você pode repetir a conta para cada modelo e ver onde o tempo vai.</p>
+  <figure class="la-fig" id="fig-passo" data-title="Anatomia de um passo de decode">
+    <div class="la-fig-stage" style="height:480px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Barras de cima: o tempo de um passo, fatiado pelo que é lido (experts, densos, rascunhador, KV/estado) e pela comunicação, sem e com especulação. Embaixo à esquerda: a curva \(\bar E(n)\) de experts distintos, com os pontos do passo sem e com especulação. Embaixo à direita: \(\tau\) e o <b>teto</b> de tok/s. É estimativa: não inclui ineficiência de kernels nem overhead de CPU.</figcaption>
+  </figure>
+  <p>Repare no GLM em prosa (α baixo): o passo especulativo lê três vezes mais bytes que o passo simples, porque \(\bar E\) vai de 8 para ~57, e aceita pouco. O ganho quase some. É por isso que a receita criou o <code>GLM53_ADAPTIVE_K</code>, que verifica só 2, 4 ou 7 rascunhos conforme uma média móvel da aceitação: +13–21 % em prosa, sem perda a temperatura 0.</p>
+  <div class="la-callout deep"><b class="t">Aprofundamento: quando a hipótese do sorteio falha</b><p>A fórmula de \(\bar E\) supõe que cada token escolhe experts de forma independente. Em código e texto estruturado, tokens vizinhos tendem a usar os mesmos experts (interpretação nossa), então \(\bar E\) real fica abaixo do previsto e o teto sobe. Na validação do fim do capítulo, o MiMo em código mede 70,5 tok/s, acima do nosso teto a 230 GB/s. Quando o medido passa do teto, alguma hipótese caiu: aqui, provavelmente a da independência (ou a banda efetiva é maior). Para confirmar, instrumente quantos experts distintos cada passo toca.</p></div>
+  <h3>A curva de aceitação e o α equivalente</h3>
+  <p>O modelo geométrico supõe que cada posição é aceita com a mesma probabilidade condicional α. As curvas medidas mostram outra coisa: a aceitação cai com a posição, e cai muito mais rápido em prosa. Para usar o modelo simples sem mentir, o laboratório calcula o <span class="la-term" data-term="alfa-equivalente">α equivalente</span>, que é o α que produz o mesmo \(\tau\) que a curva medida com o mesmo k. A figura compara as curvas reais das receitas com a curva geométrica correspondente.</p>
+  <figure class="la-fig" id="fig-aceite" data-title="Aceitação por posição: medida × geométrica">
+    <div class="la-fig-stage" style="height:330px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Pontos cheios: fração de passos em que a posição \(i\) foi aceita (medições das receitas; a fonte de cada curva aparece no rodapé do gráfico, e a do DeepSeek é a sonda TP=3). Linha tracejada: \(\alpha_{\text{eq}}^{\,i}\), a curva geométrica com o mesmo \(\tau\). Linha pontilhada: um α manual para você comparar. As barras comparam \(\tau\) medido, geométrico e manual.</figcaption>
+  </figure>
+  <table class="la-params">
+    <thead><tr><th>Receita</th><th>Método e k</th><th>Aceitação medida</th><th>Decode C=1</th><th>Por que esse k</th></tr></thead>
+    <tbody>
+      <tr><td><span class="la-rb glm"></span></td><td>DFlash2, k=7</td><td>estruturado 0,959 (6,71 aceitos/passo no contador agregado; a curva por posição da Figura 47.6 soma 6,41, porque são contadores diferentes do mesmo bench); prosa 0,341 (2,39)</td><td>65,1 / 27,1 tok/s</td><td>o bloco treinado tem 8 = 1 âncora + 7; no TP4, k=3 foi melhor (53 % vs 30 %)</td></tr>
+      <tr><td><span class="la-rb qwen"></span></td><td>MTP, k=3</td><td>72,8 % (89 / 74,5 / 60 % por posição)</td><td>24,5 → 52,1 tok/s (2,13×)</td><td>MTP 4 não testado por risco de memória; se a posição 3 aceitar &lt; ~35 %, k=2 vence</td></tr>
+      <tr><td><span class="la-rb ds"></span></td><td>DSpark, k=6</td><td>sonda TP=3 (fable5-1): 0,92 / 0,74 / 0,60 / 0,41 / 0,28 / 0,21; A/B TP2 em prosa natural: 24,7–27,2 %</td><td>~56 tok/s (faixa 62–83 no README)</td><td>k ≥ bloco de 5 e múltiplo de <code>n_predict</code>=3 → 6; posições 5–6 já aceitam só 0,28 e 0,21</td></tr>
+      <tr><td>MiMo</td><td>DFlash, k=7</td><td>código 5,23 · prosa 1,23 aceitos/passo</td><td>70,5 / 25,9 tok/s</td><td>bloco 8 do treino; no TP4, k=4 foi pior que k=7</td></tr>
+    </tbody>
+  </table>
+  <div class="la-callout recipe" data-recipe="ds"><b class="t"><span class="la-rb ds"></span> Na receita: tamanhos de captura</b><p>Com especulação, cada sequência em decode tem \(k+1\) tokens. Os <span class="la-term" data-term="capture-sizes">tamanhos de captura</span> de CUDA graph precisam ser múltiplos de \(k+1\) até <code>max_num_seqs × (k+1)</code>. No DeepSeek, 6 × 7 = 42 era truncado para 40 e virava a lista 7, 14, …, 35, e o passo com 6 sequências rodava <i>eager</i>. Arredondar o teto para múltiplo de 8 (<code>--max-cudagraph-capture-size 48</code>) devolveu +14 % no agregado (139 contra 122 tok/s; a receita registra como −12 % sem o arredondamento). O GLM usa <code>1 2 4 8 16 24 32</code> (4 seqs × 8) e o tutorial do MiMo usa <code>8 16 … 64</code>.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Estação 5 · Topologia e divisibilidade</h2>
+  <p>Com uma GPU por nó, o TP é o número de nós. Cada rank guarda \(1/P\) de cada matriz fatiada, e por isso cada dimensão fatiada precisa se dividir direito entre os ranks. Quando uma dimensão não divide, sobram três saídas: fazer <span class="la-term" data-term="padding-de-cabecas">padding</span> com unidades falsas, replicar ou trocar a estratégia (EP no lugar de TP dentro dos experts). O laboratório checa as <span class="la-term" data-term="divisibilidade-tp">regras de divisibilidade</span> abaixo:</p>
+  <ol class="la-steps">
+    <li><b>Cabeças de atenção</b> \(h_q \bmod P = 0\). Se não fechar, é preciso padding com cabeças de saída zerada, e o kernel pode exigir mais: o FlashInfer SM120 só instancia {8, 16, 32, 64, 128} cabeças locais, então o GLM em TP3 (22 por rank) completa para 32 dentro do kernel e fatia de volta.</li>
+    <li><b>Cabeças de KV</b>: em GQA, \(h_{kv} \bmod P = 0\) ou replicação quando \(h_{kv} &lt; P\). Em MLA/MQA há um latente só, replicado em todos os ranks: o KV <b>não encolhe</b> com TP (DeepSeek).</li>
+    <li><b>Experts</b>: com <span class="la-term" data-term="expert-parallel">expert parallel</span>, \(E \bmod P = 0\). Sem EP, o intermediário \(m/P\) precisa ser múltiplo do bloco do formato (NVFP4 16, MXFP4 32, FP8 128) em <i>todos</i> os experts fatiados, inclusive os de camadas extras como o MTP.</li>
+    <li><b>Vocabulário</b>: o vLLM completa o vocabulário para múltiplo de 64 e exige que o resultado divida por \(P\). Em TP3 o GLM (154.880, já múltiplo de 64) não divide, e o overlay da receita muda o padding para \(\operatorname{mmc}(64, 3) = 192\): 154.880 → 154.944.</li>
+    <li><b>Extras do modelo</b>: grupos de projeção de saída (DeepSeek, 8), MLP da visão (Qwen, 4304), cabeças do rascunhador (GLM, 32/8), QKV pré-fatiado no checkpoint (MiMo, para TP=4).</li>
+  </ol>
+  <div class="la-eq">
+    \[ V_{\text{pad}} = \Big\lceil \tfrac{V}{64} \Big\rceil 64,\ \ P \mid V_{\text{pad}}\ \ \big(\text{overlay: } \operatorname{mmc}(64,P)\big) \qquad n_{\text{col}} \approx 2L + \text{extras} \qquad t_{\text{col}}(P) \approx t_{\text{col}}(2)\,(P-1) \qquad \text{bytes/all-reduce} = d \times 2\,\text{B} \times T \]
+    <ul class="la-eq-legend">
+      <li>\(V\): vocabulário; \(P\): ranks</li>
+      <li>\(n_{\text{col}}\): um all-reduce depois da atenção e outro depois do MoE, por camada (Qwen ~106, DeepSeek ~108, MiMo 96 por passo)</li>
+      <li>\(t_{\text{col}}\): 15–50 µs por coletiva no RoCE das receitas; o termo em \(P-1\) é o de latência do all-reduce em anel (modelo α–β)</li>
+      <li>\(d\): hidden; no MiMo, 4096 × 2 B = 8 KB por token</li>
+    </ul>
+  </div>
+  <p>Na figura, escolha o modelo, o TP e a dimensão. Cada unidade (cabeça, expert, fatia de vocabulário ou de intermediário) ganha a cor do rank que a guarda, e as unidades de padding aparecem hachuradas em vermelho. Embaixo, os nós trocam pulsos pelo cabo CX7, um por coletiva.</p>
+  <figure class="la-fig" id="fig-fatiador" data-title="O fatiador: quem guarda o quê">
+    <div class="la-fig-stage" style="height:420px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Unidades coloridas pelo rank dono; hachurado vermelho = padding (unidades falsas). O texto de status mostra a regra, o resultado e a solução que a receita real adotou quando existe. A faixa de baixo estima o custo das coletivas por passo com o modelo de latência.</figcaption>
+  </figure>
+  <table class="la-params">
+    <thead><tr><th>Dimensão</th><th><span class="la-rb glm"></span></th><th><span class="la-rb qwen"></span></th><th><span class="la-rb ds"></span></th><th>MiMo</th></tr></thead>
+    <tbody>
+      <tr><td>cabeças Q</td><td>64 (TP3 → 66, não 96)</td><td>24</td><td>64 (TP3 → 72)</td><td>64</td></tr>
+      <tr><td>KV</td><td>latente MLA (replicado)</td><td>2 cabeças GQA</td><td>1 latente MQA (replicado)</td><td>4 (GA) / 8 (SWA)</td></tr>
+      <tr><td>experts</td><td>288 (TP3: EP, 96/rank)</td><td>512 (EP, 256/rank)</td><td>256</td><td>256 (EP: 128/rank)</td></tr>
+      <tr><td>intermediário</td><td>2048, treliça EXL3 empacotada (não fatiar por 3)</td><td>640 → 320/rank: fecha o bloco 16 dos roteados NVFP4, mas não o 128×128 dos experts FP8 do MTP</td><td>2048</td><td>2048 → 1024 = 32 × 32</td></tr>
+      <tr><td>vocabulário</td><td>154.880 (TP3 → 154.944)</td><td>248.320</td><td>129.280 (não divide por 3)</td><td>152.576</td></tr>
+      <tr><td>outros</td><td>rascunhador 32/8 → 36/9 em TP3, draft TP=1</td><td>MLP da visão 4304/2 = 2152, e os kernels da visão exigem múltiplo de 16 → <code>--mm-encoder-tp-mode data</code></td><td><code>o_groups</code> 8 → 9 em TP3 (grupo zerado, sink −∞)</td><td>QKV pré-fatiado para TP=4</td></tr>
+    </tbody>
+  </table>
+  <div class="la-callout danger"><b class="t">Shard errado é silencioso</b><p>Divisibilidade errada raramente trava o boot. Na maioria das vezes ela produz lixo com cara de modelo funcionando. O GLM testou padding para 96 cabeças em TP3: um rank ficou só com cabeças KDA falsas e os logits colapsaram. O caminho que funcionou foi 66 (22 por rank). No DeepSeek, o grupo extra precisa de <code>wo_a/wo_b</code> zerados e <code>attn_sink = −∞</code>, e o boot deve imprimir <code>DSv4 TP pad: heads 64 -> 72 for TP=3</code>. No MiMo, se o <code>sliding_window</code> global vazar para as camadas globais, elas passam a ver só 128 tokens. Sempre valide com um teste de agulha e uma comparação numérica. Veja <a data-ch="tp3-tp4">TP=3 e TP=4</a> e <a data-ch="paralelismos">Paralelismos</a>.</p></div>
+  <div class="la-inrecipe" data-recipe="qwen"><div class="la-inrecipe-h"><span class="la-rb qwen"></span><span class="k">Topologia</span><code>--enable-expert-parallel --all2all-backend allgather_reducescatter</code></div><div class="la-inrecipe-b"><p>Com EP, cada GPU guarda 256 dos 512 experts inteiros, e os experts de 640 não precisam ser fatiados em 320. A receita chama o EP de obrigatório ("Required for NVFP4"), mas o motivo não são os experts roteados (em NVFP4, de bloco 16, 320 fecharia): é a camada MTP, cujos experts são FP8 em blocos 128×128. O card da nvidia pede EP para que "the MTP expert width remains compatible with its 128x128 FP8 blocks". O relatório da receita descobriu que, com DP=1, o backend all-to-all <b>nunca é invocado</b>: os tokens já estão replicados por TP, cada rank calcula seus experts locais e o resultado entra no mesmo all-reduce. Aqui o EP muda só quais pesos cada GPU guarda, e as coletivas continuam as mesmas.</p></div></div>
+</section>
+
+<section class="la-sec">
+  <h2>O construtor de receitas</h2>
+  <p>Agora as cinco estações trabalham juntas. Escolha um preset, que carrega a arquitetura e os parâmetros de lançamento reais de cada receita, ou "campos livres" para digitar um modelo novo. Depois mexa em qualquer controle. Os quatro painéis e a lista de alertas se atualizam na hora, e a figura seguinte escreve o esqueleto de <code>.env</code> e <code>vllm serve</code> correspondente.</p>
+  <ol class="la-steps">
+    <li><b>Modelo e pesos</b> Formato dos experts (BF16, FP8, NVFP4, MXFP4 ou EXL3 com bpw ajustável) e dos densos (nativo do checkpoint, BF16 ou FP8).</li>
+    <li><b>Topologia e memória</b> Nós (= TP), EP, GMU ou pool fixo, graphs dentro ou fora do orçamento e os dois termos do alocador (\(g\) por token e o fixo por requisição, que voltam ao valor do preset quando você muda TP, dtype ou especulação).</li>
+    <li><b>Serviço</b> <code>max-model-len</code> (teto), contexto típico em uso, <code>max-num-seqs</code>, MNBT (tokens por passo e chunk de prefill; só gera alertas, veja "não calcula"), dtype do KV e do estado linear.</li>
+    <li><b>Especulação e hardware</b> Método, k, α (com botões para os perfis medidos) e banda efetiva.</li>
+  </ol>
+  <figure class="la-fig wide" id="fig-construtor" data-title="O construtor de receitas">
+    <div class="la-fig-stage lab-stage"></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Painéis: <b>memória por nó</b> (pesos, overhead e graphs, KV, além do GMU, folga ociosa); <b>KV e concorrência</b> (a linha "GPU KV cache size" estimada, requisições de \(L\) tokens que cabem, custo por requisição e de onde veio o termo fixo, quem limita); <b>velocímetro</b> (teto de decode por stream sem e com especulação, e o agregado); <b>topologia</b> (ranks, fatias, coletivas). A lista de alertas junta os problemas de "não cabe", divisibilidade, dtype e especulação, cada um com link para o capítulo do conceito. Tudo é estimativa, e os presets usam termos calibrados nos logs das receitas. O alerta vermelho de folga não bloqueia: ele pede um soak antes de adotar.</figcaption>
+  </figure>
+  <p>Quatro experimentos para fazer agora, cada um com uma lição de receita:</p>
+  <ol class="la-steps">
+    <li><b>Troque o formato do GLM.</b> Com o preset GLM, mude os experts para FP8: aparece "não cabe" (328 GB). Volte a EXL3 e suba o bpw para 6 (o TR3 K6 tem 254 GB e KLD 0,0137, bem melhor que 0,0246). Com ~118 GiB por rank ele ainda não cabe em TP2. Passe para 3 nós: os pesos cabem, mas agora os alertas de divisibilidade acendem (64 cabeças, o intermediário da treliça EXL3, que pede EP, e o vocabulário). Ligue o expert parallel e o alerta dos experts some: 288 ÷ 3 = 96 por rank. Sobra um alerta de KV: em TP3 o termo fixo calibrado no kit é ~5,3 GiB, e o pool de 11 GiB não comporta uma requisição de 850k. Suba o pool fixo; a variante TP3 da receita usa 32–40 GiB. São essas as trocas que ela faz.</li>
+    <li><b>Encha o DeepSeek de requisições longas.</b> Com 1M de teto, suba o contexto em uso até 1M: a concorrência cai para ~2,3× (o log real mediu 2,22×), e o alerta avisa que só 2 requisições de 1M convivem. As outras serão preemptadas e refeitas. Baixe o contexto para 200k e os 6 slots voltam a caber.</li>
+    <li><b>Tire o FP8 do KV do Qwen.</b> Mude o KV para BF16: os tokens do log caem ~1,85× no construtor com o estado em BF16, e 1,71× com o estado em FP32 (mude também o estado para conferir), exatamente a razão medida pela receita (3,65 M ÷ 2,13 M). No construtor ainda sobra folga para os 8 slots a 262k. Interpretação: é por isso que a lane vLLM 0.30, cujo QSA stock só aceita BF16, roda com KV BF16 por padrão (o FP8 é opcional, via backport, com 2,64 M tokens). Mas ali a medição foi 1.467.072 tokens (5,6×) a GMU 0,80, bem abaixo dos ~2,2 M do LAB: outro motor, termo fixo não calibrado nessa imagem. É o segundo erro instrutivo da Figura 47.10.</li>
+    <li><b>Compare prosa e estruturado.</b> Em qualquer preset com especulação, alterne os botões de α. Em prosa o velocímetro com especulação quase encosta no ponteiro sem especulação: o passo lê muito mais experts e aceita pouco.</li>
+  </ol>
+  <p>A figura abaixo é a saída da bancada: um esqueleto no mesmo formato das receitas (um <code>.env</code> com os valores e um array <code>VLLM_ARGS</code> em que cada flag carrega o seu porquê). Troque entre head (rank 0) e worker (rank 1) e veja o que muda: o worker sobe primeiro, com <code>--headless</code>, e não abre API.</p>
+  <figure class="la-fig" id="fig-esqueleto" data-title="Esqueleto gerado: .env + vllm serve">
+    <div class="la-fig-stage pad lab-code-stage"><pre data-lang="bash" id="lab-code"><code># o esqueleto aparece aqui quando o construtor carrega</code></pre></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Gerado a partir do estado atual do construtor. Os valores estimados (pool, tokens, concorrência, teto de decode) aparecem nos comentários com o rótulo "estimativa". Flags e nomes de imagem dos presets vêm das receitas e do tutorial; nos campos livres, as linhas <code>TODO</code> marcam o que depende da família do modelo.</figcaption>
+  </figure>
+  <div class="la-callout warn"><b class="t">Um esqueleto não é uma receita</b><p>O gerador não sabe se a sua imagem tem cada flag, se os kernels existem para <code>sm_121</code> ou se o modelo precisa de overlay. O tutorial do MiMo lembra que <code>--kv-cache-dtype fp8</code> é ignorado sem aviso sem o overlay certo, e que o QKV fica zerado com certos loaders. Rode <code>vllm serve --help=all</code> na imagem fixada e faça o <code>start.sh</code> falhar se alguma flag não existir. Veja <a data-ch="engenharia-de-receita">Engenharia de receita</a> e <a data-ch="receita-do-zero">Receita do zero</a>.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Previsto × medido: calibrando o laboratório</h2>
+  <p>Um modelo só merece confiança depois de comparado com medições. A figura final roda o laboratório nas <b>configurações mais próximas disponíveis</b> daquelas em que as receitas mediram alguma coisa e coloca estimativa e medição lado a lado. Quando a medição e a entrada do modelo vêm de corridas diferentes, a tabela diz. A razão estimado/medido aparece em cada par. O tutorial do MiMo dá o critério de saída: desvio de até ±10 % é aceitável; acima disso, descubra o motivo antes de seguir.</p>
+  <figure class="la-fig" id="fig-validacao" data-title="Previsto × medido nas quatro receitas">
+    <div class="la-fig-stage" style="height:360px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Barras claras: estimativa do laboratório; barras cheias: medição (com a configuração na tabela abaixo da figura). Métricas: pesos por rank, pool de KV, tokens do log ("GPU KV cache size" em boots que <i>não</i> foram usados para calibrar o termo do alocador) e decode C=1 (teto a 230 GB/s × medido). O MiMo usa números de kits comunitários: SGLang (MiaAI-Lab) para os pesos, o kit tonyd2wild para o pool e o decode, e o PR #58128 para os tokens.</figcaption>
+  </figure>
+  <p>O que a validação ensina:</p>
+  <ul>
+    <li><b>Pesos</b> ficam dentro de 1–4 %. O Qwen fica abaixo em ~3 % (partes replicadas que o modelo não conhece em detalhe). O GLM fica abaixo em ~1,5 %, porque buffers do overlay entram no número do log.</li>
+    <li><b>Pool</b> fica dentro de ~5 % no Qwen e no DeepSeek, com o overhead medido. O MiMo em GMU 0,90 com a torre multimodal é o <b>erro instrutivo</b>: estimamos ~23 GiB e o kit mediu 13,89 GiB, porque o profiling multimodal infla o pico de ativação. O overhead de 4 GiB do tutorial não vale nessa configuração.</li>
+    <li><b>Tokens do log</b>: calibrado num boot, o modelo por requisição acerta os outros boots da mesma imagem dentro de ~1 % no GLM (14 GiB), no Qwen (KV BF16) e no MiMo (KV BF16), e dentro de ~8 % no DeepSeek em TP3. A lane vLLM 0.30 do Qwen é o segundo <b>erro instrutivo</b>: ~1,5× acima do medido, porque é outro motor com outro alocador, e o termo fixo não foi calibrado nela.</li>
+    <li><b>Decode</b> fica entre 76 % e 98 % do teto no GLM, no Qwen e no DeepSeek, que é a distância entre banda pura e kernels, CPU e sincronização. O MiMo em código passa do teto e expõe a hipótese do roteamento independente (Estação 4).</li>
+  </ul>
+  <p>No Qwen, a própria receita lê o mesmo número de outro jeito. Ela estima ~9,2 GiB lidos por passo, 40–42 ms a 235–245 GB/s, multiplica por <b>~2,2 tokens por passo</b> (os aceitos, sem o bônus), chega a 53–56 tok/s e compara com um 55,8 medido sem MTP: "batch-1 já está no roofline de banda". O LAB usa \(\tau = 1 +\) aceitos \(= 3{,}23\), da curva por posição, e por isso põe a medição a 76 % do teto. Os reruns da receita decidem: o <code>sweep.py</code> de 11 e 16/set, com vocabulário cheio e S=1, mediu 2,9–3,8 tokens/passo (com o bônus; de prosa a código) e 59,3–61,2 ms/passo. O \(\tau\) é mesmo ~3,2, e o passo real é ~40–50 % mais lento que a banda permite; o "roofline" do relatório vinha de 2,2 aceitos sem o bônus e de uma medição antiga sem MTP. O produto batia por acaso, e por isso se medem ms/passo e tokens/passo separadamente (<a data-ch="benchmarking">Benchmarking</a>).</p>
+  <h3>O ciclo de calibração</h3>
+  <ol class="la-steps">
+    <li><b>Preveja</b> Rode o construtor com a sua configuração e anote pesos/rank, pool, tokens, concorrência e teto de decode.</li>
+    <li><b>Suba e leia o log</b> <code>Model loading took X GiB</code>, <code>Available KV cache memory</code>, <code>GPU KV cache size</code>, <code>Maximum concurrency for L tokens</code>. Recalibre o overhead \(O\) (e confira se os graphs saíram do pool) e o termo fixo \(S_{\text{fix}}\). Para separar \(g\) de \(S_{\text{fix}}\), faça um segundo boot com outro <code>max-model-len</code>.</li>
+    <li><b>Meça sob carga</b> <code>MemAvailable</code> mínimo nos dois nós durante um prefill longo + decodes concorrentes. Se a folga real for menor que a prevista, ajuste \(H_{\text{ext}}\) e baixe o GMU ou o pool.</li>
+    <li><b>Meça o decode</b> Com prompts reais por categoria (o dataset <code>random</code> derruba a aceitação), a C=1 e na escada de concorrência. Compare com o teto. O tutorial do MiMo diz para esperar 50–65 % dele num primeiro boot sem otimização; as receitas otimizadas chegam a 76–98 %. Se você ficar bem abaixo de 50 %, procure kernel lento, graph faltando (<i>eager</i>) ou coletiva no caminho errado (<code>NET/Socket</code> em vez de <code>NET/IB</code>).</li>
+    <li><b>Mude uma variável por vez</b> Em A/B/A, com a regra de decisão escrita antes do teste, e registre também os resultados negativos no CHANGELOG. Veja <a data-ch="benchmarking">Benchmarking</a>.</li>
+  </ol>
+  <div class="la-callout tip"><b class="t">Checklist do laboratório antes do primeiro boot</b><p>(1) Pesos por rank &lt; orçamento, com o formato certo em cada grupo. (2) Pool ≥ uma requisição de <code>max-model-len</code>, senão o boot recusa. (3) Folga ociosa do host estimada ≥ 11 GiB; entre 8 e 11, só com o <code>MemAvailable</code> medido sob carga; abaixo de 8, faça um soak antes de adotar. (4) Nenhum ✕ de divisibilidade no TP escolhido. (5) k compatível com o rascunhador (bloco, <code>n_predict</code>) e tamanhos de captura em múltiplos de \(k+1\). (6) MNBT ≥ <code>max-num-seqs × (k+1)</code>. (7) Dtype de KV suportado pelo backend do modelo. (8) Cada flag do esqueleto conferida na imagem.</p></div>
+  <p>Aqui a trilha fecha o círculo. No <a data-ch="mapa-da-jornada">Mapa da jornada</a>, uma receita era "o conjunto de decisões que faz pesos, arquitetura e motor caberem no hardware". Agora você consegue fazer essas decisões com números. Quando sair um modelo novo, abra o <code>config.json</code> e rode as cinco estações. O lab vai prever errado aqui e ali, e o log de boot mostra onde a previsão errou e por quê. Até aqui o motor foi sempre o vLLM. No <a data-ch="motor-exato-tensorfold">próximo capítulo</a> trocamos só essa peça: o mesmo GLM, nos mesmos dois Sparks, roda no TensorFold, um motor por família com saída bit a bit exata, e o <a data-ch="receita-glm-tensorfold">capítulo 49</a> reconstrói essa receita.</p>
+</section>

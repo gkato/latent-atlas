@@ -1,0 +1,21 @@
+# Dependencies (npm install restores puppeteer-core for tools/qa.js)
+node_modules/
+
+# QA / screenshot output and temp bundles written by tools/qa.js
+.qa-*
+dist/.qa-*
+qa-out/
+
+# Python
+__pycache__/
+*.pyc
+
+# OS / editor
+.DS_Store
+*.swp
+.vscode/
+.idea/
+
+# Local env files
+.env
+.env.*

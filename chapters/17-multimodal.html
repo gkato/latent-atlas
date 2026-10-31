@@ -1,0 +1,409 @@
+<p class="la-lead">Um LLM só sabe ler uma coisa: uma fila de vetores, um por token. Para ele, “ver” uma foto significa receber essa foto já traduzida em centenas ou milhares de vetores que moram no mesmo espaço dos embeddings de texto. Este capítulo acompanha essa tradução de ponta a ponta: pixels, patches, torre visual, tradutor, placeholders no prompt, posições e, por fim, o motor de inferência. Em cada etapa você vai ver nascer um número de receita. É assim que se explica por que o GLM corta cada imagem em 2.048 tokens, por que o Qwen replica a torre de visão nas duas GPUs e por que o DeepSeek precisou montar a torre inteira num hotfix de boot. E como a receita do GLM ganhou uma segunda versão sobre outro motor, o TensorFold <span class="la-rb tf"></span>, você também vai ver uma terceira maneira de acomodar a torre: num rank só, com memória reservada e um orçamento de tokens que as imagens de uma requisição dividem entre si.</p>
+
+<section class="la-sec">
+  <h2>Pixels não são tokens: a imagem vira uma grade de patches</h2>
+  <p>Comece pelo que a GPU recebe. Uma foto colorida é um tensor \([3, H, W]\): três canais (vermelho, verde e azul) com um número por pixel. Um quadro 1920×1080 tem 1920 · 1080 · 3 ≈ 6,2 milhões de números. Se cada pixel virasse um token, seriam ~2 milhões de tokens por foto, e a atenção, que custa \(O(n^2)\) (<a data-ch="atencao">capítulo 6</a>), explodiria. O <span class="la-term" data-term="vit">Vision Transformer</span> (ViT) resolve isso recortando a imagem em quadradinhos de \(p \times p\) pixels, os <span class="la-term" data-term="patch-visual">patches</span>. Cada patch passa a ser tratado como uma “palavra visual”.</p>
+  <p>Cada patch é achatado num vetor de \(3p^2\) números e multiplicado por uma matriz aprendida \(W_E\). É o papel do embedding de texto (<a data-ch="tokens-embeddings">capítulo 5</a>), com uma diferença: lá o id do token escolhe uma linha da tabela; aqui a “consulta” é uma multiplicação de matriz sobre números contínuos.</p>
+  <div class="la-eq">
+    \[ \mathbf{x}_i = W_E\,\operatorname{vec}(P_i) + \mathbf{b}, \qquad W_E \in \mathbb{R}^{\,d \times 3p^2 T_p}, \qquad N = \frac{H}{p}\cdot\frac{W}{p} \]
+    <ul class="la-eq-legend">
+      <li>\(P_i\): o \(i\)-ésimo patch, com 3 canais × \(p\) × \(p\) pixels (× \(T_p\) quadros)</li>
+      <li>\(\operatorname{vec}\): achatar o bloco num vetor coluna</li>
+      <li>\(p\): lado do patch: 14 no DeepSeek e no GLM, 16 no Qwen</li>
+      <li>\(T_p\): patch temporal: 1 no DeepSeek, 2 no GLM e no Qwen</li>
+      <li>\(d\): largura da torre: 1024 (DeepSeek, GLM) ou 1152 (Qwen)</li>
+      <li>\(N\): número de patches da imagem</li>
+    </ul>
+  </div>
+  <p>Multiplicar cada patch pela mesma matriz é exatamente uma convolução com kernel \(p\) e passo \(p\). Por isso os checkpoints guardam esse peso com cara de convolução: <code>patch_embed.proj [1024, 3, 2, 14, 14]</code> no GLM e <code>[1152, 3, 2, 16, 16]</code> no Qwen. O DeepSeek escreve o mesmo cálculo como uma <code>Linear</code> de 588 → 1024, porque 3 · 14 · 14 = 588. Na figura abaixo, uma esteira pega um patch de cada vez, desenrola seus pixels num vetor e o projeta no espaço da torre. Passe o mouse sobre a imagem para escolher o patch.</p>
+  <figure class="la-fig" id="fig-patches" data-title="O patchificador: de pixels a vetor">
+    <div class="la-fig-stage" style="height:410px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Imagem ilustrativa de 224×224 pixels, desenhada no navegador. O patch escolhido é ampliado, desenrolado nos três canais (R, G e B) e multiplicado por \(W_E\). A saída tem \(d\) números (aqui, 32 células representam os 1.024 ou 1.152 reais). GLM e Qwen empilham <b>dois quadros</b> por patch: numa imagem parada, o quadro é duplicado.</figcaption>
+  </figure>
+  <p>Repare em três coisas. Primeiro, o número de patches cresce com a <b>área</b>: dobrar largura e altura quadruplica os patches. Segundo, GLM e Qwen enxergam dois quadros por patch. Com <code>temporal_patch_size = 2</code>, uma imagem estática vira um “vídeo” de dois quadros iguais, e a mesma torre serve imagens e vídeos. Terceiro, o vetor que sai ainda não tem nada de semântico. É só uma projeção linear dos pixels; o significado vem dos blocos da torre.</p>
+  <div class="la-callout analogy"><b class="t">Analogia: o mural de azulejos</b><p>Pense num mural de azulejos. O ViT não examina a parede gota de tinta por gota de tinta. Ele preenche uma ficha de 1.024 números para cada azulejo e depois deixa as fichas conversarem. É na conversa que o azulejo laranja descobre que é a orelha de um gato, porque o de baixo tem bigodes.</p></div>
+  <p>Antes do recorte, o <b>pré-processamento</b> ajusta a imagem. O processador redimensiona para múltiplos do patch (e do fator de merge, que aparece na seção 3), normaliza os valores e às vezes preenche as bordas. O DeepSeek converte para RGB, limita a razão largura/altura a 8, amplia imagens com menos de 147.456 pixels (384²), preenche com cinza 127 para manter a proporção e normaliza com \((x - 0{,}5)/0{,}5\), deixando os pixels em \([-1, 1]\) em bf16. O Qwen usa média e desvio 0,5; o GLM, a média e o desvio do CLIP.</p>
+  <div class="la-callout why"><b class="t">Por que o tamanho do patch importa</b><p>O patch é a “acuidade” do modelo. Detalhe menor que um patch, como uma letra de 6 pixels, precisa ser reconstruído a partir da mistura de pixels dentro de um único vetor. Patch menor enxerga melhor, mas gera mais vetores, e o custo da atenção dentro da torre cresce com o quadrado desse número. Todo modelo de visão vive entre essas duas forças. Por isso os três processadores das receitas <b>redimensionam</b> as imagens para caber num orçamento de tokens antes do recorte (seção 8).</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>A torre visual: um Transformer que olha para todos os lados</h2>
+  <p>Depois do embedding, os \(N\) vetores atravessam uma pilha de blocos Transformer, a <span class="la-term" data-term="torre-visual">torre visual</span> (<i>vision tower</i>). É o bloco do <a data-ch="bloco-transformer">capítulo 7</a>: pré-normalização, atenção multi-cabeça, MLP e fluxo residual. A diferença decisiva está na máscara de atenção.</p>
+  <p>Num LLM, o token \(i\) só enxerga os tokens \(0 \dots i\). É a <span class="la-term" data-term="mascara-causal">máscara causal</span>, que existe porque o texto é gerado da esquerda para a direita e o futuro ainda não foi escrito. Numa imagem não existe futuro: todos os patches chegam juntos. Por isso o ViT usa <span class="la-term" data-term="atencao-bidirecional">atenção bidirecional</span>, em que cada patch consulta todos os outros, inclusive os que vêm “depois” na ordem de leitura. Na figura, clique num patch para vê-lo fazer perguntas. As linhas mostram para onde vai o peso da atenção, calculado de forma ilustrativa: cores parecidas e vizinhos próximos atraem mais peso.</p>
+  <figure class="la-fig" id="fig-bidir" data-title="Bidirecional (ViT) × causal (LLM)">
+    <div class="la-fig-stage" style="height:420px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Mosaico 8×8 da mesma imagem (64 patches). No mosaico, o patch selecionado (anel rosa) e as chaves que mais recebem atenção. Na matriz de atenção 64×64: cada linha é uma query, cada coluna uma chave. No modo causal, o triângulo superior some: um patch só vê os que vêm antes dele na leitura linha a linha.</figcaption>
+  </figure>
+  <p>No modo causal, o patch do canto superior esquerdo só enxerga a si mesmo, e a orelha do gato não pode consultar a pata que está logo abaixo. A máscara jogaria informação fora sem motivo, porque a torre não gera nada. O custo da atenção continua \(O(N^2)\), mas \(N\) é mantido sob controle pelo orçamento de tokens.</p>
+  <div class="la-callout deep"><b class="t">Aprofundamento: e dentro do LLM?</b><p>Depois do tradutor (seção 3), os tokens de imagem entram na sequência do decoder e obedecem à máscara causal dele, como qualquer texto; é assim que o vLLM os trata nas três receitas. A referência oficial do DeepSeek Vision-Exp vai além em dois pontos: dá visibilidade bidirecional entre os tokens de uma mesma imagem (de <code>IMAGE_START</code> a <code>IMAGE_END</code>), alargando a janela deslizante para cobri-los, e exige que esse span seja pré-preenchido num único chunk. O inventário não achou nenhum dos dois no hotfix: lá, os tokens de imagem seguem causais, com janela de 128, e o <a data-ch="scheduler-batching">chunked prefill</a> pode cortar a imagem entre passos (os vetores esperam no encoder cache, seção 6). O impacto não foi medido; o ponto segue em aberto.</p></div>
+  <p>As três torres são parentes próximas, com escolhas diferentes de norma, ativação e posição:</p>
+  <table>
+    <thead><tr><th></th><th><span class="la-rb glm"></span> GLM-5.3-Flash</th><th><span class="la-rb qwen"></span> Qwen3.8-Flash-Next</th><th><span class="la-rb ds"></span> DeepSeek Vision-Exp</th></tr></thead>
+    <tbody>
+      <tr><td>Blocos</td><td>24</td><td>27</td><td>32</td></tr>
+      <tr><td>Largura / cabeças</td><td>1024 / 16 (64 por cabeça)</td><td>1152 / 16 (72)</td><td>1024 / 16 (64)</td></tr>
+      <tr><td>MLP</td><td>SwiGLU, intermediária 4096, com bias</td><td>GELU-tanh, intermediária 4304, com bias</td><td>SwiGLU, intermediária 2816</td></tr>
+      <tr><td>Norma</td><td>RMSNorm (também em q/k)</td><td>LayerNorm com bias</td><td>RMSNorm</td></tr>
+      <tr><td>Patch</td><td>14×14 × 2 quadros</td><td>16×16 × 2 quadros</td><td>14×14</td></tr>
+      <tr><td>Posição</td><td>RoPE 2D parcial (fator 0,5), sem embedding absoluto</td><td>grade absoluta 48×48 aprendida e interpolada + RoPE 2D axial</td><td>RoPE 2D, Θ = 10.000</td></tr>
+      <tr><td>Tamanho</td><td>563.627.008 parâmetros (1,13 GB em BF16)</td><td>0,836 GiB em BF16</td><td>≈ 412 M (ViT) + 54,5 M (Aligner), cálculo do inventário</td></tr>
+    </tbody>
+  </table>
+  <p>Interpretação do inventário: 1152 / 4304 / 27 / 16 é a geometria do SigLIP-2 So400m/16, o mesmo encoder da família Qwen3.5/Qwen3-VL. Os números de tamanho mostram outra coisa importante: as torres têm ~0,5 B de parâmetros, contra centenas de bilhões do LLM. Carregar a visão custa pouco. Caro é o que ela <i>produz</i>: tokens.</p>
+  <div class="la-callout warn"><b class="t">Armadilha: um epsilon que estraga descrições</b><p>O <code>config.json</code> do GLM declara <code>rms_norm_eps = 1e-5</code> para a torre, e a imagem vLLM usada pela receita força <code>1e-6</code>. O comentário no código, citado no inventário, diz que servir com 1e-5 faz a RMSNorm derivar e produz descrições de imagem “repetitivas e degradadas”. A torre é pequena, mas é numericamente sensível: um detalhe de normalização muda o que o LLM “vê”.</p></div>
+  <div class="la-callout recipe" data-recipe="tf"><b class="t"><span class="la-rb tf"></span> Na lane TensorFold: a mesma torre, reescrita e conferida bit a bit</b><p>A segunda versão da receita GLM troca o vLLM pelo TensorFold v0.6.0 com 53 patches (<a data-ch="motor-exato-tensorfold">Um motor exato</a>). No upstream, imagens do GLM-5.3-Flash só funcionavam no backend MLX, do Mac. Por isso o patch <code>0003-glm-vision</code> reescreve a torre para CUDA em PyTorch puro, com pesos BF16, peça por peça da coluna GLM da tabela acima: a conv3d de patches 3×2×14×14, os 24 blocos com RMSNorm (também em q e k), RoPE 2D, atenção dentro de cada imagem ou par de quadros e MLP SwiGLU com clamp, e depois a redução 2×2 e o merger até as 4.096 colunas do LLM. Os processadores e a torre seguem os do Hugging Face transformers 5.17 e foram conferidos <b>bit a bit</b> contra eles. Um detalhe mostra o quanto isso é delicado: o código usa as <b>convoluções</b> da referência, e não as multiplicações de matriz que a seção 1 mostrou serem matematicamente iguais. As duas somam as mesmas parcelas em outra ordem, e a soma em ponto flutuante não é associativa (<a data-ch="numeros-no-computador">capítulo 4</a>). Segundo o comentário do código, ao longo dos 24 blocos essas diferenças de último bit viram ~3%. É a lição do epsilon acima vista por outro ângulo: numa torre, a aritmética exata da referência faz parte do modelo.</p></div>
+
+  <h3>Posição em duas dimensões: RoPE 2D</h3>
+  <p>Atenção é cega à ordem: embaralhe os patches e as somas ponderadas não mudam. É preciso dizer a cada patch onde ele está. O RoPE (<a data-ch="posicao-rope">capítulo 8</a>) faz isso girando pares de dimensões de \(\mathbf{q}\) e \(\mathbf{k}\) por um ângulo proporcional à posição. Assim, o produto \(\mathbf{q}\cdot\mathbf{k}\) passa a depender da distância relativa. Numa imagem, a posição tem duas coordenadas, a linha \(h\) e a coluna \(w\). A <span class="la-term" data-term="rope-2d">RoPE 2D</span> resolve com uma divisão: metade dos pares gira com a linha, a outra metade com a coluna.</p>
+  <div class="la-eq">
+    \[ \omega_k = \Theta^{-2k/32},\ \ k = 0,\dots,15 \qquad \phi_k = h\,\omega_k, \qquad \phi_{16+k} = w\,\omega_k \]
+    \[ \big\langle R(\boldsymbol\phi^{(q)})\,\mathbf{q},\ R(\boldsymbol\phi^{(k)})\,\mathbf{k} \big\rangle = f\big(\mathbf{q},\mathbf{k},\ h_q - h_k,\ w_q - w_k\big) \]
+    <ul class="la-eq-legend">
+      <li>\(\Theta\): <code>vision_rope_theta</code> = 10.000 no DeepSeek</li>
+      <li>\(\omega_k\): as 16 frequências por eixo (<code>rope_dim</code> = 1024 / 16 / 2 = 32)</li>
+      <li>\(h, w\): linha e coluna do patch na grade da torre</li>
+      <li>\(\phi\): os 32 ângulos, um por par, de cada cabeça de 64 dimensões</li>
+      <li>\(R(\phi)\): rotação bloco a bloco dos pares</li>
+      <li>\(f\): o resultado só depende das diferenças \(\Delta h\) e \(\Delta w\)</li>
+    </ul>
+  </div>
+  <p>A figura mostra isso como dois varais de relógios. Mova o patch pela grade: os ponteiros da fileira de cima giram quando a <b>linha</b> muda, os de baixo quando a <b>coluna</b> muda. Os relógios da esquerda são rápidos e os da direita, lentíssimos. Juntos formam uma impressão digital única da posição.</p>
+  <figure class="la-fig" id="fig-rope2d" data-title="RoPE 2D: relógios de linha e de coluna">
+    <div class="la-fig-stage" style="height:430px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Frequências reais do ViT do DeepSeek (\(\Theta = 10.000\), 16 frequências por eixo; mostramos 8 de cada). O mapa de calor é a similaridade \(\tfrac{1}{32}\big[\sum_k \cos(\Delta h\,\omega_k) + \sum_k \cos(\Delta w\,\omega_k)\big]\) entre dois vetores iguais em posições diferentes. Ela só depende do deslocamento \((\Delta h, \Delta w)\) e forma uma cruz porque os dois eixos somam separadamente.</figcaption>
+  </figure>
+  <p>O desenho em cruz no mapa não é acidente: linha e coluna contribuem com parcelas separadas, então patches da mesma linha (ou coluna) já ganham metade da similaridade máxima. Por isso o DeepSeek dispensa embedding posicional absoluto; a tabela de senos e cossenos é gerada sob demanda para qualquer grade \((n_h, n_w)\) por <code>get_vision_cos_sin</code>. O Qwen combina as duas técnicas: uma grade absoluta aprendida de 48×48 posições (2.304 vetores), interpolada bilinearmente para cada imagem e somada à RoPE axial. O GLM aplica RoPE 2D em metade das dimensões (<code>partial_rotary_factor 0,5</code>); como o texto do GLM é <a data-ch="posicao-rope">NoPE</a>, essa é a única RoPE do modelo-alvo (o rascunhador DFlash2 servido junto é outro modelo).</p>
+</section>
+
+<section class="la-sec">
+  <h2>O tradutor: merger, aligner e projetor</h2>
+  <p>Ao fim da torre há \(N\) vetores de largura \(d\), e dois problemas impedem despejá-los no LLM. O primeiro é a <b>largura</b>: 1024 ou 1152, contra 4096 no GLM e no DeepSeek e 2560 no Qwen. O segundo é a <b>quantidade</b>: patches de 14 pixels custariam uma fortuna em prefill e em <span class="la-term" data-term="kv-cache">KV cache</span>. A peça que resolve os dois de uma vez tem três nomes: <span class="la-term" data-term="merger-visual">merger</span> (Qwen, GLM), <i>aligner</i> (DeepSeek) ou projetor. Ela junta \(k \times k\) patches vizinhos, concatena seus vetores e os passa por uma MLP pequena que desemboca na largura do LLM.</p>
+  <div class="la-eq">
+    \[ \mathbf{z}_j = W_2\,\sigma\!\big(W_1\,[\mathbf{x}_{j,1};\ \mathbf{x}_{j,2};\ \dots;\ \mathbf{x}_{j,k^2}] + \mathbf{b}_1\big) + \mathbf{b}_2, \qquad \mathbf{z}_j \in \mathbb{R}^{d_{\text{LLM}}}, \qquad N_{\text{tokens}} = \frac{N}{k^2} \]
+    <ul class="la-eq-legend">
+      <li>\(\mathbf{x}_{j,m}\): os \(k^2\) vetores de saída da torre no grupo \(j\)</li>
+      <li>\([\,;\,]\): concatenação, com \(k^2 d\) números</li>
+      <li>\(\sigma\): ativação (GELU no Qwen e no DeepSeek; SwiGLU no GLM)</li>
+      <li>\(k\): <code>spatial_merge_size</code> = 2 (GLM, Qwen) ou <code>vision_downsample_ratio</code> = 3 (DeepSeek)</li>
+      <li>\(d_{\text{LLM}}\): largura do fluxo residual do LLM</li>
+      <li>no Qwen, cada \(\mathbf{x}_{j,m}\) passa antes por uma LayerNorm de 1152 números (<code>merger.norm [1152]</code>), aplicada patch a patch, antes da concatenação</li>
+    </ul>
+  </div>
+  <p>Concatenar vizinhos é o truque conhecido como <i>space-to-depth</i> (ou <i>pixel unshuffle</i>): a resolução espacial cai \(k\) vezes em cada eixo e a profundidade do vetor sobe \(k^2\) vezes, sem perder nenhum número. No DeepSeek isso é literalmente <code>F.unfold(x, 3, stride=3)</code>. Siga os passos na figura e troque de modelo para ver as contas mudarem.</p>
+  <figure class="la-fig" id="fig-merger" data-title="Merger em ação: agrupar, concatenar, projetar">
+    <div class="la-fig-stage" style="height:430px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Grade ilustrativa de 6×6 saídas da torre. Com \(k=2\) (GLM, Qwen), 36 vetores viram 9 tokens do LLM; com \(k=3\) (DeepSeek), viram 4. As dimensões das matrizes \(W_1, W_2\) são as reais de cada checkpoint.</figcaption>
+  </figure>
+  <p>No passo 4, repare que um único token do LLM agora resume uma região inteira da imagem, e o tamanho dessa região é \(p \cdot k\) pixels de lado:</p>
+  <div class="la-compare">
+    <div data-recipe="glm"><h4>GLM</h4><ul><li>2×2 por uma convolução de redução (<code>downsample [4096, 1024, 2, 2]</code>)</li><li>SwiGLU 4096 → 10240 → 4096, com <code>swiglu_limit</code> = 10 (clamp)</li><li>1 token ≈ 28×28 px (× 2 quadros)</li></ul></div>
+    <div data-recipe="qwen"><h4>Qwen</h4><ul><li>LayerNorm de 1152 em cada patch, depois 2×2 concatenado: 4 × 1152 = 4608</li><li>fc1 4608 → 4608 → GELU → fc2 4608 → 2560</li><li>1 token ≈ 32×32 px</li></ul></div>
+    <div data-recipe="ds"><h4>DeepSeek</h4><ul><li>3×3 com <code>F.unfold</code>: 9 × 1024 = 9216</li><li>Linear → 4096 → GELU → Linear 4096 (≈ 54,5 M parâmetros)</li><li>1 token ≈ 42×42 px</li></ul></div>
+  </div>
+  <p>Esse \(p \cdot k\) define o câmbio entre imagem e contexto. Por unidade de área, o GLM gasta \(42^2/28^2 = 2{,}25\) vezes mais tokens que o DeepSeek, e o Qwen \(42^2/32^2 \approx 1{,}7\) vez. Mais tokens significam mais detalhe (bom para ler texto em screenshots) e mais prefill, KV e memória. O DeepSeek escolhe o extremo econômico: no máximo 384 tokens por imagem.</p>
+  <div class="la-callout why"><b class="t">Por que uma MLP pequena basta</b><p>O LLM só entende vetores parecidos com os que viu no treino. O projetor é o “dicionário” que leva as features da torre para essa região do espaço, daí o nome <i>aligner</i>: ele alinha os dois espaços. Não precisa ser profundo, porque o trabalho pesado de reconhecer (bordas, texturas, objetos) já foi feito pelos blocos da torre, e o raciocínio fica para o LLM.</p></div>
+  <div class="la-callout deep"><b class="t">Aprofundamento: por que a visão fica em BF16</b><p>Nas três receitas a torre não é quantizada: no GLM ela recebe <code>quant_config=None</code> mesmo no checkpoint FP8, no Qwen NVFP4 <code>model.visual*</code> está nas exclusões da quantização, e no DeepSeek também é BF16. Interpretação: a torre soma ~0,5 B de parâmetros e só roda no prefill dos tokens de imagem, então quantizá-la economizaria pouco e arriscaria justamente a precisão de percepção. Há ainda os kernels. No checkpoint alternativo <code>local-inference-lab/…</code>, com MXFP8 na visão, o <code>mm_mxfp8</code> exige dimensões múltiplas de 32, e a <code>visual.blocks.*.mlp.linear_fc1 [4304, 1152]</code> não passa (4304 mod 32 = 16); o patch MXFP8 da receita Qwen manda todo <code>visual.*</code> para emulação BF16 (<a data-ch="fp8-fp4-microescala">capítulo 21</a>).</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Costurando a imagem no prompt: placeholders e o bloco de imagem</h2>
+  <p>Agora existem \(M\) vetores na largura do LLM. Como eles entram no meio de uma conversa? As três receitas usam o mesmo truque, os <span class="la-term" data-term="placeholder-de-imagem">placeholders</span>. O <span class="la-term" data-term="chat-template">chat template</span> escreve um marcador onde a imagem estava. O processador multimodal expande esse marcador em exatamente \(M\) cópias do token de imagem. A camada de embedding transforma todos os ids em vetores e, no último passo, as linhas das cópias são sobrescritas pelos vetores da torre, uma operação chamada <span class="la-term" data-term="masked-scatter">masked scatter</span>.</p>
+  <div class="la-eq">
+    \[ \mathbf{e}_i = \begin{cases} E[x_i] & \text{se } x_i \neq \texttt{IMG} \\ \mathbf{z}_{\pi(i)} & \text{se } x_i = \texttt{IMG} \end{cases} \]
+    <ul class="la-eq-legend">
+      <li>\(x_i\): id do token na posição \(i\)</li>
+      <li>\(E\): matriz de embedding [vocabulário × hidden]</li>
+      <li>\(\texttt{IMG}\): id do placeholder</li>
+      <li>\(\mathbf{z}\): saídas do tradutor</li>
+      <li>\(\pi(i)\): qual vetor visual vai para a posição \(i\), ou seja, a ordem em que a grade é lida</li>
+    </ul>
+  </div>
+  <table>
+    <thead><tr><th></th><th>Placeholder</th><th>Delimitadores</th><th>Vídeo</th></tr></thead>
+    <tbody>
+      <tr><td><span class="la-rb glm"></span></td><td><code>&lt;|image|&gt;</code> = 154854</td><td>image start/end = 154830/154831</td><td><code>&lt;|video|&gt;</code> = 154855; start/end 154832/154833</td></tr>
+      <tr><td><span class="la-rb qwen"></span></td><td><code>&lt;|image_pad|&gt;</code> = 248056</td><td><code>&lt;|vision_start|&gt;</code>/<code>&lt;|vision_end|&gt;</code> = 248053/248054</td><td><code>&lt;|video_pad|&gt;</code> = 248057</td></tr>
+      <tr><td><span class="la-rb ds"></span></td><td><code>&lt;｜deepseek_image｜&gt;</code> = 129264 (vocabulário de 129.280)</td><td>vetores aprendidos <code>image_start</code>, <code>image_end</code>, <code>image_newline</code>, <code>image_pad</code> (4096 cada)</td><td>não há</td></tr>
+    </tbody>
+  </table>
+  <p>Repare que o placeholder é um token de verdade, com id dentro do vocabulário. Isso vai ter uma consequência inesperada na seção 7, no roteamento MoE.</p>
+
+  <h3>O bloco de imagem do DeepSeek: layout “N” e alinhamento a 4</h3>
+  <p>O DeepSeek monta um bloco mais elaborado (<code>build_image_block</code>), num formato que chamaremos de <span class="la-term" data-term="layout-n">layout N</span>:</p>
+  <ol class="la-steps">
+    <li><b>Quebras de linha.</b> Cada linha da grade do Aligner ganha um token de nova linha no final. Sem ele, uma imagem de 10×12 tokens e outra de 12×10 seriam a mesma fila de 120 vetores.</li>
+    <li><b>Zigue-zague em pares de linhas.</b> As linhas são agrupadas duas a duas e percorridas coluna a coluna: (l0,c0), (l1,c0), (l0,c1), (l1,c1)… O desenho lembra a letra N, e 4 tokens consecutivos formam um quadradinho 2×2 da imagem.</li>
+    <li><b>Pad de alinhamento.</b> Antes do <code>IMAGE_START</code> entram \(3 - (s \bmod 4)\) tokens de pad, o <span class="la-term" data-term="compress-pad">compress_pad</span>, para que o corpo da imagem comece numa posição múltipla de 4.</li>
+    <li><b>Fechamento.</b> Um pad final completa o corpo até um múltiplo de 4, e o <code>IMAGE_END</code> fecha o bloco.</li>
+  </ol>
+  <p>Por que 4? Porque metade das camadas de atenção do DeepSeek-V4 comprime o KV de 4 em 4 tokens: são as camadas C4A do <a data-ch="atencao-esparsa">capítulo 13</a>. A leitura do inventário, que é uma interpretação, é que com esse alinhamento cada entrada comprimida cobre um pedaço 2×2 da mesma imagem e nunca mistura texto com imagem.</p>
+  <div class="la-eq">
+    \[ n_{\text{bloco}} = \underbrace{3 - (s \bmod 4)}_{\text{compress\_pad}} + 1 + n_h\,(n_w + 1) + (n_h \bmod 2)(n_w + 1) + n_{\text{pad final}} + 1 \]
+    <ul class="la-eq-legend">
+      <li>\(s\): posição onde o bloco começa no prompt (<code>start_pos</code>)</li>
+      <li>\(n_h, n_w\): grade do Aligner, \(\lceil \text{grade da torre}/3 \rceil\) em cada eixo</li>
+      <li>\((n_h \bmod 2)(n_w+1)\): linha de pad quando o número de linhas é ímpar</li>
+      <li>\(n_{\text{pad final}}\): 0 ou 2 tokens para fechar um múltiplo de 4</li>
+      <li>os dois “+1”: <code>IMAGE_START</code> e <code>IMAGE_END</code></li>
+    </ul>
+  </div>
+  <p>O exemplo do próprio código, feito à mão. A torre vê 19 linhas × 40 colunas de patches (a docstring escreve “40×19”, largura primeiro). O Aligner divide cada eixo por 3: \(n_h = \lceil 19/3 \rceil = 7\), \(n_w = \lceil 40/3 \rceil = 14\). Cada linha tem \(14 + 1 = 15\) tokens com o ↵, o corpo tem \(7 \cdot 15 = 105\), e como \(n_h\) é ímpar entra uma linha de pad de 15. As 8 linhas formam 4 pares de 15 tokens (60, par), então o pad final é 0: \(\text{pad} + 1 + 105 + 15 + 0 + 1 = 122 + \text{pad}\), de 122 a 125. Com os eixos trocados (\(n_h = 14\), \(n_w = 7\)), a conta daria 114. Na figura, empurre a imagem para a direita com o slider e veja o pad se ajustar. Depois desligue o alinhamento e procure os grupos vermelhos, em que uma entrada comprimida mistura texto e imagem.</p>
+  <figure class="la-fig" id="fig-layout" data-title="O bloco de imagem do DeepSeek: layout N e grupos de 4">
+    <div class="la-fig-stage" style="height:430px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Grade ilustrativa de 4×5 tokens de imagem (mais a coluna de nova linha ↵). O número em cada célula é a posição do token no prompt. Na fila de baixo, os colchetes marcam os grupos de 4 posições que a atenção C4A comprime numa entrada. Verde: um quadrado 2×2 da imagem. Lavanda: imagem com quebra de linha. Vermelho: mistura de texto e imagem.</figcaption>
+  </figure>
+  <div class="la-callout warn"><b class="t">Guarde esta consequência</b><p>O comprimento do bloco depende de onde a imagem cai no prompt, então a mesma foto pode ocupar 122, 123, 124 ou 125 tokens. Na seção 6 você vai ver que o cache de encoder do vLLM identifica imagens só pelos bytes, e que essa combinação derrubou o engine (issue #172).</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Onde fica cada token de imagem? mRoPE, NoPE e vídeo</h2>
+  <p>Dentro da torre, cada patch sabia sua linha e sua coluna. Depois do tradutor, a imagem vira uma fila de tokens no meio do texto. Como o LLM vai saber que o token 17 fica embaixo do token 3? As três receitas dão três respostas:</p>
+  <div class="la-cards">
+    <div class="la-card"><span class="ic">↵</span><h4>DeepSeek: fila com quebras</h4><p>As posições no LLM são 1D, como no texto. A estrutura vem do layout: tokens de nova linha, zigue-zague 2×2 e delimitadores aprendidos. A geometria já chega codificada nos vetores pela RoPE 2D da torre.</p></div>
+    <div class="la-card"><span class="ic">🧭</span><h4>Qwen: mRoPE 3D</h4><p>Cada token recebe uma tripla (t, h, w). Para texto, as três coordenadas são iguais. Para imagem e vídeo, elas descrevem a grade no espaço e no tempo.</p></div>
+    <div class="la-card"><span class="ic">∅</span><h4>GLM: NoPE no texto</h4><p>O LLM do GLM não tem RoPE nenhuma: a ordem vem das camadas KDA. A informação espacial chega embutida nos vetores, vinda da RoPE 2D da torre, e os delimitadores marcam o começo e o fim da imagem.</p></div>
+  </div>
+  <p>No <span class="la-term" data-term="mrope">mRoPE</span> (<i>Multimodal RoPE</i>) do Qwen, a posição de cada token deixa de ser um número e vira uma tripla \((t, h, w)\). Para texto, as três coordenadas são iguais, \((p, p, p)\), e o mRoPE vira o RoPE comum. Para os tokens de uma imagem que começa na posição \(s\), \(t\) fica constante e \(h, w\) percorrem a grade: \((s, s + i, s + j)\). O texto seguinte continua em 1 + a maior coordenada usada pela imagem, e não em \(s\) + número de tokens. Uma imagem de 1.000 tokens “ocupa” só ~\(\max(H, W)\) posições.</p>
+  <div class="la-eq">
+    \[ \mathbf{p}_{\text{texto}} = (p,p,p), \qquad \mathbf{p}_{\text{img}}(\tau, i, j) = (s+\tau,\ s+i,\ s+j), \qquad p_{\text{seguinte}} = \max(\mathbf{p}) + 1 \]
+    \[ \phi_m = p_{a(m)}\,\omega_m, \qquad \omega_m = \Theta^{-2m/64}, \qquad m = 0,\dots,31, \qquad a(m) \in \{t, h, w\} \]
+    <ul class="la-eq-legend">
+      <li>\(s\): primeira posição da imagem</li>
+      <li>\(i, j\): linha e coluna depois do merge; \(\tau\): grupo temporal (vídeo)</li>
+      <li>\(\Theta = 10^7\) no Qwen</li>
+      <li>\(a(m)\): o eixo que controla o par \(m\). <code>mrope_section [11, 11, 10]</code> dá 11 pares a \(t\), 11 a \(h\) e 10 a \(w\)</li>
+      <li><code>mrope_interleaved: true</code>: os eixos se alternam (t, h, w, t, h, w…) em vez de ocupar faixas contíguas</li>
+      <li>só 64 das 256 dimensões de cada cabeça giram (<code>partial_rotary_factor 0,25</code>)</li>
+    </ul>
+  </div>
+  <p>Por que intercalar? Em faixas contíguas, \(t\) ficaria só com as frequências mais altas e \(w\) só com as mais baixas, e cada eixo “enxergaria” uma parte diferente do espectro. Intercalando, os três eixos recebem frequências do espectro inteiro. Essa é a motivação descrita pela família Qwen3-VL, de onde a arquitetura herda o esquema. Na figura, cada token mostra sua tripla. Os relógios embaixo giram com o token destacado, coloridos pelo eixo que os controla.</p>
+  <figure class="la-fig" id="fig-mrope" data-title="mRoPE: coordenadas (t, h, w) de cada token">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Esquema de posições do Qwen2-VL, herdado pelas gerações seguintes, numa grade ilustrativa de 3×4 tokens. Detalhes de vídeo, como timestamps, variam entre versões e foram simplificados. Os 32 relógios usam as frequências reais do Qwen3.8 (\(\Theta = 10^7\), 64 dimensões rotacionadas); os de frequência baixa quase não se mexem.</figcaption>
+  </figure>
+  <p>Repare no salto depois da imagem: o texto seguinte começa em 8, e não em 4 + 12 = 16. O modelo aprende a ler a grade pelo par \((h, w)\), sem gastar posições como se a imagem fosse uma frase comprida.</p>
+  <div class="la-callout warn"><b class="t">Armadilha: overrides que apagam o mRoPE</b><p>As chaves do mRoPE vivem dentro de <code>rope_parameters</code>, junto com \(\Theta\) e o fator parcial. Um override que substitua o dicionário inteiro, como ligar YaRN para 1M de contexto, precisa repetir <code>mrope_section</code> e <code>mrope_interleaved</code>, como faz o card oficial; na receita Qwen, ele ainda vai aninhado em <code>text_config</code> (<a data-ch="posicao-rope">capítulo 8</a>, <a data-ch="receita-qwen">capítulo 43</a>). O ponto a conferir: o payload do <code>start.sh</code> da receita manda só <code>rope_type</code>, <code>factor</code> e <code>original_max_position_embeddings</code>. Se o vLLM substituir o dicionário inteiro, \(\Theta\), a fração rotacional e as seções do mRoPE caem nos defaults. O inventário marca isso como “a verificar”, e o repo trata 1M como <i>unvalidated</i>. Ao recriar a receita, use o dicionário completo do card.</p></div>
+
+  <h3>Vídeo: o tempo como terceira dimensão</h3>
+  <p>Vídeo é uma pilha de quadros, e GLM e Qwen tratam o tempo como tratam o espaço. Com <span class="la-term" data-term="temporal-patch">temporal_patch_size</span> = 2, dois quadros consecutivos formam um único patch 3D (uma Conv3d de 2×\(p\)×\(p\)), então cada par de quadros vira uma grade de tokens: \(\text{grid}_t = \text{quadros}/2\). Uma imagem parada é só o caso de um grupo com o quadro duplicado. Cada receita trata vídeo de um jeito:</p>
+  <ul>
+    <li><span class="la-rb glm"></span> O processador de vídeo amostra a 2 fps, com teto de 240.000 tokens (<code>max_image_tokens</code> do <code>video_processor</code>). Cada grupo temporal vira <code>[image_start] tokens [image_end]</code> seguido do timestamp em texto (“1.0 seconds”). O vLLM decodifica 32 quadros por vídeo por padrão; <code>VIDEO_NUM_FRAMES</code> muda isso via <code>--media-io-kwargs '{"video":{"num_frames":N}}'</code>.</li>
+    <li><span class="la-rb qwen"></span> O vídeo usa <code>&lt;|video_pad|&gt;</code> (248057) e o mesmo patch 3D de 2 quadros, então cada grupo \(T/2\) vira uma grade de tokens com posições \((s+\tau, s+i, s+j)\) no mRoPE. O README fixa o orçamento do encoder em 16.384 tokens por entrada: imagens maiores são redimensionadas, vídeos maiores são amostrados de forma esparsa. Os limites do vídeo ficam em <code>video_preprocessor_config.json</code>: <code>shortest_edge</code> 4096 e <code>longest_edge</code> 25.165.824 pixels.</li>
+    <li><span class="la-rb ds"></span> Não existe encoder de vídeo nos pesos oficiais. Um GIF é decodificado como imagem estática: só o primeiro quadro.</li>
+  </ul>
+  <p>Por que o Qwen descarta quadros? Um token de vídeo cobre 32×32 pixels em 2 quadros: 2.048 “pixels-quadro”. O card sugere <code>longest_edge</code> = 469.762.048 para vídeos de uma hora e diz que isso dá 224 mil tokens; de fato, 469.762.048 / 2.048 = 229.376 = 224 × 1.024 (interpretação: o teto soma os pixels de todos os quadros). Pela mesma conta, o padrão de 25.165.824 dá ~12 mil tokens. Um minuto a 2 quadros/s (taxa ilustrativa) são 60 grupos; a 300 tokens por grupo, 18 mil tokens, acima dos 16.384. Em vez de achatar todos os quadros, amostram-se menos grupos.</p>
+  <p>Na figura, a fita de filme é amostrada, agrupada em pares, e cada par vira um bloco de placeholders. No GLM, cada bloco leva o seu timestamp; ligue o <b>bug</b> para ver o caso documentado que o overlay do GLM corrige. No Qwen, suba a duração e os tokens por grupo até estourar os 16.384 e veja grupos inteiros serem descartados.</p>
+  <figure class="la-fig" id="fig-video" data-title="Vídeo: quadros, grupos temporais e placeholders">
+    <div class="la-fig-stage" style="height:420px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Fita ilustrativa a 2 quadros por segundo. GLM (até 32 quadros, o padrão do vLLM): cada grupo de 2 quadros vira um bloco de tokens com timestamp; o modo “bug” mostra o caso documentado, 3 timestamps para \(T = 1\), 300 vagas para 100 tokens. Qwen (esquema simplificado): os grupos \(T/2\) viram <code>&lt;|video_pad|&gt;</code> (248057), e os que não cabem nos 16.384 são descartados; o processador real também ajusta a resolução.</figcaption>
+  </figure>
+  <div class="la-inrecipe" data-recipe="glm"><div class="la-inrecipe-h"><span class="la-rb glm"></span><span class="k">Overlay #3</span><code>overlay/patch_glm_video_placeholders.py</code></div><div class="la-inrecipe-b"><p>O processador <code>glm4_1v</code> do vLLM monta um bloco de imagem por timestamp, e com os timestamps do GLM-5.3 um clipe de 1 s podia render 3 timestamps enquanto <code>video_grid_thw</code> dizia \(T = 1\): 300 vagas para 100 tokens. O patch substitui <code>_construct_video_placeholder</code> e alinha os timestamps a <code>grid_t</code> (<code>_align_timestamps</code>, estilo <code>glm46v</code>). O mesmo arquivo, instalado como hook de import num <code>.pth</code>, também desliga o <code>persistent_topk</code> do indexador (<code>if False and … select_k in (512, 1024, 2048)</code>), que estourava a shared memory do GB10, e deixou de importar o vLLM em todo interpretador Python: a primeira linha de log caiu de 100 para 6 s.</p></div></div>
+  <div class="la-callout danger"><b class="t">O incidente de 2026-09-14</b><p>Um vídeo de 11,9 MB anexado num chat chegou ao vLLM como ~33 imagens em resolução cheia: o cliente decompôs o vídeo e enviou os quadros como imagens. O vLLM nunca divide um <code>video_url</code> em vários itens do encoder; o incidente veio pelo caminho de <b>imagem</b> (diz o <code>start.sh</code>), e <code>VIDEO_NUM_FRAMES</code>, que só amostra <code>video_url</code> de verdade, não teria ajudado. A 8.000 tokens por imagem, cada quadro custou ~7,2 mil tokens: <b>236.544 tokens</b> de encode. O nó 0 ficou com 44 MB livres, e o kernel matou o <code>VLLM::Worker_TP</code>. O tamanho do arquivo engana: 11,9 MB de H.264 são ~33 quadros, cada um tão caro quanto uma página inteira. Com o teto de 2.048, o mesmo anexo custa 67.320 tokens e é servido.</p></div>
+  <div class="la-inrecipe" data-recipe="tf"><div class="la-inrecipe-h"><span class="la-rb tf"></span><span class="k">Vídeo e posições</span><code>TENSORFOLD_GLM_VIDEO_FRAMES=128 · TENSORFOLD_GLM_VIDEO_TOKENS=16384</code></div><div class="la-inrecipe-b"><p>O processador de vídeo da lane TensorFold (patch 0003, espelho do <code>Glm5NextVideoProcessor</code>) também amostra a 2 quadros por segundo, mas o teto é outro: até <b>128 quadros</b>, ou 64 s a 2 por segundo. Num clipe mais longo (até uma hora, decodificada com PyAV), os 128 se espalham pelo clipe inteiro. O padrão do vLLM, para comparar, é decodificar 32 quadros. O teto de 16.384 tokens vale para o clipe inteiro, não para cada quadro: o redimensionador escolhe uma tela única em que todos os pares caibam, então 128 quadros (64 pares) ficam com no máximo 256 tokens por par (conta nossa). A contagem de quadros é forçada a ser par (o último se repete), e cada par vira <code>&lt;|begin_of_image|&gt;…&lt;|end_of_image|&gt;</code> seguido do tempo do par em texto (<code>{s:.1f} seconds</code>). Como cada timestamp é tirado do próprio par, há exatamente um por grupo temporal, e o descompasso que o overlay #3 corrige no vLLM não tem onde nascer (leitura nossa do código). A posição dos tokens visuais também não pede conta nenhuma. A injeção troca as linhas dos placeholders <code>&lt;|image|&gt;</code> (154854) pelos vetores da torre nos quatro fluxos residuais das <span class="la-term" data-term="mhc">hyper-connections</span>. E, como as camadas MLA do GLM não têm parte rotativa, as posições são as próprias posições dos tokens, e nada mais muda no prompt. É o card “NoPE no texto” acima, escrito em código.</p></div></div>
+</section>
+
+<section class="la-sec">
+  <h2>Servindo visão no vLLM: do image_url ao encoder cache</h2>
+  <div class="la-callout info"><b class="t">Emprestado de capítulos futuros</b><p>Cinco ideias desta seção ganham capítulo próprio mais adiante; por ora, basta uma linha de cada:</p><ul><li><b>Chunked prefill</b>: o prompt entra em pedaços que dividem cada passo com os decodes (<a data-ch="scheduler-batching">capítulo 32</a>).</li><li><b>UMA</b>: no GB10, CPU e GPU dividem a mesma memória; RAM do host sai do modelo (<a data-ch="memoria-unificada">capítulo 27</a>).</li><li><b>CUDA graph</b>: kernels gravados uma vez e reexecutados sem a CPU (<a data-ch="cuda-graphs-warmup">capítulo 29</a>).</li><li><b>MTP como rascunhador</b>: chuta os próximos tokens; a aceitação mede quantos o modelo confirma (<a data-ch="mtp-eagle-vocab">capítulo 36</a>).</li><li><b>Tensor parallel</b>: cada matriz fatiada entre GPUs, com all-reduce das somas parciais (<a data-ch="paralelismos">capítulo 38</a>).</li></ul></div>
+  <h3>A porta de entrada: formatos da API</h3>
+  <p>Na API compatível com OpenAI (<a data-ch="api-tools-estruturado">capítulo 34</a>), uma mensagem com imagem troca o <code>content</code> de string por uma lista de partes: texto e <code>image_url</code> (ou <code>video_url</code>). A URL pode ser <code>http(s)://</code>, que o servidor baixa, ou uma <span class="la-term" data-term="data-url">data URL</span> com os bytes em base64. O exemplo é do README da receita DeepSeek:</p>
+  <pre data-lang="json"><code>{"model":"deepseek-v4-flash-vision-exp","messages":[{"role":"user","content":[
+  {"type":"image_url","image_url":{"url":"data:image/jpeg;base64,..."}},
+  {"type":"text","text":"What is in this picture?"}
+]}]}</code></pre>
+  <p>Caminhos locais (<code>file://</code>) só funcionam se o servidor declarar <code>--allowed-local-media-path</code>. O Qwen não declara, e a mídia chega apenas por URL ou base64, sem expor o disco do servidor. O DeepSeek aceita ainda a forma <code>&lt;image&gt;caminho&lt;/image&gt;</code> citada no README.</p>
+  <div class="la-inrecipe" data-recipe="ds"><div class="la-inrecipe-h"><span class="la-rb ds"></span><span class="k">Regras de papéis</span><code>image_url só em mensagens user</code></div><div class="la-inrecipe-b"><p>Pela regra oficial do Vision-Exp, imagens (JPEG, PNG, GIF, WebP) só entram em mensagens <code>user</code>; uma parte <code>image</code>/<code>image_url</code> ou o token cru <code>&lt;｜deepseek_image｜&gt;</code> em <code>system</code>, <code>assistant</code>, <code>tool</code> ou <code>function</code> recebe HTTP 400. O hotfix calibrou a regra em três rodadas: texto que só <i>menciona</i> <code>&lt;image&gt;</code> passou (#165); resultado de ferramenta deixou de ser escaneado, para um <code>cat</code> do próprio hotfix não dar 400 (#167); pares <code>&lt;image&gt;…&lt;/image&gt;</code> citados em prosa de system/assistant viraram texto (#181). Sobra a armadilha #178: clientes OpenAI típicos não refazem um 400, a mensagem rejeitada fica no histórico e os turnos seguintes seguem falhando até alguém removê-la. Screenshot de ferramenta vai num turno <code>user</code>.</p></div></div>
+  <p>Limites valem <b>por requisição</b>, e isso tem um efeito colateral. Chat Completions é sem estado: o cliente reenvia o histórico inteiro, imagens incluídas, a cada turno. Com o antigo <code>{"image":4}</code> do GLM, uma sessão funcionava até a quarta imagem. A partir da quinta, <i>todo</i> turno falhava com “At most 4 image(s) may be provided in one prompt”, até os de texto puro. Essa é a sessão “envenenada” de <code>docs/images-per-request.md</code>.</p>
+
+  <h3>A esteira interna</h3>
+  <p>Dentro do motor, uma imagem percorre sete estações. Siga os passos, alterne o modo de paralelismo do encoder e reenvie a mesma imagem para ver os caches entrarem em ação.</p>
+  <figure class="la-fig wide" id="fig-esteira" data-title="A esteira multimodal do vLLM">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Fluxo conceitual do vLLM V1 com os números das receitas: limites por prompt, cache do processador de 1 GiB (GLM), orçamento por passo de 7.168 tokens (GLM), 2.040 tokens para um quadro 1080p com teto de 2.048 e a MLP de 4304 da torre do Qwen.</figcaption>
+  </figure>
+  <p>As peças, uma por uma:</p>
+  <dl class="la-kv">
+    <dt>processador</dt><dd>O <span class="la-term" data-term="processador-multimodal">processador multimodal</span> roda na CPU: decodifica, redimensiona, normaliza e recorta, expande o placeholder e calcula o <span class="la-term" data-term="mm-hash">hash multimodal</span>. O resultado fica no <span class="la-term" data-term="cache-do-processador">cache do processador</span> (<code>--mm-processor-cache-gb</code>, padrão 4 GiB de RAM).</dd>
+    <dt>scheduler</dt><dd>Quando o pedaço de prefill alcança os placeholders, manda o encoder rodar a imagem <b>inteira</b>, dentro de um orçamento de encoder por passo.</dd>
+    <dt>encoder cache</dt><dd>Guarda na GPU a saída da torre até o <span class="la-term" data-term="chunked-prefill">chunked prefill</span> consumi-la, possivelmente em vários passos (o <span class="la-term" data-term="encoder-cache">encoder cache</span>). Segundo a receita GLM, tem o tamanho do <span class="la-term" data-term="max-num-batched-tokens">max_num_batched_tokens</span>: 7.168.</dd>
+    <dt>LLM</dt><dd><code>embed_input_ids</code> espalha os vetores nas linhas dos placeholders; depois é prefill normal. O hash da imagem entra nas chaves do <a data-ch="prefix-caching">prefix caching</a>: a mesma imagem na mesma posição reaproveita o KV.</dd>
+  </dl>
+  <div class="la-inrecipe" data-recipe="glm"><div class="la-inrecipe-h"><span class="la-rb glm"></span><span class="k">Tokens por imagem</span><code>--mm-processor-kwargs '{"max_image_tokens":2048}'</code></div><div class="la-inrecipe-b"><p><code>MM_IMAGE_TOKENS=2048</code>. O checkpoint pede <span class="la-term" data-term="max-image-tokens">max_image_tokens</span> = 8.000, mais que os 7.168 do <code>MAX_NUM_BATCHED_TOKENS</code>, que a receita documenta como o tamanho do encoder cache: uma imagem cheia não caberia. Um quadro 1080p mede <b>2.691 tokens</b> sem teto, <b>2.040</b> com 2.048 e <b>1.008</b> com 1.024. Vazio omite a flag e volta aos 8.000 (o script usa <code>${MM_IMAGE_TOKENS-2048}</code>, então “exportar vazio” sobrevive). Para detalhe de documento numa imagem só, a receita sugere subir rumo a 7.168 vigiando o <code>MemAvailable</code> do head.</p></div></div>
+  <div class="la-inrecipe" data-recipe="glm"><div class="la-inrecipe-h"><span class="la-rb glm"></span><span class="k">Profiling e limites</span><code>--skip-mm-profiling · --limit-mm-per-prompt '{"image":48,"video":1}'</code></div><div class="la-inrecipe-b"><p>No boot, o <span class="la-term" data-term="profile-run">profile run</span> do vLLM passa pela torre um lote falso de mídia de tamanho máximo, mede o pico de ativação e reserva essa memória antes de dar o resto ao KV. Na <span class="la-term" data-term="uma">UMA</span> do GB10 esse perfil dá OOM, então a receita liga <span class="la-term" data-term="skip-mm-profiling">--skip-mm-profiling</span> (<code>SKIP_MM_PROFILING=1</code>). O preço é permanente: <b>nada fica reservado para a torre</b>, e cada token multimodal é codificado com memória que o modelo já gastou. <span class="la-term" data-term="limit-mm-per-prompt">--limit-mm-per-prompt</span> vira só validação (subir de 4 para 16 imagens mudou o KV de 12,93 para 12,89 GiB), então o teto precisa caber no que a máquina consegue codificar. <code>LIMIT_MM</code> foi de 4 para 100 e hoje é 48 (o <code>start-tp4.sh</code> ainda traz 100): pior caso de 48 × 2.048 ≈ 98 mil tokens, contra 800 mil antes. Acima do teto, a API responde HTTP 500 “At most N image(s)…”, um erro em vez de um engine morto.</p></div></div>
+  <div class="la-inrecipe" data-recipe="glm"><div class="la-inrecipe-h"><span class="la-rb glm"></span><span class="k">RAM do host</span><code>--mm-processor-cache-gb 1 · --language-model-only</code></div><div class="la-inrecipe-b"><p><code>MM_PROCESSOR_CACHE_GB=1</code>. O vLLM guarda 4 GiB de RAM para mídia processada por padrão, e na UMA são 4 GiB que o modelo perde. Um cache de 1 GiB ainda evita reprocessar as imagens que clientes sem estado reenviam; <code>0</code> desliga o cache. <code>LANGUAGE_MODEL_ONLY=0</code> mantém a visão ligada, e <code>1</code> passa <code>--language-model-only</code>: a torre (1,13 GB em BF16) nem é carregada, e sobra memória. No tutorial MiMo do <a data-ch="receita-do-zero">capítulo 46</a>, a lane só texto ganha ~1,6 GiB de KV por rank.</p></div></div>
+
+  <h3>Fatiar ou replicar a torre: --mm-encoder-tp-mode</h3>
+  <p>Sob <span class="la-term" data-term="tensor-parallel">tensor parallel</span>, o padrão do vLLM é fatiar também a torre (<code>weights</code>): cada GPU guarda metade de cada matriz da visão e as duas somam resultados parciais com all-reduce. A alternativa <span class="la-term" data-term="mm-encoder-tp-mode">data</span> <span class="la-term" data-term="replicado">replica</span> a torre inteira em cada GPU e divide as <i>imagens</i> entre elas. Isso custa memória, porque os pesos são duplicados, e economiza comunicação e exigências de <span class="la-term" data-term="divisibilidade-tp">divisibilidade</span> (<a data-ch="paralelismos">capítulo 38</a>).</p>
+  <div class="la-inrecipe" data-recipe="qwen"><div class="la-inrecipe-h"><span class="la-rb qwen"></span><span class="k">Encoder replicado</span><code>--mm-encoder-tp-mode data</code></div><div class="la-inrecipe-b"><p><code>MM_ENCODER_TP_MODE=data</code> é o padrão do <code>.env.sample</code>. A MLP da torre tem intermediária 4304; com <code>weights</code> em TP=2, cada GPU ficaria com 2152 colunas, que não é múltiplo de 16 (2152 = 16 · 134,5), e a carga crasha. O <code>.env</code> atribui a exigência aos kernels NVFP4; como <code>visual.*</code> está em BF16, o kernel exato não é documentado, mas o crash é medido. Em <code>data</code>, cada GPU guarda a torre inteira (0,84 GiB em BF16), ~0,42 GiB a mais que as metades do modo <code>weights</code>, e codifica imagens inteiras sem all-reduce.</p></div></div>
+  <p>No <span class="la-rb glm"></span>, o TP=2 usa o modo padrão (<code>weights</code>): 16 cabeças e 4096 se dividem por 2 sem problema. No TP=3, <code>start-tp3.sh</code> passa <code>MM_ENCODER_TP_MODE=data</code>, pela lógica de divisibilidade do <a data-ch="tp3-tp4">capítulo 40</a>. Interpretação: nem as 16 cabeças nem a intermediária 4096 dividem por 3.</p>
+
+  <h3>Na lane TensorFold: a torre num rank só e um orçamento por requisição</h3>
+  <p>Os dois modos do vLLM partem do mesmo princípio: as duas GPUs trabalham na visão, seja fatiando as matrizes (<code>weights</code>), seja dividindo as imagens (<code>data</code>). A lane <span class="la-rb tf"></span> escolhe uma terceira saída: <b>só o rank 0 carrega a torre</b>, com 1,05 GiB de pesos BF16 mais 0,75 GiB de workspace (~1,8 GiB), e o rank 1 nunca vê um pixel. Os vetores de uma imagem ficam todos no rank 0. Quando um chunk de prefill alcança as linhas da imagem, o rank 0 entrega ao rank 1 só as linhas daquele chunk, por um <span class="la-term" data-term="all-gather">all-gather</span> (o rank 1 contribui com zeros), e nenhum dos dois guarda uma segunda cópia. A codificação roda antes de o rank 1 ser avisado da requisição: se ela falhar, os dois param juntos, em vez de divergir.</p>
+  <table>
+    <thead><tr><th>Desenho</th><th>Pesos da torre</th><th>Comunicação</th><th>Quem codifica</th></tr></thead>
+    <tbody>
+      <tr><td><code>weights</code> (vLLM; GLM em TP=2)</td><td>metade de cada matriz em cada GPU</td><td>all-reduce das somas parciais dentro da torre</td><td>as duas GPUs, juntas, cada imagem</td></tr>
+      <tr><td><code>data</code> (vLLM; Qwen, GLM em TP=3)</td><td>torre inteira em cada GPU (0,84 GiB no Qwen)</td><td>nenhuma na torre</td><td>cada GPU, imagens inteiras diferentes</td></tr>
+      <tr><td>rank 0 (TensorFold)</td><td>torre inteira só no rank 0</td><td>um all-gather por chunk de prefill que contém linhas de imagem, só com essas linhas</td><td>o rank 0, todas as imagens</td></tr>
+    </tbody>
+  </table>
+  <p>O preço é a assimetria: só o rank 0 paga a memória da visão. Com <code>KV=bf16</code> e os pesos densos em fp8 ou bf16, a torre custa ao rank 0 ~66 mil tokens de janela, segundo a receita (com os densos em 4 bits, o padrão, os pesos menores devolvem esse espaço), e <code>VISION=0</code> devolve os ~1,8 GiB ao cache. Em troca, nenhuma matriz é fatiada, e a torre fica livre das exigências de <span class="la-term" data-term="divisibilidade-tp">divisibilidade</span> que derrubaram o modo <code>weights</code> do Qwen (interpretação nossa). Enquanto o rank 0 codifica, o rank 1 espera (leitura nossa do código: o encode acontece na admissão da requisição, antes de qualquer mensagem ao rank 1). A receita não publica o tempo de encode separado, só o total de ponta a ponta mais abaixo.</p>
+  <p>A segunda diferença é de filosofia de memória. A lane vLLM liga <code>--skip-mm-profiling</code>, e nada fica reservado para a torre. O TensorFold faz o contrário: o workspace da visão entra no orçamento de partida do rank 0 (<a data-ch="memoria-unificada">capítulo 27</a>), e os tetos de tokens existem para que o encode de uma requisição caiba nele. Os picos medidos que o código do patch 0003 registra dão a escala: 0,47 GiB para uma imagem de 2.048 tokens, 0,56 para quatro, 1,08 para um clipe de 16.384 tokens e 1,73 para uma imagem de 8.000 tokens (o máximo do checkpoint) codificada de uma vez, em 31.724 patches. Depois, o patch 0004 cortou o workspace de 1,5 para 0,75 GiB e a passada da torre de 16.384 para 8.192 patches. Uma imagem de 2.048 tokens cabe numa passada só (2.048 tokens × 4 patches do merge 2×2), e a memória temporária da torre passa a se revezar com a de um chunk de prompt (~1 GiB a 164 mil tokens).</p>
+  <p>A terceira diferença é a que mais muda o comportamento: o <span class="la-term" data-term="orcamento-visual-por-requisicao">orçamento</span> vale <b>por requisição</b>, não só por imagem. Cada imagem tem teto de 2.048 tokens, como na lane vLLM (um 1080p custa 2.040), mas as imagens de uma requisição <b>dividem</b> 16.384 tokens, e os clipes, 32.768:</p>
+  <div class="la-eq">
+    \[ c_{\text{img}}(n) = \max\!\Big(16,\ \min\big(2048,\ \big\lfloor 16384/n \big\rfloor\big)\Big), \qquad c_{\text{clipe}}(m) = \max\!\Big(64,\ \min\big(16384,\ \big\lfloor 32768/m \big\rfloor\big)\Big) \]
+    <ul class="la-eq-legend">
+      <li>\(n\): imagens na requisição, até 50 (<code>TENSORFOLD_GLM_MAX_IMAGES</code>); \(m\): clipes, até 4 (<code>TENSORFOLD_GLM_MAX_VIDEOS</code>)</li>
+      <li>2048 e 16384 dentro do \(\min\): tetos por item (<code>TENSORFOLD_GLM_IMAGE_TOKENS</code>, <code>TENSORFOLD_GLM_VIDEO_TOKENS</code>)</li>
+      <li>16384 e 32768 no numerador: orçamentos da requisição (<code>TENSORFOLD_GLM_REQUEST_IMAGE_TOKENS</code>, <code>TENSORFOLD_GLM_REQUEST_VIDEO_TOKENS</code>)</li>
+      <li>16 e 64: pisos, para nenhum item sumir</li>
+    </ul>
+  </div>
+  <p>Até 8 imagens e 2 clipes, ninguém perde nada, porque 16.384 / 8 = 2.048 e as telas não mudam. A receita conferiu que respostas com até 4 imagens e 2 vídeos saíram byte a byte iguais às da versão anterior. Da 9ª imagem em diante, cada uma encolhe: com 50, o teto é de 327 tokens. Com 3 ou 4 clipes, 10.922 ou 8.192 cada. O contraste com a lane vLLM está no pior caso. Lá, o teto por item se multiplica pelo número de itens, 48 × 2.048 = 98.304 tokens de encode sem nada reservado. Aqui, o pior caso de imagens é constante: 16.384 tokens, com 9 ou com 50 imagens. Pela fórmula, o anexo do incidente da seção 5 (33 quadros) ganharia 496 tokens por quadro, no máximo 16.368 no total (conta nossa), contra 67.320 com o teto de 2.048 da lane vLLM e 236.544 sem teto. O preço é a resolução. Cada imagem fica mais grossa, e um detalhe que tinha um token só para ele passa a dividir o token com os vizinhos. Na figura, arraste o número de imagens e compare as duas lanes. Esse foi o padrão até a v1.10. Desde 2026-10-10 (<code>36df86e</code>), o <code>scripts/config.sh</code> põe o orçamento de imagens em <code>MAX_IMAGES</code> × <code>IMAGE_TOKENS</code> = 50 × 2.048 = 102.400 tokens e reserva 1.440 MiB de workspace da torre em vez de 768: com os 16.384 divididos, cada imagem depois da 8ª encolhia todas as anteriores, as chaves de conteúdo delas mudavam e o estado de prompt guardado só casava até a primeira imagem, então um agente lendo screenshots a ~420k tokens relia 187–191k tokens (150–167 s) depois de cada uma (dois Sparks, v1.10, <code>PARALLEL=4</code>). <code>TENSORFOLD_GLM_REQUEST_IMAGE_TOKENS=16384</code> traz de volta o pior caso constante. A lição vale para qualquer stack: se o pré-processamento de um item depende do resto da requisição, um cache indexado por conteúdo deixa de casar.</p>
+  <figure class="la-fig" id="fig-tf-orcamento" data-title="Teto por imagem × orçamento por requisição">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Lane vLLM do GLM: <code>MM_IMAGE_TOKENS=2048</code> por imagem, até 48 imagens, nada reservado. Lane TensorFold: teto \(c_{\text{img}}(n)\), até 50 imagens, workspace reservado no rank 0. As grades usam o mesmo redimensionador aproximado da calculadora da seção 8, que reproduz os 2.040 tokens de um 1080p com teto de 2.048. O processador real busca a maior tela múltipla de 28 px que cabe no teto e preenche o resto com zeros. Nas barras, as linhas verticais marcam o orçamento de 16.384 (o padrão até a v1.10) e o pior caso de 98.304 que a lane vLLM dimensionou.</figcaption>
+  </figure>
+  <p>Medido na v1.1 da receita, ainda sobre o TensorFold v0.5.0 (o changelog não detalha as condições da medida): 50 imagens numa requisição foram respondidas em 12,5 s, com 16.239 tokens de prompt, e a memória livre no head nunca caiu abaixo de 6,75 GiB; com 4 vídeos, o mínimo foi 6,90 GiB. Para caber, o patch 0050 também baixou o pico de memória. Cada imagem é ajustada à sua tela <b>enquanto</b> é decodificada, então só uma imagem em tamanho cheio ocupa a RAM do host por vez, e a torre escreve suas linhas direto na saída pré-alocada da requisição, sem a cópia extra de um <code>torch.cat</code>. Na memória unificada do GB10, RAM do host e memória da GPU são o mesmo pool.</p>
+  <div class="la-callout warn"><b class="t">O que fica de fora do reuso</b><p>Na lane TensorFold da v1.3.2, prompts com imagem não eram guardados para reuso: não havia <span class="la-term" data-term="estado-de-prompt-guardado">estado de prompt guardado</span> deles, nem replay, e no multi-prefill eles preenchiam sozinhos, sem dividir o forward com outros prompts. Na lane vLLM, ao contrário, o hash da imagem entra nas chaves do prefix caching, e a mesma imagem na mesma posição reaproveita o KV. Interpretação nossa: um agente que reenvia a cada turno uma conversa com screenshots não acha estado para retomar nessa lane e paga o prefill de novo, enquanto a mesma conversa só com texto retoma de onde parou. Desde a v1.4 (patch 0054, issue #11) prompts com imagens também retomam, com os estados guardados distinguidos pelo conteúdo de cada imagem, e só as imagens depois do ponto de retomada são codificadas de novo. Na v1.3.2 havia ainda um detalhe de escalonamento. Quando o pool enche e o motor precisa devolver um stream à fila para recalculá-lo depois, ele só escolhe streams sem imagens e sem gramática; se todos tiverem uma das duas, o mais novo falha com <code>NoRoom</code>.</p></div>
+
+  <h3>Casos de borda que viraram hotfix</h3>
+  <div class="la-inrecipe" data-recipe="ds"><div class="la-inrecipe-h"><span class="la-rb ds"></span><span class="k">#172 · hash salgado</span><code>salt_mm_image_hash(digest, num_tokens)</code></div><div class="la-inrecipe-b"><p>Lembre da seção 4: o bloco tem 122 + <code>compress_pad</code> tokens, e o pad depende de <code>start_pos % 4</code>. O encoder cache do vLLM identificava a imagem só pelos bytes, então a mesma foto em outro deslocamento reaproveitava saídas com o layout errado (125 placeholders para 124 embeddings), e o EngineCore morria. A correção salga o hash com o número de tokens (<code>"{digest}:vlexp-ntok{num_tokens}"</code>), desliga o cache do processador para imagens e faz <code>embed_input_ids</code> recusar, com erro claro, contagens que não batem. Lição geral: a chave de um cache precisa incluir <b>tudo</b> de que o valor depende.</p></div></div>
+  <div class="la-inrecipe" data-recipe="ds"><div class="la-inrecipe-h"><span class="la-rb ds"></span><span class="k">#109 · passos só de encoder</span><code>patches/hotfix-vllm-empty-encoder-output.py</code></div><div class="la-inrecipe-b"><p>O vLLM pode separar encode, prefill e decode em instâncias diferentes. Uma instância <span class="la-term" data-term="epd">só de encoder</span> (o “produtor de encoder cache”) publica embeddings e não amostra tokens, mas a imagem Anemll 0.1.1 inventava o token 0 nesses passos (<code>[[0] for _ in req_ids]</code>): o scheduler anexava um token fantasma, avançava gramática e stops, distorcia a contabilidade da especulação e entrava em loop. O backport do upstream <code>7ca49fb</code> devolve uma linha <b>vazia</b> por requisição e encerra a requisição só-encoder (<code>FINISHED_STOPPED</code>) quando o prompt foi consumido. Sempre ligado e fail-closed: valida os dois arquivos antes de escrever qualquer um.</p></div></div>
+  <div class="la-callout recipe" data-recipe="qwen"><b class="t"><span class="la-rb qwen"></span> Na receita: o rascunhador não vê a imagem</b><p>O log avisa: <i>“Draft model … does not support external multimodal embeddings”</i>. O <span class="la-term" data-term="mtp">MTP</span> rascunha só com texto, então a <a data-ch="mtp-eagle-vocab">aceitação</a> cai em prompts com imagem ou vídeo. Ao vivo, a receita verificou OCR de texto de 48 px num quadro 3840×2160 (≈ 8,2 mil tokens de visão), perguntas de cor, forma e cena e a recusa de ler texto que não está na imagem. Por ser um modelo de raciocínio, o pensamento consome <code>max_tokens</code> primeiro: se <code>content</code> voltar vazio com <code>finish_reason: "length"</code>, suba <code>max_tokens</code> (2 a 4 mil bastam para a maioria das perguntas).</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Visão enxertada: o DeepSeek Vision-Exp e o roteamento por modalidade</h2>
+  <p>GLM e Qwen chegaram ao vLLM com a visão já implementada no código upstream. O DeepSeek testou três arquiteturas até ganhar olhos nativos. As duas primeiras não foram etapas sucessivas: coexistiram na era só texto, e a primeira da lista saiu antes da segunda.</p>
+  <ol class="la-steps">
+    <li><b>Lane MoonViT (apagada primeiro).</b> Uma torre MoonViT plugada ao DeepSeek, com projetor treinado no próprio repositório (havia scripts de treino e avaliação). Saiu enquanto o sidecar seguia; o CHANGELOG registra que, dali em diante, a visão era “só o sidecar Qwen3-VL + MCP”.</li>
+    <li><b>Sidecar Qwen3-VL (removido em 2026-08-31).</b> Um <span class="la-term" data-term="sidecar-de-visao">sidecar de visão</span>: um segundo modelo, o VLM Qwen3-VL-4B AWQ, rodava ao lado do DeepSeek só texto e descrevia as imagens via MCP (<code>ds4f-vision</code>); o modelo principal nunca via pixels. O custo era memória: com <code>ENABLE_VL_SIDECAR=1</code> e <code>GPU_MEMORY_UTILIZATION_VISION</code> = 0,80, o KV principal caía para 13,37 GiB (1,37 M tokens), mais 1,54 GiB (84 mil) para o VL, contra 18,08 GiB (~2,49 M) só texto a 0,835. Foi a única visão até o Vision-Exp.</li>
+    <li><b>Vision-Exp nativo (atual).</b> O checkpoint oficial <code>DeepSeek-V4-Flash-Vision-Exp</code> traz ViT de 32 camadas, Aligner e viés de roteamento próprio. O runtime Anemll 0.1.1, porém, só conhece o <code>DeepseekV4ForCausalLM</code> de texto.</li>
+  </ol>
+  <p>Para o Vision-Exp, <code>patches/hotfix-dsv4-vision-exp.py</code> e a pasta <code>patches/vision_exp/</code> constroem a visão dentro do container, no boot, com um hook de import <span class="la-term" data-term="fail-closed">fail-closed</span> anexado ao fim de <code>nvidia/model.py</code>. O hook faz, em ordem:</p>
+  <ol class="la-steps">
+    <li><b>Constrói a torre em PyTorch puro.</b> Envolve o <code>__init__</code> do modelo para criar <code>vision</code> (ViT), <code>aligner</code> e os vetores <code>image_start/end/newline/pad</code>, adaptados da referência oficial (MIT) sem os kernels customizados.</li>
+    <li><b>Mapeia os pesos.</b> Estende o <code>WeightsMapper</code> para <code>vision.*</code>, <code>aligner.*</code>, <code>image_*</code> e <code>bias_vl</code>, e tira <code>vision.</code>/<code>aligner.</code> do mapeamento empilhado <code>w1 → gate_up_proj</code>: no Aligner, <code>w1</code> é uma Linear inteira, não metade de uma MLP fundida (<a data-ch="checkpoints">capítulo 24</a>).</li>
+    <li><b>Registra o modelo como multimodal.</b> Adiciona <code>SupportsMultiModal</code> e um processador próprio (resize, layout N, hash salgado); <code>get_language_model()</code> devolve o próprio wrapper, para o DSpark e o Eagle3 continuarem achando <code>.model</code>.</li>
+    <li><b>Mantém os ids crus.</b> Com imagem, o runner passa <code>inputs_embeds</code>, mas as camadas de hash do MoE precisam dos ids: <code>requires_raw_input_tokens = True</code>.</li>
+    <li><b>Ajusta o rascunhador e o encoder de chat.</b> Remapeia <code>ffn.gate.bias_vl → e_score_correction_bias_vl</code> no loader do DSpark, deixa o <code>image_url</code> sobreviver ao parser do vLLM e restaura a regra “imagens só em user”.</li>
+    <li><b>Deixa o limite para o operador.</b> <code>get_supported_mm_limits()</code> passa a devolver <code>None</code>: o processador declarava <code>{"image": 16}</code>, e o vLLM usava <code>min(16, --limit-mm-per-prompt)</code>, então pedir 32 não surtia efeito.</li>
+  </ol>
+  <p>Os campos <code>vision_*</code> do <code>config.json</code> controlam a torre. O código do hotfix tem defaults (<code>vision_args_from_config</code>): patch 14, downsample 3, <code>max_n_token</code> 384, <code>min_pixels</code> 147.456, <code>max_wh_ratio</code> 8, <code>dim</code> 1024, 16 cabeças, <code>inter_dim</code> 2816 e <code>rope_theta</code> 10.000. O default mais importante é <code>vision_n_layers = 0</code>, que <b>desliga</b> a visão. O checkpoint Vision-Exp traz 32 e ativa a torre e o <code>bias_vl</code>; o 0731 só texto não traz o campo e fica sem visão.</p>
+
+  <h3>Roteamento MoE condicionado à modalidade</h3>
+  <p>Recapitule o MoE do DeepSeek-V4 (<a data-ch="mixture-of-experts">capítulo 11</a>). Nas camadas 3 a 42, o roteador calcula scores \(s\) e escolhe os top-6 de \(s + b\), onde \(b\) é o viés de balanceamento sem perda auxiliar (<code>e_score_correction_bias</code>). Nas camadas 0 a 2, o <span class="la-term" data-term="hash-routing">hash routing</span> dispensa o roteador na escolha: uma tabela fixa <code>tid2eid[token_id]</code> decide os 6 experts pelo <b>id</b> do token.</p>
+  <div class="la-eq">
+    \[ \mathcal{E}(x) = \begin{cases} \texttt{tid2eid}[\,\mathrm{id}(x)\,] & \text{camadas 0–2, texto} \\ \operatorname{top6}\big(s(x) + \mathbf{b}\big) & \text{camadas 3–42, texto} \\ \operatorname{top6}\big(s(x) + \mathbf{b}_{\text{vl}}\big) & \text{todas as camadas, linhas de imagem} \end{cases} \]
+    <ul class="la-eq-legend">
+      <li>\(\mathcal{E}(x)\): os 6 experts roteados escolhidos para o token \(x\)</li>
+      <li>\(s(x) = \sqrt{\operatorname{softplus}(x W_g^\top)}\): scores do roteador (<code>sqrtsoftplus</code>)</li>
+      <li>\(\mathbf{b}\): <code>e_score_correction_bias</code>, o viés de texto</li>
+      <li>\(\mathbf{b}_{\text{vl}}\): <code>e_score_correction_bias_vl</code>, o viés próprio das imagens, presente só no Vision-Exp</li>
+      <li>os pesos continuam saindo de \(s\) sem viés, normalizados e multiplicados por 1,5</li>
+    </ul>
+  </div>
+  <p>Agora junte com a seção 4: <b>todas</b> as linhas de um bloco de imagem têm o mesmo id, 129264. Sem tratamento especial, a tabela de hash mandava cada token de imagem, de cada foto, para os mesmos 6 experts, <code>tid2eid[129264]</code>, nas camadas 0 a 2. Era um engarrafamento de centenas de tokens em 6 portas, e o <code>e_score_correction_bias_vl</code> era carregado e ignorado. Essa é a issue #175. A correção implementa o <span class="la-term" data-term="roteamento-por-modalidade">roteamento por modalidade</span> da referência oficial: linhas de imagem roteiam com o <span class="la-term" data-term="bias-vl">bias_vl</span> e <b>sem</b> tabela de hash.</p>
+  <figure class="la-fig" id="fig-roteamento" data-title="Roteamento por modalidade: o engarrafamento do #175">
+    <div class="la-fig-stage" style="height:450px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Camada de hash ilustrativa com os 256 experts do DeepSeek-V4 numa grade 16×16. O calor mede a carga recente. Tokens de texto (lavanda, com ids ilustrativos) seguem a tabela <code>tid2eid</code>, que depende do id. Tokens de imagem (rosa) têm todos o id 129264. Embaixo, os 43 gates do modelo e quantas sincronizações host-device cada estratégia de classificação custa.</figcaption>
+  </figure>
+  <p>Sem a correção, seis células queimam e o resto da grade esfria; com ela, a carga das imagens se espalha como a do texto. Há uma sutileza de desempenho. Para escolher o caminho, cada gate precisaria saber se o lote é só texto, só imagem ou misto, e perguntar isso à GPU (<code>.sum().item()</code>) é uma <span class="la-term" data-term="sync-host-device">sincronização host-device</span>: 43 gates, 43 esperas por forward. O hotfix classifica o lote <b>uma vez</b>, em <code>embed_input_ids</code>, reaproveitando a contagem de placeholders já lida para a checagem da #172 (zero sync extra; um lote só texto nem essa paga), e publica o resultado numa célula lida pelos 43 gates. Lotes mistos são divididos por linha. Durante a captura de <span class="la-term" data-term="cuda-graph">CUDA graphs</span> nada é resolvido e vale o caminho de texto: os grafos de decode só repetem texto, e o prefill de imagem roda em modo eager.</p>
+  <div class="la-callout why"><b class="t">Por que isso importa para quem escreve receitas</b><p>Um placeholder parece inofensivo, porque “é só um id que depois vira embedding”. Mas qualquer componente que olhe o <b>id</b>, e não o vetor, vê centenas de tokens idênticos. Foi o que aconteceu com a tabela de hash do MoE. Por extensão (interpretação nossa), qualquer mecanismo endereçado por id, como os N-gramas do Qwen (<a data-ch="ngram-mtp">capítulo 16</a>) ou penalidades de repetição, merece a mesma pergunta: o que acontece com os tokens de imagem? O inventário não traz número de qualidade para a #175, só a correção do mecanismo.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Nas receitas: o painel multimodal</h2>
+  <p>Todas as peças convergem numa conta: quantos tokens cada imagem vai custar, e se essa conta cabe nos limites que a receita escolheu. A calculadora abaixo implementa os três redimensionadores. O do DeepSeek é portado linha a linha de <code>image_processor.py</code>. O do Qwen é o <code>smart_resize</code> com fator 32 e os limites do <code>preprocessor_config.json</code>. O do GLM é uma aproximação que reproduz os valores medidos pela receita para 1080p (2.691, 2.040 e 1.008).</p>
+  <figure class="la-fig wide" id="fig-orcamento" data-title="Calculadora: quanto custa uma imagem?">
+    <div class="la-fig-stage" style="height:460px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>A grade sobre cada imagem mostra os tokens do LLM (depois do merge): 28 px no GLM, 32 px no Qwen, 42 px no DeepSeek. No GLM, a terceira checagem compara o encode total com o pior caso que a receita dimensionou (48 × 2.048 = 98.304), já que nada é reservado; no DeepSeek, o teto de 384 já inclui o <code>compress_pad</code>. O preset “quadro do incidente” é uma resolução ilustrativa (3136×1792) que reproduz os números documentados: 7.168 tokens sem teto, 2.040 com teto de 2.048.</figcaption>
+  </figure>
+  <p>Faça quatro experimentos. (1) Com 1080p no GLM, troque o teto de 8.000 para 2.048: o quadro cai de 2.691 para 2.040 tokens (a grade engrossa ~15% em cada eixo). (2) Suba para 49 imagens: o GLM recusa (teto 48), e o DeepSeek já recusou em 9. (3) Escolha 4K: o Qwen gasta ~8 mil tokens, dentro de 16.384, e o DeepSeek comprime tudo em 366 tokens mais o <code>compress_pad</code> de 0 a 3. O teto de 384 já inclui esse pad: o redimensionador tira 3 tokens do orçamento antes de escolher o tamanho. (4) Escolha o quadro do incidente, teto 8.000 e 33 imagens. As duas primeiras checagens do GLM passam, mas a terceira fica vermelha: 236.544 tokens de encode sem nada reservado, o cenário que matou o <code>VLLM::Worker_TP</code>. Com teto 2.048, o mesmo anexo custa 67.320 tokens, dentro do pior caso de 98.304 que a receita dimensionou.</p>
+  <p>As tabelas resumem cada parâmetro em uma frase; a explicação completa está na seção indicada.</p>
+
+  <h3>GLM-5.3-Flash</h3>
+  <table class="la-params">
+    <thead><tr><th>Parâmetro</th><th>Valor</th><th>Por que esse valor</th></tr></thead>
+    <tbody>
+      <tr><td><code>--limit-mm-per-prompt</code> (<code>LIMIT_MM</code>)</td><td><code>{"image":48,"video":1}</code> (antes 4 → 100; <code>start-tp4.sh</code> ainda usa 100)</td><td>Só valida. Pior caso de 48 × 2.048 ≈ 98 mil tokens que a máquina consegue codificar (seção 6).</td></tr>
+      <tr><td><code>--mm-processor-kwargs max_image_tokens</code> (<code>MM_IMAGE_TOKENS</code>)</td><td><code>2048</code> (vazio = 8.000 do checkpoint)</td><td>Cabe no encoder cache de 7.168 e reduz o custo de cada quadro (seções 5 e 6).</td></tr>
+      <tr><td><code>--media-io-kwargs video.num_frames</code> (<code>VIDEO_NUM_FRAMES</code>)</td><td>vazio (32 do vLLM)</td><td>Limita quadros de um <code>video_url</code> real; o incidente veio pelo caminho de imagem (seção 5).</td></tr>
+      <tr><td><code>--mm-processor-cache-gb</code> (<code>MM_PROCESSOR_CACHE_GB</code>)</td><td><code>1</code> (vLLM: 4; 0 desliga)</td><td>Na UMA, cada GiB de RAM do host sai do modelo (seção 6).</td></tr>
+      <tr><td><code>--skip-mm-profiling</code> (<code>SKIP_MM_PROFILING</code>)</td><td><code>1</code></td><td>O perfil de boot dá OOM; em troca, nada fica reservado para a torre (seção 6).</td></tr>
+      <tr><td><code>--language-model-only</code> (<code>LANGUAGE_MODEL_ONLY</code>)</td><td><code>0</code> (1 desliga a visão)</td><td>Sem a torre de 1,13 GB, sobra memória para o KV.</td></tr>
+      <tr><td><code>--mm-encoder-tp-mode</code> (<code>MM_ENCODER_TP_MODE</code>)</td><td>TP2: <code>weights</code>; TP3: <code>data</code></td><td>16 cabeças e 4096 não dividem por 3 (seção 6).</td></tr>
+      <tr><td><code>patch_glm_video_placeholders.py</code></td><td>overlay #3, hook <code>.pth</code></td><td>Alinha timestamps a <code>grid_t</code> e desliga o <code>persistent_topk</code> (seção 5).</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Qwen3.8-Flash-Next</h3>
+  <table class="la-params">
+    <thead><tr><th>Parâmetro</th><th>Valor</th><th>Por que esse valor</th></tr></thead>
+    <tbody>
+      <tr><td><code>--mm-encoder-tp-mode</code> (<code>MM_ENCODER_TP_MODE</code>)</td><td><code>data</code> (<code>weights</code> crasha)</td><td>2152 colunas por GPU em TP2 não é múltiplo de 16; a réplica custa ~0,42 GiB a mais por GPU (seção 6).</td></tr>
+      <tr><td><code>vision_config</code></td><td>27 blocos, 1152, intermediária 4304, patch 16, merge 2, saída 2560</td><td>A 4304 explica os dois tropeços: MXFP8 exige múltiplo de 32, TP2 múltiplo de 16 (seções 3 e 6).</td></tr>
+      <tr><td><code>--allowed-local-media-path</code></td><td>não definido</td><td>Mídia só por URL ou data URL base64, sem expor o disco do servidor.</td></tr>
+      <tr><td>limite por prompt</td><td>1 imagem + 1 vídeo (padrão, segundo o README)</td><td>Define o pior caso de tokens de visão por requisição.</td></tr>
+      <tr><td>orçamento do encoder</td><td>16.384 tokens por entrada</td><td>4K ≈ 8,2 mil tokens cabe; vídeos maiores são amostrados (seção 5). O MTP não vê a imagem.</td></tr>
+      <tr><td><code>mrope_section</code> / <code>mrope_interleaved</code></td><td><code>[11, 11, 10]</code> / <code>true</code></td><td>Precisam sobreviver a overrides de <code>rope_parameters</code> (seção 5).</td></tr>
+    </tbody>
+  </table>
+
+  <h3>DeepSeek-V4-Flash Vision-Exp</h3>
+  <table class="la-params">
+    <thead><tr><th>Parâmetro</th><th>Valor</th><th>Por que esse valor</th></tr></thead>
+    <tbody>
+      <tr><td><code>--limit-mm-per-prompt</code> (<code>LIMIT_MM_PER_PROMPT</code>)</td><td><code>image=8</code> → <code>{"image":8}</code>; testado com 32 (32 → 200, 33 → 400)</td><td>A Anemll faz <code>json.loads</code>, e um JSON no <code>.env</code> perde as aspas no <code>source</code>; o entrypoint converte <code>image=N</code>.</td></tr>
+      <tr><td><code>image_url</code> (regras de papéis)</td><td>JPEG, PNG, GIF, WebP, só em <code>user</code></td><td>Regra oficial; o 400 fica no histórico (#178, seção 6). GIF vira quadro estático.</td></tr>
+      <tr><td><code>hotfix-dsv4-vision-exp.py</code> + <code>patches/vision_exp/</code></td><td>sempre</td><td>A classe da Anemll 0.1.1 é só texto (seção 7).</td></tr>
+      <tr><td><code>vision_*</code></td><td>patch 14, downsample 3, 384 tokens, 147.456 px, razão 8, dim 1024, 16 cabeças, 2816, θ 10.000</td><td><code>vision_n_layers</code> 0 (default) desliga; o checkpoint traz 32 (seção 7).</td></tr>
+      <tr><td><code>IMAGE_TOKEN_ID</code></td><td>129264</td><td>Está no vocabulário, por isso caía no hash MoE (#175).</td></tr>
+      <tr><td><code>COMPRESS_PAD_TO</code></td><td>4 → pad de 3 − (s mod 4)</td><td>Corpo alinhado à compressão C4 (interpretação); bloco de 122 a 125 tokens (seção 4).</td></tr>
+      <tr><td><code>salt_mm_image_hash</code> (#172)</td><td><code>digest:vlexp-ntok{N}</code></td><td>A chave do encoder cache inclui o comprimento do bloco (seção 6).</td></tr>
+      <tr><td>roteamento de imagem (#175)</td><td><code>e_score_correction_bias_vl</code>, sem <code>tid2eid</code></td><td>Sem colapso em 6 experts; classificação 1× por forward (seção 7).</td></tr>
+      <tr><td><code>hotfix-vllm-empty-encoder-output.py</code> (#109)</td><td>sempre</td><td>Sem token 0 fantasma nos passos só de encoder (seção 6).</td></tr>
+      <tr><td><code>ENABLE_VL_SIDECAR</code> / <code>GPU_MEMORY_UTILIZATION_VISION</code></td><td>removidos</td><td>Sidecar da era só texto, substituído pela visão nativa (seção 7).</td></tr>
+    </tbody>
+  </table>
+
+  <h3>GLM-5.3-Flash · TensorFold</h3>
+  <p>A mesma visão do GLM, servida por outro motor (<a data-ch="receita-glm-tensorfold">Receita GLM · TensorFold</a>). Os nomes mudam porque não há flags do vLLM; os tetos ficam em variáveis de ambiente que o <code>start.sh</code> passa aos dois containers.</p>
+  <table class="la-params">
+    <thead><tr><th>Parâmetro</th><th>Valor</th><th>Por que esse valor</th></tr></thead>
+    <tbody>
+      <tr><td><code>VISION</code> → <code>--vision</code></td><td><code>1</code> (0 = só texto)</td><td>Torre só no rank 0: 1,05 GiB de pesos + 0,75 GiB de workspace. <code>0</code> devolve ~1,8 GiB ao cache (seção 6).</td></tr>
+      <tr><td><code>VISION_URLS</code> → <code>--vision-urls</code></td><td><code>0</code> (só data URLs)</td><td><code>1</code> deixa o servidor buscar URLs <code>https://</code> públicas. Corpo de até 96 MiB (~70 MB de mídia).</td></tr>
+      <tr><td><code>TENSORFOLD_GLM_IMAGE_TOKENS</code></td><td><code>2048</code> (faixa 16–8.000)</td><td>O mesmo teto da lane vLLM (1080p = 2.040), que mantém o encode dentro do workspace reservado (seção 6).</td></tr>
+      <tr><td><code>TENSORFOLD_GLM_MAX_IMAGES</code> / <code>_MAX_VIDEOS</code></td><td><code>50</code> / <code>4</code> (eram 4 / 2)</td><td>Validação por requisição, com 10 MB por imagem e 64 MB por vídeo.</td></tr>
+      <tr><td><code>TENSORFOLD_GLM_REQUEST_IMAGE_TOKENS</code> / <code>_REQUEST_VIDEO_TOKENS</code></td><td><code>16384</code> / <code>32768</code> (imagens: 102.400 desde <code>36df86e</code>)</td><td>Orçamento dividido entre os itens: pior caso constante, 327 tokens por imagem com 50 (seção 6); o padrão novo mantém 2.048 por imagem até 50.</td></tr>
+      <tr><td><code>TENSORFOLD_GLM_VIDEO_TOKENS</code> / <code>_VIDEO_FRAMES</code></td><td><code>16384</code> / <code>128</code></td><td>2 quadros por segundo, espalhados pelo clipe; um timestamp em texto por par (seção 5).</td></tr>
+      <tr><td><code>TENSORFOLD_VISION_WORKSPACE_MIB</code></td><td>automático (0,75 GiB)</td><td>Workspace reservado na partida; cresce sozinho se o teto por imagem passar de 4.096 tokens.</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Receita para a sua receita</h3>
+  <p>Quando um modelo multimodal novo aparecer, percorra esta lista antes de subir o primeiro <code>vllm serve</code>:</p>
+  <ol class="la-steps">
+    <li><b>Leia a torre.</b> Em <code>vision_config</code> e <code>preprocessor_config.json</code>, anote o patch \(p\), o merge \(k\), o patch temporal, a largura, a intermediária e o orçamento de pixels. Calcule \(p \cdot k\): esse é o lado de um token em pixels.</li>
+    <li><b>Calcule o câmbio.</b> Tokens por imagem ≈ área / \((pk)^2\), limitados pelo orçamento. Faça a conta para as imagens reais do seu uso: screenshots, documentos, quadros de vídeo.</li>
+    <li><b>Encaixe no motor.</b> Tokens por imagem ≤ encoder cache (≈ <code>max_num_batched_tokens</code>). Se o checkpoint pedir mais, limite com <code>--mm-processor-kwargs</code>, como o GLM fez com 2.048 e o tutorial MiMo com <code>max_pixels</code> 2.073.600.</li>
+    <li><b>Escolha limites pensando no pior caso.</b> Itens por prompt × tokens por item, lembrando que clientes sem estado reenviam o histórico. Com <code>--skip-mm-profiling</code>, esses limites são a única proteção de memória. Um orçamento por requisição dividido entre os itens, como o da lane TensorFold, deixa o pior caso constante.</li>
+    <li><b>Decida fatiar ou replicar a torre.</b> Verifique cabeças e intermediária da torre contra o grau de TP e os tiles dos kernels. Na dúvida, <code>--mm-encoder-tp-mode data</code>: a torre é pequena. Um motor próprio ainda pode deixá-la num rank só, como faz o TensorFold.</li>
+    <li><b>Procure quem olha o id.</b> Tabelas de hash, N-gramas e o rascunhador: o que eles fazem com centenas de placeholders idênticos?</li>
+    <li><b>Teste como usuário.</b> OCR fino, sessões com muitas imagens, vídeo e imagens em papéis proibidos. Meça a aceitação do rascunhador em prompts com imagem.</li>
+  </ol>
+  <p>Com a visão, a Parte III fecha a lista de peças: experts e roteadores, MLA, atenção esparsa e linear, hyper-connections, N-gramas, MTP e, agora, olhos. No <a data-ch="tres-modelos">próximo capítulo</a>, os três modelos são montados lado a lado, camada por camada, com todas essas peças encaixadas no mesmo chassi.</p>
+</section>

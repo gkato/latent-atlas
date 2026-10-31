@@ -1,0 +1,426 @@
+<p class="la-lead">Stage 3 of DeepSeek-R1 looks mundane. The model generates lots of responses, the wrong ones go in the trash and whatever is left becomes SFT: about 600,000 reasoning samples (only the correct ones) and 200,000 general ones, two epochs on top of DeepSeek-V3-Base. Llama 2 used nothing but rounds of this same <i>rejection sampling fine-tuning</i> up to version V4 of its RLHF; after that it chained the two, applying PPO on top of the rejection sampling checkpoint. Nobody calls this RL, but it is a close relative. It is the extreme case of a family that was born in robotics (RWR, from 2007), grew into <span class="la-term" data-term="awr">advantage-weighted regression</span> (AWR, 2019) and aims at the same optimum that <a data-ch="dpo">DPO</a> chases. In this chapter you will travel the two roads that lead to alignment without PPO. On the <b>regression</b> road, the method samples, weighs and imitates. On the <b>contrast</b> road, it pushes the good up and the bad down, one against many (InfoNCE, SLiC, CPL, unlikelihood). At the end, a family tree connects all of them to DPO, and you will know when it pays to swap an RL loop for a regression or a contrast.</p>
+
+<section class="la-sec">
+  <h2>Two roads to the same summit</h2>
+  <p>Start with the objective that <a data-ch="ppo-rlhf">RLHF with PPO</a> optimizes and that the <a data-ch="dpo">DPO chapter</a> solved in closed form. For each prompt \(x\), we want a policy that earns reward without straying too far from the reference model:</p>
+  <div class="la-eq">
+    \[ \max_{\pi}\ \mathbb E_{x\sim\mathcal D}\Big[\ \mathbb E_{y\sim\pi(\cdot\mid x)}\big[r(x,y)\big]\;-\;\beta\,\mathbb D_{\text{KL}}\big(\pi(\cdot\mid x)\,\|\,\pi_{\text{ref}}(\cdot\mid x)\big)\Big] \]
+    <ul class="la-eq-legend">
+      <li>\(x\): the prompt, drawn from the prompt set \(\mathcal D\); \(y\): a complete response</li>
+      <li>\(r(x,y)\): the reward (a reward model's score, a verifier's verdict, a judge…)</li>
+      <li>\(\pi_{\text{ref}}\): the frozen reference policy, usually the SFT model</li>
+      <li>\(\beta\): the “price” of straying, measured by the <span class="la-term" data-term="kld">KL divergence</span></li>
+    </ul>
+  </div>
+  <p>Among all possible distributions, the solution is the reference <span class="la-term" data-term="inclinacao-exponencial">exponentially tilted</span> by the reward (the derivation, via Gibbs' inequality, is in the DPO chapter):</p>
+  <div class="la-eq">
+    \[ \pi^*(y\mid x)=\frac{\pi_{\text{ref}}(y\mid x)\,e^{r(x,y)/\beta}}{Z(x)},\qquad Z(x)=\sum_{y}\pi_{\text{ref}}(y\mid x)\,e^{r(x,y)/\beta} \]
+    <ul class="la-eq-legend">
+      <li>\(\pi^*\): the optimal policy for the objective above, with no architectural constraint whatsoever</li>
+      <li>\(e^{r/\beta}\): the tilting factor; it grows exponentially with the reward</li>
+      <li>\(Z(x)\): the constant that makes the probabilities sum to 1; it sums over <i>all</i> possible responses</li>
+    </ul>
+  </div>
+  <p>Read the formula as a three-step recipe: take the probability the reference already gave each response, multiply it by \(e^{r/\beta}\) and renormalize. With a large \(\beta\), \(e^{r/\beta}\approx 1\) for everyone and nothing changes. With a small \(\beta\), the highest-reward response swallows the mass. Notice that \(\pi^* \propto \exp\big(\log\pi_{\text{ref}} + r/\beta\big)\): it is a <span class="la-term" data-term="softmax">softmax</span> over whole responses, in which \(\log\pi_{\text{ref}}\) plays the role of the “prior” and \(\beta\) plays the role of the <span class="la-term" data-term="temperatura">temperature</span> from <a data-ch="geracao-amostragem">chapter 9</a>. Move \(\beta\) and watch the mass flow.</p>
+  <figure class="la-fig" id="fig-inclinacao" data-title="The tilted table: the reference weighted by the reward">
+    <div class="la-fig-stage" style="height:420px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Six responses to the same prompt. Dashed lilac bars: the reference \(\pi_{\text{ref}}\). Mint bars: the tilted policy \(\pi^*\). The dots are “grains” of probability (each one worth 1/60 of the mass), and they roll toward the higher-reward responses as \(\beta\) decreases. Below, each response's factor \(e^{r/\beta}\), on a log scale. Turn on “subtract the baseline”: the factors and \(Z(x)\) change, but \(\pi^*\) does not budge, because the baseline cancels in the normalization (the same calculation as in the AWR section). Probabilities and rewards are <b>illustrative</b>; \(\mathbb E[r]\), KL and entropy are computed on the fly.</figcaption>
+  </figure>
+  <div class="la-callout analogy"><b class="t">Analogy: the marble table</b><p>Picture the probability mass as marbles scattered on a table, right where the reference placed them. The reward tilts the table, and the marbles roll toward the good responses. \(\beta\) is the friction: with lots of friction (large \(\beta\)), they barely leave their spots; with no friction (\(\beta\to 0\)), they all tumble into the lowest corner, the argmax of the reward. A response the reference never generates (\(\pi_{\text{ref}}=0\)) gets no marble at all, however large its reward: tilting only redistributes what already exists.</p></div>
+  <h3>Three ways to get there</h3>
+  <p>Why not use the formula directly? Because \(Z(x)\) sums over every possible response, a number of terms on the order of \(|\mathcal V|^{|y|}\), and because we don't have a table with \(\pi^*(y\mid x)\): we have a neural network with billions of parameters. What we can do is <b>sample</b> responses and <b>fit</b> the network. There are three ways to organize this, and each one defines a family of methods in this module:</p>
+  <ol class="la-steps">
+    <li><b>RL (PPO, GRPO).</b> Sample from the policy itself, \(\pi_\theta\), measure the reward and climb the policy gradient. A two-line identity shows that maximizing the objective is the same as <i>minimizing</i> \(\mathbb D_{\text{KL}}(\pi_\theta\,\|\,\pi^*)\), the <span class="la-term" data-term="kl-reverso">reverse KL</span> (equation below).</li>
+    <li><b>Regression (RWR, AWR, RAFT, ReST).</b> Sample from the reference, give each sample the weight \(e^{r/\beta}\) and do weighted maximum likelihood. That amounts to minimizing the <span class="la-term" data-term="kl-direto">forward KL</span> \(\mathbb D_{\text{KL}}(\pi^*\,\|\,\pi_\theta)\). If the samples come from another policy \(q\) (the one from a few iterations ago, an old log), the same weight targets \(q\,e^{r/\beta}\): the anchor becomes whoever did the sampling, like AWR's \(\mu\). To keep \(\pi_{\text{ref}}\) as the anchor, you would have to multiply by the importance weight \(\pi_{\text{ref}}/q\).</li>
+    <li><b>Reparameterization and contrast (DPO, CPL, InfoNCE).</b> Invert the formula, write the reward as a function of the policy itself and fit comparisons between responses. \(Z(x)\) cancels in the difference.</li>
+  </ol>
+  <div class="la-eq">
+    \[ \underbrace{\mathbb E_{y\sim\pi}[r]-\beta\,\mathbb D_{\text{KL}}(\pi\,\|\,\pi_{\text{ref}})\;=\;\beta\log Z(x)-\beta\,\mathbb D_{\text{KL}}(\pi\,\|\,\pi^*)}_{\text{RL road}}\qquad\qquad \underbrace{\min_\theta\ \mathbb D_{\text{KL}}(\pi^*\,\|\,\pi_\theta)\;\Longleftrightarrow\;\max_\theta\ \mathbb E_{y\sim\pi_{\text{ref}}}\Big[\tfrac{e^{r(x,y)/\beta}}{Z(x)}\,\log\pi_\theta(y\mid x)\Big]}_{\text{regression road}} \]
+    <ul class="la-eq-legend">
+      <li>left: since \(\beta\log Z(x)\) does not depend on \(\pi\), maximizing the objective means pulling \(\pi\) onto \(\pi^*\) under the reverse KL</li>
+      <li>right: \(\mathbb D_{\text{KL}}(\pi^*\|\pi_\theta) = \text{const} - \sum_y \pi^*(y)\log\pi_\theta(y)\), and \(\pi^* = \pi_{\text{ref}}\,e^{r/\beta}/Z\) turns the sum into an expectation under \(\pi_{\text{ref}}\), which we can sample</li>
+      <li>\(e^{r/\beta}/Z(x)\): each sample's weight; the \(\log\pi_\theta\) term is the same log-likelihood as in SFT</li>
+    </ul>
+  </div>
+  <p>The weight still depends on \(Z(x)\), which remains unknown. But for a fixed prompt, \(Z(x)\) is the same constant for every sample. So it is enough to normalize the weights of that prompt's \(K\) samples, \(\hat w_i = e^{r_i/\beta}/\sum_j e^{r_j/\beta}\), which is called self-normalized <span class="la-term" data-term="amostragem-por-importancia">importance sampling</span>. The normalized weights are, once again, a softmax of the rewards with temperature \(\beta\). Hold on to that sentence, because the rest of the regression section is a variation on it.</p>
+  <h3>Covering the mass or hunting the mode</h3>
+  <p>If the network could represent \(\pi^*\) exactly, with infinite data, both roads would arrive at the same place: zero KL, in both directions. The difference shows up in real life, when the model <b>can't</b> (finite capacity, few samples, few steps). The forward KL punishes the model for giving low probability where the target has mass, and so it <i>covers the mass</i> (it is <i>mass-covering</i>): it spreads probability over every mode, including the valley between them. The reverse KL punishes the model for putting mass where the target has none, and so it <i>hunts the mode</i> (it is <i>mode-seeking</i>): it picks one peak and covers it well. It is the same distinction that separates SFT, which minimizes a forward KL to the data, from RL with KL and on-policy distillation, which minimize a reverse KL.</p>
+  <figure class="la-fig" id="fig-direcao-kl" data-title="A blanket too short: forward KL × reverse KL">
+    <div class="la-fig-stage" style="height:400px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Target \(\pi^*\) (lilac area) with two modes over an axis of “responses”. The model (mint curve) can only make a single hill: a discretized Gaussian with mean \(\mu\) and width \(\sigma\). The fit runs by live gradient descent, with the trail of its path drawn in the \((\mu,\sigma)\) plane panel. Forward KL (regression road): the hill widens and covers both peaks. Reverse KL (RL road): the hill picks one peak; which one depends on the starting point. Shapes are <b>illustrative</b>; the KLs are computed on the grid.</figcaption>
+  </figure>
+  <div class="la-callout why"><b class="t">Why it matters</b><p>The regression road inherits SFT's temperament. It is stable (deep down it is a cross-entropy), it covers every mode the good samples exhibit and it <b>never leaves the support of the samples</b>: if none of the \(K\) responses solved the problem, there is nothing to imitate. The RL road can concentrate the mass and explore on-policy, but it can also collapse onto one mode and lose diversity. This difference in temperament will resurface in every method of the chapter.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>From RWR to AWR: imitating with weights</h2>
+  <p>In the name AWR, “regression” does not mean predicting a number with squared error. It means <b>supervised fitting</b>: matching the policy to the data by maximum likelihood, exactly as in <a data-ch="sft">SFT</a>. The only novelty is a per-example weight. Examples with a high weight pull the model hard; examples with a near-zero weight are practically ignored.</p>
+  <h3>RWR: the weight is the return</h3>
+  <p><span class="la-term" data-term="rwr">Reward-Weighted Regression</span> (Peters &amp; Schaal, 2007) was born in robot control. In each iteration, the current policy \(\pi_k\) generates trajectories, and the next policy is the maximum likelihood fit of those same actions, weighted by the exponential of the return (in the form the AWR paper presents it, Eq. 2):</p>
+  <div class="la-eq">
+    \[ \pi_{k+1}=\arg\max_\pi\ \mathbb E_{s\sim d_{\pi_k},\,a\sim\pi_k}\Big[\log\pi(a\mid s)\,\exp\!\big(\tfrac{1}{\beta}\,\mathcal R_{s,a}\big)\Big],\qquad \mathcal R_{s,a}=\sum_t\gamma^t r_t \]
+    <ul class="la-eq-legend">
+      <li>\(s\), \(a\): state and action (in an LLM, prefix and next token, or prompt and whole response)</li>
+      <li>\(d_{\pi_k}\): the distribution of states that policy \(\pi_k\) visits</li>
+      <li>\(\mathcal R_{s,a}\): the return from \((s,a)\), the sum of future rewards discounted by \(\gamma\)</li>
+      <li>\(\beta\): the temperature of the weights</li>
+    </ul>
+  </div>
+  <p>The original derivation comes from an <span class="la-term" data-term="esperanca-maximizacao">expectation-maximization</span> (EM) framework: the E-step reweights the samples by their return, the M-step fits the policy. The deep dive below shows where the weights come from, and the same calculation will reappear in ReST-EM.</p>
+  <div class="la-callout deep"><b class="t">Deep dive: EM, or why weights show up</b><p>Invent a binary variable \(O\) (“the outcome was good”) with \(p(O{=}1\mid x,y)\) increasing in the reward, for example \(\propto e^{r(x,y)/\beta}\), or \(\mathbb 1[\text{correct}]\) with a verifier. We want the policy that makes “good” more likely, that is, the one that maximizes \(\log p(O{=}1\mid x)=\log\sum_y p(O{=}1\mid x,y)\,\pi_\theta(y\mid x)\). The log of a sum is hard to optimize. For any distribution \(q(y)\), Jensen's inequality gives a lower bound:</p><p>\[ \log p(O{=}1\mid x)\ \ge\ F(q,\theta)=\mathbb E_{y\sim q}\big[\log p(O{=}1\mid x,y)+\log\pi_\theta(y\mid x)-\log q(y)\big] \]</p><p>EM climbs this bound <b>coordinate-wise</b>, alternating. <b>E-step</b> (with \(\theta\) fixed, optimize \(q\)): the bound touches the true value when \(q\) is the posterior, \(q(y)\propto p(O{=}1\mid x,y)\,\pi_{\theta_t}(y\mid x)\), that is, “the current policy's responses, conditioned on having succeeded”. <b>M-step</b> (with \(q\) fixed, optimize \(\theta\)): only the term \(\mathbb E_q[\log\pi_\theta]\) depends on \(\theta\), and maximizing it is a maximum likelihood fit. Since the samples come from \(\pi_{\theta_t}\), each one enters with the importance weight \(q/\pi_{\theta_t}\propto p(O{=}1\mid x,y)\). That is where the weights come from: \(e^{r/\beta}\) in RWR, \(\mathbb 1[\text{correct}]\) in the binary filter. Neither step decreases \(F\), and the E-step makes the bound tight, so \(\log p(O{=}1\mid x)\) never drops from one iteration to the next.</p></div>
+  <p>RWR's practical problem is one of scale. \(e^{\mathcal R/\beta}\) depends on the absolute value of the return, and a state in which every action pays off handsomely dominates the whole batch, even if there is nothing to learn there.</p>
+  <h3>AWR: maximize the improvement, not the return</h3>
+  <p><span class="la-term" data-term="awr-algoritmo">AWR</span> (Peng, Kumar, Zhang &amp; Levine, 2019) changes the question. Instead of maximizing the return, it maximizes the <b>expected improvement</b> over the policy \(\mu\) that collected the data, \(\eta(\pi) = J(\pi) - J(\mu) = \mathbb E_{s\sim d_\pi}\mathbb E_{a\sim\pi}[A^\mu(s,a)]\) (Eq. 3), where \(A^\mu\) is the <span class="la-term" data-term="vantagem">advantage</span>, how much better action \(a\) is than \(\mu\)'s average in state \(s\). We swap \(d_\pi\) for \(d_\mu\), an approximation that holds as long as the policies are similar, and add a KL constraint to guarantee exactly that:</p>
+  <div class="la-eq">
+    \[ \arg\max_\pi\int_s d_\mu(s)\int_a\pi(a\mid s)\big[\mathcal R^\mu_{s,a}-V^\mu(s)\big]\,da\,ds\quad\text{s.t.}\quad\int_s d_\mu(s)\,\mathbb D_{\text{KL}}\big(\pi(\cdot\mid s)\,\|\,\mu(\cdot\mid s)\big)\,ds\le\epsilon \]
+    <ul class="la-eq-legend">
+      <li>\(\mu\): the behavior policy, which generated the data (in AWR, the mixture of old policies kept in the buffer)</li>
+      <li>\(V^\mu(s)\): the <span class="la-term" data-term="funcao-valor">value function</span>, \(\mu\)'s average return from \(s\); \(\mathcal R-V\) estimates the advantage</li>
+      <li>\(\epsilon\): the KL budget per step; the same trust region idea as TRPO</li>
+    </ul>
+  </div>
+  <p>The Lagrangian of this constraint (Eq. 7) has a closed-form solution (Eq. 8), and it looks like something you already know:</p>
+  <div class="la-eq">
+    \[ \pi^*(a\mid s)=\frac{1}{Z(s)}\,\mu(a\mid s)\,\exp\!\Big(\frac{1}{\beta}\big(\mathcal R^\mu_{s,a}-V^\mu(s)\big)\Big) \]
+    <ul class="la-eq-legend">
+      <li>it is the exponential tilting from the previous section, with \(\mu\) in place of \(\pi_{\text{ref}}\) and the advantage in place of the reward</li>
+      <li>\(\beta\): now it is the Lagrange multiplier of the KL constraint; a small \(\beta\) corresponds to a loose budget \(\epsilon\)</li>
+    </ul>
+  </div>
+  <div class="la-callout math"><b class="t">The Lagrangian calculation, in three lines</b><p>Write \(A=\mathcal R^\mu_{s,a}-V^\mu(s)\) and, alongside the KL constraint, add the constraint that \(\pi(\cdot\mid s)\) sums to 1 in each state (multiplier \(\alpha_s\)):</p><p>\[ \begin{aligned}\mathcal L=&\int_s d_\mu(s)\!\int_a\pi(a\mid s)\,A\\&+\beta\Big(\epsilon-\int_s d_\mu(s)\!\int_a\pi(a\mid s)\log\tfrac{\pi(a\mid s)}{\mu(a\mid s)}\Big)\\&+\int_s\alpha_s\Big(1-\int_a\pi(a\mid s)\Big)\end{aligned} \]</p><p>Differentiate with respect to a single value \(\pi(a\mid s)\) and set it to zero: \(d_\mu(s)\,A-\beta\,d_\mu(s)\big(\log\pi(a\mid s)-\log\mu(a\mid s)+1\big)-\alpha_s=0\). Isolating the log, \(\log\pi(a\mid s)=\log\mu(a\mid s)+A/\beta-\big(1+\alpha_s/(\beta\,d_\mu(s))\big)\). The last parenthesis depends only on \(s\), and exponentiating gives \(\pi^*=\mu\,e^{A/\beta}/Z(s)\), with \(Z(s)\) pinned down by the sum-to-1 condition. It is the same result the DPO chapter obtained via Gibbs' inequality, now with \(\mu\) in place of \(\pi_{\text{ref}}\).</p></div>
+  <p>What remains is bringing \(\pi^*\) into the network. The projection \(\arg\min_\pi \mathbb E_s[\mathbb D_{\text{KL}}(\pi^*\,\|\,\pi)]\) (Eq. 9–10) becomes, by the same calculation as in the previous section, a weighted maximum likelihood on \(\mu\)'s samples. The paper's Algorithm 1 alternates two supervised regressions per iteration, plus a clip on the weights:</p>
+  <div class="la-eq">
+    \[ V_k^{\mathcal D}\leftarrow\arg\min_V\ \mathbb E_{s,a\sim\mathcal D}\big\|\mathcal R^{\mathcal D}_{s,a}-V(s)\big\|^2,\qquad \pi_{k+1}\leftarrow\arg\max_\pi\ \mathbb E_{s,a\sim\mathcal D}\Big[\log\pi(a\mid s)\,\min\!\Big(\exp\!\big(\tfrac{1}{\beta}\big(\mathcal R^{\mathcal D}_{s,a}-V_k^{\mathcal D}(s)\big)\big),\ \omega_{\max}\Big)\Big] \]
+    <ul class="la-eq-legend">
+      <li>\(\mathcal D\): the FIFO <span class="la-term" data-term="replay-buffer">replay buffer</span> with the recent trajectories</li>
+      <li>regression 1: the critic \(V\) learns to predict each state's return (squared error)</li>
+      <li>regression 2: the policy imitates the buffer's actions, each with weight \(e^{A/\beta}\)</li>
+      <li>\(\omega_{\max}\): the <span class="la-term" data-term="corte-de-pesos">weight clipping</span>, which keeps a single example from dominating the gradient</li>
+    </ul>
+  </div>
+  <table class="la-params">
+    <thead><tr><th>Detail</th><th>Value in the paper</th><th>Why it matters</th></tr></thead>
+    <tbody>
+      <tr><td>\(\beta\) (temperature)</td><td>0.05, <b>fixed</b> in every experiment</td><td>not adapted, unlike its predecessors REPS (<i>Relative Entropy Policy Search</i>, Peters et al., 2010) and MPO (<i>Maximum a posteriori Policy Optimisation</i>, Abdolmaleki et al., 2018), which treat \(\beta\) as a Lagrange multiplier and recompute it every iteration, solving the dual problem to spend exactly the budget \(\epsilon\); fixed is simpler, but then the scale of the advantage starts to matter</td></tr>
+      <tr><td>\(\omega_{\max}\)</td><td>20</td><td>with a small \(\beta\), \(e^{A/\beta}\) blows up; the clip trades a little bias for stability</td></tr>
+      <tr><td>returns</td><td>TD(λ) with \(V_{k-1}\), λ = 0.95</td><td>the critic's target mixes observed return and bootstrap, as in GAE from <a data-ch="rl-fundamentos">chapter 54</a></td></tr>
+      <tr><td>buffer</td><td>50k samples; ~2,000 new ones per iteration</td><td>off-policy data, treated as samples from a mixture of past policies</td></tr>
+      <tr><td>optimization</td><td>minibatch 256; 200 value steps and 1,000 policy steps per iteration</td><td>everything is supervised regression: no importance ratio, no ratio clipping</td></tr>
+    </tbody>
+  </table>
+  <h3>Why the baseline \(V(s)\) matters</h3>
+  <p>The paper says that swapping the return for the advantage is “crucial” in practice. There is a subtlety worth seeing with numbers. For the <b>same state</b>, the baseline is irrelevant after normalization: \(e^{(\mathcal R-V)/\beta} = e^{\mathcal R/\beta}\cdot e^{-V/\beta}\), and the factor \(e^{-V/\beta}\) is the same for every action in that state. Four samples with rewards \((1.0,\ 0.0,\ 0.5,\ 0.2)\) and \(\beta = 0.5\) give RWR weights \((7.389,\ 1.0,\ 2.718,\ 1.492)\) and, once normalized, \((0.5865,\ 0.0794,\ 0.2158,\ 0.1184)\), exactly the same as AWR's. The <span class="la-term" data-term="linha-de-base">baseline</span> matters <b>across states</b> (or across prompts), for two reasons the figure shows:</p>
+  <ul>
+    <li><b>Gradient scale.</b> In a shared network, an “easy” state with high returns produces astronomical weights \(e^{\mathcal R/\beta}\) and monopolizes the gradient. With the advantage, each state contributes on the scale of how much there is still to learn in it.</li>
+    <li><b>Interaction with the clip.</b> With \(\beta = 0.05\), an action with return 0.9 has RWR weight \(e^{18}\approx 6.6\times10^{7}\), and every reasonable action of an easy state hits the ceiling \(\omega_{\max} = 20\). Equal weights teach nothing. Centering by the mean, the advantages separate the actions again (our own toy example, built from the paper's formulas).</li>
+  </ul>
+  <p>Tied to this choice there is an elegant reading, which is our derivation and not the paper's: the “correct” normalizer for each state is \(Z(s)\), and \(e^{\mathcal R/\beta}/Z(s) = e^{(\mathcal R - \beta\log Z(s))/\beta}\). In other words, the ideal baseline would be the <i>soft value</i> \(\beta\log\mathbb E_\mu[e^{\mathcal R/\beta}]\), which tends to the mean \(\mathbb E_\mu[\mathcal R]\) as \(\beta\) grows. AWR uses the mean, the large-\(\beta\) approximation, and counts on the clip to hold back the rest.</p>
+  <figure class="la-fig" id="fig-awr-laco" data-title="The AWR loop, one iteration from the inside">
+    <div class="la-fig-stage" style="height:470px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>A toy world with three states (easy, medium, hard) and three actions. In the buffer, drawn as a matrix, each row is a sample \((s, a, \mathcal R)\), and the columns \(V\), \(A\) and \(w\) are filled in step by step. In the policy panel, the bars show \(\pi(a\mid s)\) for each state before (dashed, 1/3) and after the weighted regression (solid), plus the share of the gradient each state takes. Switch the baseline to RWR and watch the easy state's weights all hit the ceiling \(\omega_{\max}\). Returns are <b>illustrative</b>; the new policy is the exact maximizer of the weighted likelihood (tabular case).</figcaption>
+  </figure>
+  <h3>AWAC: the same weight, with a Q critic</h3>
+  <p><span class="la-term" data-term="awac">AWAC</span> (Nair, Gupta, Dalal &amp; Levine) takes the idea to offline-to-online RL. Instead of estimating the advantage with Monte Carlo returns minus \(V\), it uses the advantage from a critic \(Q\). The policy update (Eq. 13) and its closed-form solution are:</p>
+  <div class="la-eq">
+    \[ \theta_{k+1}=\arg\max_\theta\ \mathbb E_{s,a\sim\pi_\beta}\Big[\log\pi_\theta(a\mid s)\,\exp\!\big(\tfrac{1}{\lambda}A^{\pi_k}(s,a)\big)\Big],\qquad \pi^*\propto\pi_\beta\,e^{A/\lambda} \]
+    <ul class="la-eq-legend">
+      <li>\(\pi_\beta\): the behavior policy, that is, the buffer's data (in the paper, the letter \(\beta\) denotes this data, not the temperature)</li>
+      <li>\(\lambda\): the temperature; 0.3 in the manipulation tasks, 1.0 on MuJoCo</li>
+      <li>\(A^{\pi_k}=Q^{\pi_k}(s,a)-\mathbb E_{a'\sim\pi_k}Q^{\pi_k}(s,a')\): the advantage computed with the critic</li>
+    </ul>
+  </div>
+  <p>The practical upside is that the constraint to \(\pi_\beta\) appears implicitly in the weights, with no need to model the behavior policy. A reading caveat: the main text calls the projection \(\mathbb D_{\text{KL}}(\pi^*\|\pi_\theta)\) “forward KL”, and the appendix calls the same projection “reverse KL”. Always describe it by the formula, not by the label.</p>
+</section>
+
+<section class="la-sec">
+  <h2>Weighted SFT for LLMs: filter, rank, resample</h2>
+  <p>In an LLM, the MDP from <a data-ch="rl-fundamentos">chapter 54</a> can be read as a <span class="la-term" data-term="bandit-contextual">contextual bandit</span>: the state is the prompt \(x\), the action is the whole response \(y\), and the reward arrives at the end. Since \(\log\pi_\theta(y\mid x) = \sum_t\log\pi_\theta(y_t\mid x, y_{&lt;t})\), weighted maximum likelihood is just an SFT in which every token of response \(i\) carries the same weight \(w_i\):</p>
+  <div class="la-eq">
+    \[ \mathcal L(\theta)=-\sum_{x}\sum_{i=1}^{K}w_i(x)\sum_{t=1}^{|y_i|}\log\pi_\theta\big(y_{i,t}\mid x,\,y_{i,&lt;t}\big),\qquad y_1,\dots,y_K\sim\pi_{\text{sample}}(\cdot\mid x) \]
+    <ul class="la-eq-legend">
+      <li>\(K\): responses sampled per prompt (from the current model or from an earlier version)</li>
+      <li>\(w_i(x)\): the weight of response \(i\); the table below shows the choices</li>
+      <li>\(\pi_{\text{sample}}\): whoever generated the responses; with samples from the model itself, the method is <i>semi-on-policy</i></li>
+    </ul>
+  </div>
+  <p>The GRPO paper (DeepSeekMath) offers a handy lens for comparing all of this: the <b>gradient coefficient</b> of each token. In SFT it is 1 on every target token. In <span class="la-term" data-term="rft">RFT</span> it is 1 on correct responses and 0 on wrong ones. In PPO it is the advantage \(\hat A_t\), which can be negative. In weighted SFT it is \(w_i\), constant along the response and <b>never negative</b>. That detail will weigh in when it is time to choose.</p>
+  <table class="la-params">
+    <thead><tr><th>Scheme</th><th>Weight \(w_i\)</th><th>Examples</th></tr></thead>
+    <tbody>
+      <tr><td>Plain SFT / “Preferred-FT”</td><td>1 on the chosen responses</td><td>DPO's baseline; the initialization of \(\pi_{\text{ref}}\)</td></tr>
+      <tr><td>AWR</td><td>\(e^{A_i/\beta}\), with clipping</td><td>AWR/AWAC; <span class="la-term" data-term="a-lol">A-LoL</span>, which treats the whole sequence as a single action and trains only on the positive-advantage data</td></tr>
+      <tr><td>RWR / ReST-EM</td><td>\(\propto r_i\) (rewards ≥ 0) or \(e^{r_i/\beta}\)</td><td><span class="la-term" data-term="rest-em">ReST-EM</span>: E-step \(q\propto p(O{=}1\mid x,y)\,p_{\theta_t}(y\mid x)\), M-step = weighted NLL</td></tr>
+      <tr><td>Threshold filter</td><td>\(\mathbb 1[R(x,y)&gt;\tau]\)</td><td><span class="la-term" data-term="rest">ReST</span>: Grow (generate) + Improve (filter with thresholds \(\tau_1&lt;\tau_2&lt;\dots\) and fine-tune)</td></tr>
+      <tr><td>Binary (verifiable)</td><td>\(\mathbb 1[\text{correct}]\)</td><td>ReST-EM (MATH and APPS, PaLM 2), <span class="la-term" data-term="star">STaR</span>, RFT</td></tr>
+      <tr><td>Argmax (<span class="la-term" data-term="best-of-n">best-of-K</span>)</td><td>\(\mathbb 1[i=\arg\max_j r_j]\)</td><td><span class="la-term" data-term="raft">RAFT</span>; Llama 2's rejection sampling fine-tuning</td></tr>
+    </tbody>
+  </table>
+  <p>The table looks like a zoo, but it is a single family. With normalized weights \(e^{A/\beta}\), \(\beta\to 0\) becomes the argmax (RAFT, best-of-K) and \(\beta\to\infty\) becomes uniform SFT on everything that was sampled. Intermediate values interpolate, and the threshold filter and the binary weight are “steps” in place of the exponential. See it with the same four samples as before, \(R = (1.0,\ 0.0,\ 0.5,\ 0.2)\), baseline \(V = 0.425\) and advantages \(A = (0.575,\ -0.425,\ 0.075,\ -0.225)\):</p>
+  <figure class="la-fig" id="fig-espectro" data-title="The weighted-SFT spectrum: from uniform to best-of-K">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Four responses to the same prompt (the characters), with the rewards from the toy example. The token strips are painted with each scheme's gradient coefficient (the intensity is the normalized weight). With AWR, the \(\beta\) slider sweeps the spectrum; with clipping on, \(\omega_{\max}=20\). In ReST, the selector raises the threshold \(\tau_1&lt;\tau_2&lt;\tau_3\) as in the Improve steps, and the kept subset shrinks; in ReST-EM, the rule is fixed (a binary verifier that here approves \(R\ge0.5\)). The <span class="la-term" data-term="tamanho-efetivo-amostra">effective sample size</span> says how many “real” responses are sustaining the gradient. <b>Illustrative</b> example; the weights are computed on the fly.</figcaption>
+  </figure>
+  <p>Three numbers in the figure deserve attention. With \(\beta = 0.05\) and no clipping, the raw weights are \((98{,}715.8,\ 0.0002,\ 4.48,\ 0.011)\), and normalization gives \((1,\ 0,\ 0,\ 0)\): it has turned into best-of-4. With the clip \(\omega_{\max} = 20\), the first response is demoted to 20 while the third keeps its 4.48, and the normalized weights become \((0.8166,\ 0.0,\ 0.1830,\ 0.0005)\): the clip gives the runner-up a voice again. With \(\beta = 10\), what's left is \((0.2646,\ 0.2394,\ 0.2517,\ 0.2443)\), almost a uniform SFT, which also imitates the zero-reward response.</p>
+  <h3>RAFT: the best of K</h3>
+  <p><span class="la-term" data-term="raft">RAFT</span> (<i>Reward rAnked FineTuning</i>, Dong et al.) is the \(\beta\to0\) case, embraced outright. It generates \(K\) responses with sampling temperature \(\lambda\), keeps the one with the highest reward and fine-tunes on it. The experiments use \(K\in\{8, 16, 32\}\) with \(\lambda = 0.85\). How far does the resulting policy move from the reference? For <span class="la-term" data-term="best-of-n">best-of-n</span> there is a classic formula, used by Stiennon et al. and by Gao et al.:</p>
+  <div class="la-eq">
+    \[ \mathbb D_{\text{KL}}\big(\pi_{\text{bon}}\,\|\,\pi_{\text{ref}}\big)\ \le\ \log n-\frac{n-1}{n} \]
+    <ul class="la-eq-legend">
+      <li>\(\pi_{\text{bon}}\): the distribution of “generate \(n\) and keep the best”</li>
+      <li>the bound is: \(n = 4\): 0.6363 nat; \(n = 16\): 1.8351; \(n = 64\): 3.1745; \(n = 1{,}000\): 5.9088</li>
+      <li>Table 9 of Stiennon et al. lists 1.2 / 3.2 / 3.9 nats for \(N\) = 8 / 64 / 128, the formula's values (1.20 / 3.17 / 3.86)</li>
+    </ul>
+  </div>
+  <p>The formula is often quoted as an equality, but Beirami et al. (2024) show that it is an <span class="la-term" data-term="kl-best-of-n">upper bound</span>: nearly exact when the \(n\) responses are all distinct and the reward has no ties (long LLM responses), loose with a binary reward or few possible responses. With a verifier that only says “right” or “wrong” and random tie-breaking, best-of-\(n\) returns some correct response, and the KL never exceeds \(-\log P(\text{correct})\), however large \(n\) is; the expert iteration figure shows the two numbers side by side. For long responses, the KL grows only with \(\log n\): moving some 6 nats takes at least a thousand samples per prompt. The reward gain saturates too: RAFT shows that, with a bounded reward, the average gain of best-of-\(K\) is bounded by something proportional to \(\sqrt{\log K}\), and the marginal return of increasing \(K\) falls quickly. That is why people <b>iterate</b>: instead of one best-of-1000, ten rounds of best-of-16, each one starting from the previous round's model.</p>
+  <h3>ReST and ReST-EM: the loop as EM</h3>
+  <p><span class="la-term" data-term="rest">ReST</span> (<i>Reinforced Self-Training</i>, Gulcehre et al.) splits the loop into two phases. In <b>Grow</b>, the policy generates a dataset. In <b>Improve</b>, the dataset is filtered by increasing thresholds \(\tau_1&lt;\tau_2&lt;\dots\), with \(\tau_1\) above the policy's mean value, and the model is fine-tuned on ever smaller and better subsets, each new policy starting from the previous one with a smaller LR. Among the losses tested in Improve (OAC, BVMPO, GOLD), plain <i>behavior cloning</i> (NLL) was the best, on machine translation. The authors warn that filtering by threshold can favor high-variance outcomes in stochastic environments, and they treat translation as deterministic.</p>
+  <p><span class="la-term" data-term="rest-em">ReST-EM</span> (Singh et al., “Beyond Human Data”) reads the same loop as EM, with a binary reward on MATH and APPS. The E-step builds \(q(y\mid x)\propto p(O{=}1\mid x,y)\,\pi_{\theta_t}(y\mid x)\), where \(O=1\) means “the response is good”. The M-step fits the model by weighted NLL. It is exactly the calculation from the EM deep dive in the RWR section, with \(p(O{=}1\mid x,y)=\mathbb 1[\text{correct}]\). Now put the pieces together. If you choose \(p(O{=}1\mid x,y)\propto e^{r/\beta}\), the E-step becomes \(q\propto\pi_{\theta_t}\,e^{r/\beta}\): the same tilting as in the first section, with the <b>current policy</b> as the reference. Iterating, in the nonparametric limit, composes the tilts (our derivation):</p>
+  <div class="la-eq">
+    \[ \pi_{k}\ \propto\ \pi_{k-1}\,e^{r/\beta}\ \propto\ \pi_0\,e^{k\,r/\beta}=\pi_0\,e^{r/(\beta/k)} \]
+    <ul class="la-eq-legend">
+      <li>\(\pi_0\): the initial model; \(k\): the number of iterations of the generate → filter → fit loop</li>
+      <li>each round divides the effective temperature: after \(k\) rounds, it is like a single step with \(\beta/k\)</li>
+      <li>consequence: the loop marches toward the argmax and, along with it, <b>diversity drops</b>; in practice, partial fitting and sampling noise slow this collapse down</li>
+    </ul>
+  </div>
+  <h3>STaR, RFT and R1's stage 3</h3>
+  <p>The same loop, with a binary verifier, goes by several names, usually lumped together as <span class="la-term" data-term="expert-iteration">expert iteration</span>: sample \(k\) responses per prompt, keep the correct ones, do SFT on them (sometimes mixed with the original data) and repeat with the new model. <span class="la-term" data-term="star">STaR</span> (Zelikman et al., 2022) adds “rationalization”: for the questions the model gets wrong, it receives the right answer as a hint, generates a justification and trains on it. This plugs the filter's hole, because the hard prompts, with no correct sample, would otherwise produce no data at all. <span class="la-term" data-term="rft">RFT</span> (Yuan et al., 2023) took LLaMA-7B from 35.9% (SFT) to 49.3% on GSM8K by combining accepted samples from several models; the gain grows with the number of <i>distinct</i> reasoning paths and is larger for weaker models. In Llama 2, rejection sampling fine-tuning provided the <b>breadth</b> (\(K\) samples per prompt, keep the best one according to the reward model) and PPO the <b>depth</b>: up to RLHF V4 there was only rejection sampling; after that, PPO ran on top of its checkpoint before sampling again. And DeepSeek-R1's stage 3 is RFT at scale, as in the chapter's opening. The <code>R1-Distill-*</code> models (Qwen and Llama) are nothing but SFT on those ~800k examples.</p>
+  <figure class="la-fig" id="fig-iteracao" data-title="Expert iteration live: generate, filter, imitate">
+    <div class="la-fig-stage" style="height:480px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>A toy model chooses among 8 solution “strategies”, each with its own chance of success (amber diamonds). Each round: 12 prompts of varying difficulty receive \(K\) samples each (a matrix of cells, green ✓ and red ✗); the filter keeps the correct ones (or weighs all of them by \(e^{A/\beta}\) in AWR mode); the policy (mint bars) is refit on the kept samples. The charts track the success rate and the policy's entropy per round. Gray rows in the matrix are prompts with no success at all, which produce no data in any mode. In AWR mode, each cell's opacity is its weight, and prompts with no reward variance (all wrong or all right) are left out, as in the code in the last section: without that, zero advantage would turn into a uniform weight and an SFT on the wrong responses. The “target KL” readout is the exact KL between the round's expected target and \(\pi\). In best-of-K mode it appears next to the bound \(\log K-(K-1)/K\): with a binary verifier the target is just “\(\pi\) conditioned on success”, and in this toy the KL barely depends on \(K\). Everything is <b>illustrative</b>; the fit is the weighted maximum likelihood with mixing \(\eta = 0.6\), which mimics finite SFT steps.</figcaption>
+  </figure>
+  <div class="la-callout warn"><b class="t">The limits of the regression road</b><p><b>Sample ceiling:</b> the method only imitates what has already been generated. If the right answer never shows up among the \(K\), the prompt teaches nothing (that is why STaR exists). <b>Half the signal:</b> RFT throws the wrong responses away. It is a policy gradient with a binary reward in which only the positives survived (our interpretation), and it does not “push down” the mistakes. PPO and GRPO use both signals (GRPO only on prompts that mix successes and failures). <b>Diversity:</b> iterating cools the effective temperature, and entropy falls round after round. Measure pass@k, not just pass@1. <b>A gullible judge:</b> with a reward model in place of a verifier, the filter also selects the RM's errors. It is the Goodhart over-optimization from <a data-ch="preferencias-reward-models">chapter 53</a>, and for best-of-n it is studied as a function of \(\sqrt{\mathrm{KL}}\), with the KL estimated by the formula above.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Contrast: one against many (InfoNCE)</h2>
+  <p>The second road does not weight examples: it <b>compares</b> them. The cleanest idea in this family comes from representation learning. In CPC (<i>Contrastive Predictive Coding</i>, van den Oord, Li &amp; Vinyals, 2018), given a context \(c_t\), you build a set \(X=\{x_1,\dots,x_N\}\) with <b>one positive</b>, drawn from the true conditional distribution \(p(x_{t+k}\mid c_t)\), and \(N-1\) <b>negatives</b>, drawn from a proposal \(p(x_{t+k})\). The <span class="la-term" data-term="infonce">InfoNCE</span> loss (Eq. 4) is the cross-entropy of “finding the positive in the crowd”:</p>
+  <div class="la-eq">
+    \[ \mathcal L_N=-\mathbb E_X\Big[\log\frac{f_k(x_{t+k},c_t)}{\sum_{x_j\in X}f_k(x_j,c_t)}\Big],\qquad I(x_{t+k};c_t)\ \ge\ \log N-\mathcal L_N \]
+    <ul class="la-eq-legend">
+      <li>\(f_k(x,c)\): any positive score; in practice \(f=e^{s}\), and \(s\) comes out of a network</li>
+      <li>\(N\): the size of the set (1 positive and \(N-1\) negatives)</li>
+      <li>\(I(\cdot;\cdot)\): the <span class="la-term" data-term="informacao-mutua">mutual information</span>; \(\log N-\mathcal L_N\) is a lower bound, tighter for larger \(N\)</li>
+    </ul>
+  </div>
+  <p>The optimum of the loss is \(f_k\propto p(x_{t+k}\mid c_t)/p(x_{t+k})\), a density ratio, whatever \(N\) is. And the gradient with respect to the scores \(s_j=\log f_j\) reveals the mechanism (it is the standard derivative of cross-entropy with softmax):</p>
+  <div class="la-eq">
+    \[ \frac{\partial\mathcal L}{\partial s_j}=p_j-\mathbb 1[j=+],\qquad p_j=\frac{e^{s_j}}{\sum_{k}e^{s_k}} \]
+    <ul class="la-eq-legend">
+      <li>positive (\(j=+\)): pushed up with strength \(1-p_+\), the share it has not “won” yet</li>
+      <li>each negative: pushed down with strength \(p_j\), the probability it is stealing</li>
+      <li>the most confusing negatives, the <span class="la-term" data-term="negativo-dificil">hard negatives</span>, get the biggest shoves; the ones already ruled out receive almost no gradient</li>
+    </ul>
+  </div>
+  <p>Now the bridge. With <b>a single negative</b> and the score \(s(y)=\beta\log\frac{\pi_\theta(y\mid x)}{\pi_{\text{ref}}(y\mid x)}\), InfoNCE becomes exactly the DPO loss:</p>
+  <div class="la-eq">
+    \[ -\log\frac{e^{s(y_w)}}{e^{s(y_w)}+e^{s(y_l)}}=-\log\sigma\big(s(y_w)-s(y_l)\big)=-\log\sigma\Big(\beta\log\tfrac{\pi_\theta(y_w\mid x)}{\pi_{\text{ref}}(y_w\mid x)}-\beta\log\tfrac{\pi_\theta(y_l\mid x)}{\pi_{\text{ref}}(y_l\mid x)}\Big) \]
+    <ul class="la-eq-legend">
+      <li>\(\sigma\): the <span class="la-term" data-term="sigmoide">sigmoid</span>; \(e^{a}/(e^{a}+e^{b})=\sigma(a-b)\)</li>
+      <li>DPO's “adaptive weight”, \(\sigma(-\beta\Delta h)\), is InfoNCE's \(1-p_+\) with \(N=2\)</li>
+      <li>with rankings of \(K\) responses, DPO's Plackett–Luce is a sum of nested InfoNCEs: each term is a softmax of one item against all the worse ones</li>
+    </ul>
+  </div>
+  <p>In numbers (illustrative example): a positive with score 2.0 and negatives with 1.0, 0.5 and −0.5. With \(N=4\), \(\mathcal L = 0.5147\), and the mutual information bound is \(\log 4 - 0.5147 = 0.8716\) nat. With only the first negative, \(\mathcal L = 0.3133 = -\log\sigma(2.0-1.0)\), the same number as a DPO with margin 1.</p>
+  <figure class="la-fig" id="fig-infonce" data-title="One against many: the softmax that finds the positive">
+    <div class="la-fig-stage" style="height:430px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>The positive (mint, in the center) and \(N-1\) negatives (pink) on a wheel; each character's size is its share of the softmax \(p_j\). The arrows show the gradient: the positive goes up with \(1-p_+\), each negative goes down with \(p_j\). “Train” applies descent steps to the scores and shows the loss falling. The first three negatives are the ones from the example in the text (1.0, 0.5, −0.5); the rest are <b>illustrative</b>. With \(N=2\), the panel shows the equivalence with the DPO loss.</figcaption>
+  </figure>
+  <div class="la-callout deep"><b class="t">Deep dive: why the density ratio?</b><p>Think of the ideal classifier that looks at the \(N\) candidates and has to say which one came from \(p(x\mid c)\). The posterior probability that candidate \(j\) is the positive is proportional to \(p(x_j\mid c)\prod_{k\ne j}p(x_k)\), which, divided by the product of all the \(p(x_k)\), becomes proportional to \(p(x_j\mid c)/p(x_j)\). That is why the optimal score is the ratio, and that is why CPC learns representations: to estimate the ratio well, the network has to capture what \(c\) says about \(x\), in other words, the mutual information. In DPO, the “context” is the prompt, and the ratio the score learns is \(\pi_\theta/\pi_{\text{ref}}\).</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>SLiC and SLiC-HF: calibrating with a margin and an anchor</h2>
+  <p>Before DPO, people were already doing alignment by contrast with <span class="la-term" data-term="slic">SLiC</span> (<i>Sequence Likelihood Calibration</i>, Zhao et al., 2022). The motivation was different: models trained by maximum likelihood produce poorly calibrated <i>sequence</i> probabilities. One response can be more likely than a better one. SLiC is a third stage, after fine-tuning: it decodes \(m\) candidates \(\{\hat y\}_m\) from the model itself and trains with a calibration loss plus a regularization term:</p>
+  <div class="la-eq">
+    \[ \mathcal L(\theta)=\sum_b\mathcal L^{\text{cal}}\big(\theta,s;x,\bar y,\{\hat y\}_m\big)+\lambda\,\mathcal L^{\text{reg}}\big(\theta,\theta_{ft};x,\bar y\big),\qquad \mathcal L^{\text{cal}}_{\text{rank}}=\max\big(0,\ \beta-\log P_\theta(\hat y^+\mid x)+\log P_\theta(\hat y^-\mid x)\big) \]
+    <ul class="la-eq-legend">
+      <li>\(\bar y\): the reference target; \(s\): the candidate's similarity to the target, in the style of BERTScore (which compares two texts by matching the contextual vectors of their tokens, instead of counting identical n-grams), here computed over the decoder's own hidden states</li>
+      <li>\(\hat y^+,\hat y^-\): two candidates, the most similar and the least similar to the target</li>
+      <li>\(\beta\) (here): the ranking margin; \(\theta_{ft}\): the weights of the fine-tuned model, used by the regularization</li>
+      <li>\(\mathcal L^{\text{reg}}\): cross-entropy on the target tokens, or per-token KL to the fine-tuned model</li>
+    </ul>
+  </div>
+  <p>The paper tested four calibration losses: <i>rank</i> (the one in the equation), <i>margin</i> (the margin becomes proportional to the similarity gap), <i>list rank</i> (the BRIO loss, a 2022 summarization method that trains the model to order candidates by quality, with margin \(\beta|i-j|\) between positions \(i\) and \(j\) in the ranking) and <i>expected reward</i>. <b>Rank</b> came out on top, followed by margin, list rank and expected reward. It is the classic <span class="la-term" data-term="perda-hinge">hinge loss</span>: zero if the positive already beats the negative by the margin, linear otherwise.</p>
+  <h3>SLiC-HF: the same hinge, with human preferences</h3>
+  <p><span class="la-term" data-term="slic">SLiC-HF</span> (Zhao et al., 2023) swaps similarity to the target for human preferences (Eq. 4):</p>
+  <div class="la-eq">
+    \[ \mathcal L(\theta)=\max\big(0,\ \delta-\log P_\theta(y^+\mid x)+\log P_\theta(y^-\mid x)\big)\;-\;\lambda\log P_\theta(y_{\text{ref}}\mid x) \]
+    <ul class="la-eq-legend">
+      <li>\(y^+,y^-\): the preferred and the rejected response; \(\delta\): the margin (1.0 in the paper)</li>
+      <li>\(y_{\text{ref}}\): the target of the regularization term (the SFT response, or the best candidate according to a ranker or RM)</li>
+      <li>\(\lambda\): the anchor's weight; the cross-entropy plays the role of the KL “without needing an extra copy of the SFT weights”</li>
+    </ul>
+  </div>
+  <p>There are two variants. In <i>sample-rank</i>, the candidates are sampled from the SFT model and ranked by a pointwise RM or by a pairwise ranker (a T5-XXL, the most accurate option). In <i>direct</i>, the loss uses the human pairs directly: simpler, but off-policy. The reported values (T5, TL;DR) are LR \(10^{-5}\), margin 1.0 and 8 samples with temperature 0.7 and top-k 40. Using KL in place of the cross-entropy, tested in the original SLiC, performed about the same.</p>
+  <p>Compare it with DPO on three points. <b>1.</b> SLiC uses the <i>raw</i> log-prob, with no reference, and the anchor comes only from the cross-entropy. Swapping it for the log-ratio \(h=\log\pi_\theta/\pi_{\text{ref}}\) yields the <code>hinge</code> loss of RSO and TRL, \(\max(0,\ 1-\beta\,\Delta h)\), where \(\beta\) is the reciprocal of the margin. <b>2.</b> The hinge <b>zeroes out</b> the gradient beyond the margin, while DPO's logistic only decays and never stops pushing. <b>3.</b> According to the KTO analysis, SLiC is not a <span class="la-term" data-term="halo">HALO</span>: the cross-entropy does not respect that family's constraints.</p>
+  <figure class="la-fig" id="fig-dobradica" data-title="Ramp, hinge and parabola">
+    <div class="la-fig-stage" style="height:420px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Loss as a function of the margin \(m\) between preferred and rejected: DPO's logistic \(-\log\sigma(\beta m)\) (mint), SLiC's hinge \(\max(0,\delta-m)\) (pink) and, for comparison, IPO's parabola \((m-\tfrac{1}{2\tau})^2\) with \(\tau=1\) (lavender). Below, the force each loss exerts on the pair (\(-\partial\mathcal L/\partial m\)). The dot is a pair in training: “train” moves the margin by gradient descent under each loss. The hinge parks at the margin; the logistic keeps going, slower and slower. Exact curves; the dynamics are <b>illustrative</b>.</figcaption>
+  </figure>
+  <p>The lack of a reference has a side effect that a toy example makes plain. Consider a pair in which the preferred response has 20 tokens and log-prob \(-25\) and the rejected one has 10 tokens and log-prob \(-17\). The preferred one is longer, hence less likely as a sequence. What changes between the methods is the <b>sign of the margin</b>. SLiC-HF looks at the raw log-prob and sees the pair inverted: \(m = -25-(-17) = -8\), loss \(\max(0,\ 1+8) = 9.0\) and a gradient of 1 per unit of margin, as if the pair were badly wrong. With the reference (log-probs \(-26\) and \(-15\)), the log-ratio gives \(\Delta h = (-25+26)-(-17+15) = +3\): the pair is in the right order. DPO, with \(\beta = 0.5\), barely pushes (force 0.09 in the figure). TRL's <code>hinge</code> with \(\beta=0.1\) still gives \(\max(0,\ 1-0.3) = 0.7\), because the effective margin in \(\Delta h\) is \(1/\beta = 10\), but the gradient per unit of \(\Delta h\) is only \(\beta = 0.1\). Comparing 9.0 with 0.7 mixes scales; the robust fact is that the reference “discounts” the length and flips the pair back. Without it, the method is pushed to inflate the probability of long sequences, the same problem SimPO solved with the per-token mean in <a data-ch="ipo-kto-simpo">chapter 58</a>.</p>
+</section>
+
+<section class="la-sec">
+  <h2>CPL: preferences as regret</h2>
+  <p>The methods so far treat the whole response as one action. <span class="la-term" data-term="cpl">CPL</span> (<i>Contrastive Preference Learning</i>, Hejna et al., ICLR 2024) goes back to real RL, with states and actions in sequence (robots, agents), and asks a modeling question: <i>what</i> does a human compare when they prefer one stretch of behavior over another? The classic RLHF assumption is that they compare the sum of the stretch's rewards. CPL adopts the alternative argued for by Knox et al.: the human compares the <span class="la-term" data-term="arrependimento">regret</span>, how far each stretch falls short of optimal behavior. This yields a preference model based on the <b>optimal advantage</b> (Eq. 2):</p>
+  <div class="la-eq">
+    \[ P_{A^*}\big[\sigma^+\succ\sigma^-\big]=\frac{\exp\sum_{\sigma^+}\gamma^tA^*(s^+_t,a^+_t)}{\exp\sum_{\sigma^+}\gamma^tA^*(s^+_t,a^+_t)+\exp\sum_{\sigma^-}\gamma^tA^*(s^-_t,a^-_t)} \]
+    <ul class="la-eq-legend">
+      <li>\(\sigma^+,\sigma^-\): the preferred and rejected segments, sequences of pairs \((s_t,a_t)\)</li>
+      <li>\(A^*\): the advantage under the optimal policy; summing \(A^*\) along the segment measures “how much was lost” relative to the optimum</li>
+      <li>\(\gamma\): the discount</li>
+    </ul>
+  </div>
+  <p>Now comes the trick. In <span class="la-term" data-term="rl-maxima-entropia">maximum-entropy RL</span> (Ziebart), the optimal policy is \(\pi^*(a\mid s)=e^{A^*_r(s,a)/\alpha}\), so \(A^*_r(s,a)=\alpha\log\pi^*(a\mid s)\) (Eq. 3). It is a bijection between advantage and policy, and it lets you swap the advantage for the log-probability in the preference formula. No need to learn a reward, or an advantage, or to run RL. Out comes a purely supervised loss (Eq. 5):</p>
+  <div class="la-eq">
+    \[ \mathcal L_{\text{CPL}}=\mathbb E_{(\sigma^+,\sigma^-)}\Bigg[-\log\frac{\exp\sum_{\sigma^+}\gamma^t\alpha\log\pi_\theta(a^+_t\mid s^+_t)}{\exp\sum_{\sigma^+}\gamma^t\alpha\log\pi_\theta(a^+_t\mid s^+_t)+\exp\sum_{\sigma^-}\gamma^t\alpha\log\pi_\theta(a^-_t\mid s^-_t)}\Bigg] \]
+    <ul class="la-eq-legend">
+      <li>\(\alpha\): the maximum-entropy temperature; it scales the log-probs like DPO's \(\beta\)</li>
+      <li>it is an instance of <span class="la-term" data-term="nce">NCE</span> (<i>noise-contrastive estimation</i>, Gutmann &amp; Hyvärinen, 2010: learning an unnormalized model by training it to tell real data apart from “noise” samples), here with one negative; with rankings and Plackett–Luce, CPL recovers InfoNCE, the “one against many” version</li>
+      <li>convex, fully off-policy, and valid for arbitrary MDPs (sequential segments)</li>
+    </ul>
+  </div>
+  <p>The guarantees: with unlimited data coming from a <span class="la-term" data-term="ruidoso-racional">noisy-rational</span> regret model (the human picks the lower-regret stretch more often, but not always: with the probability of Eq. 2, as in a Bradley–Terry model), CPL recovers \(\pi^*\) (Theorem 1), and it always learns a <i>consistent</i> advantage, that is, the optimal policy of <i>some</i> reward (Proposition 1). The trouble shows up with finite data. The comparison matrix has a nontrivial null space, there are infinitely many minimizers, and some of them put mass on actions that never appeared in the dataset. The fix is a conservative “bias” regularizer, which multiplies the negative's term by \(\lambda\in(0,1)\) (Eq. 6):</p>
+  <div class="la-eq">
+    \[ \mathcal L_{\text{CPL}(\lambda)}=\mathbb E\Bigg[-\log\frac{\exp\sum_{\sigma^+}\gamma^t\alpha\log\pi_\theta(a^+_t\mid s^+_t)}{\exp\sum_{\sigma^+}\gamma^t\alpha\log\pi_\theta(a^+_t\mid s^+_t)+\exp\lambda\sum_{\sigma^-}\gamma^t\alpha\log\pi_\theta(a^-_t\mid s^-_t)}\Bigg] \]
+    <ul class="la-eq-legend">
+      <li>\(\lambda=1\): “vanilla” CPL; \(\lambda&lt;1\): the negative's term shrinks</li>
+      <li>effect: raising the log-prob of the positive <i>and</i> of the negative by the same amount now lowers the loss, which favors actions seen in the dataset</li>
+    </ul>
+  </div>
+  <p>Numbers (illustrative example, \(\alpha=0.1\), log-prob sums \(-25\) and \(-17\), \(\gamma=1\)): the vanilla loss is 1.1711, and with \(\lambda=0.5\) it is 1.8257. Add 1 nat to both log-probs. The vanilla one stays at 1.1711, because only the difference matters. The conservative one drops to 1.7839: the regularizer rewards putting mass on the dataset's responses.</p>
+  <figure class="la-fig" id="fig-cpl" data-title="Segments, regret and the conservative bias">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Two segments as rows of cells: each cell is one step's \(\log\pi_\theta(a_t\mid s_t)\), and the rows sum to \(-25\) (preferred, 20 steps) and \(-17\) (rejected, 10 steps), as in the toy example. A glowing sweep runs along each row, and next to it the partial sum “Σ up to t” accumulates \(\sum_t\gamma^t\log\pi_\theta\) step by step (\(\gamma=1\)) until it reaches the row's total, which is then multiplied by \(\alpha\). In the chart, the loss as a function of a common shift added to both rows; the “+1 nat on both” button animates that shift: with \(\lambda=1\), the loss stays put; with \(\lambda&lt;1\), it drops. Per-cell values are <b>illustrative</b> (drawn so the sum is exact); losses are computed on the fly.</figcaption>
+  </figure>
+  <p>The kinship with DPO is spelled out in the paper: DPO is a special case of CPL (Appendix A.6), the contextual bandit case, with a one-step episode and the same initial state, in which \(A^*=r_E(s,a)-V^*(s)\) and \(V^*\) cancels between the two sides. You can go one step further with a derivation of ours in an LLM's token MDP (\(s_t=(x,y_{&lt;t})\), \(a_t=y_t\), \(\gamma=1\)). There, the sum \(\sum_t\alpha\log\pi_\theta(y_t\mid x,y_{&lt;t})\) is \(\alpha\log\pi_\theta(y\mid x)\), and CPL with segments equal to complete responses becomes exactly \(-\log\sigma(\alpha\log\pi_\theta(y_w\mid x)-\alpha\log\pi_\theta(y_l\mid x))\). That is CPO's preference loss, in other words a DPO with a <b>uniform reference</b>. It makes sense: maximum entropy is KL regularization against the uniform distribution. And that is why “pure” CPL on an LLM inherits SLiC's length problem: with no reference, the long response looks worse.</p>
+</section>
+
+<section class="la-sec">
+  <h2>Unlikelihood: teaching the model to say “not that”</h2>
+  <p>Maximum likelihood only knows how to say “do more of this”. <span class="la-term" data-term="unlikelihood">Unlikelihood training</span> (Welleck et al., 2019) gives the model a direct way to learn “do <b>less</b> of this”. The motivation was the text degeneration that <a data-ch="geracao-amostragem">chapter 9</a> fought with penalties in the sampler. With greedy decoding, a model trained only by maximum likelihood repeated n-grams in 43% of cases, versus 0.5% in human text. The predicted next token had already appeared in the previous 128 tokens 62% of the time, versus 49% in real text. And the vocabulary shrank: about 40% fewer unique tokens (11.6k versus 18.9k). Unlikelihood moves the sampler's correction into the weights.</p>
+  <div class="la-eq">
+    \[ \mathcal L^t_{\text{UL}}=-\sum_{c\in\mathcal C^t}\log\big(1-p_\theta(c\mid x_{&lt;t})\big),\qquad \mathcal L^t_{\text{UL-token}}=-\alpha\sum_{c\in\mathcal C^t}\log\big(1-p_\theta(c\mid x_{&lt;t})\big)-\log p_\theta(x_t\mid x_{&lt;t}) \]
+    <ul class="la-eq-legend">
+      <li>\(\mathcal C^t\): the negative candidates at step \(t\); in the token-level version, the tokens of the previous context, \(\{x_1,\dots,x_{t-1}\}\setminus\{x_t\}\) (Eq. 5)</li>
+      <li>\(-\log(1-p)\): grows as \(p(c)\) grows; it equals 0.0513 at \(p=0.05\), 0.3567 at \(p=0.3\) and 2.3026 at \(p=0.9\)</li>
+      <li>\(\alpha\): the weight of the negative term; the second term is the usual cross-entropy, the anchor</li>
+    </ul>
+  </div>
+  <p>Notice the shape of \(-\log(1-p)\). For small \(p\) it is roughly \(p\), a gentle nudge. For \(p\) close to 1 it blows up, a violent shove. It is the “negative side” of a binary cross-entropy, which punishes hardest the forbidden candidate that is dominating. The gradient on the logits \(a\), with a single negative (Eq. 6 of the paper), shows where the mass goes:</p>
+  <div class="la-eq">
+    \[ -\nabla_a\mathcal L=x^*-m\odot p,\qquad m_i=\begin{cases}1-\alpha\,\dfrac{p_{\text{neg}}}{1-p_{\text{neg}}} & i\ne i_{\text{neg}}\\[6pt] 1+\alpha & i=i_{\text{neg}}\end{cases} \]
+    <ul class="la-eq-legend">
+      <li>\(x^*\): the one-hot vector of the target token; \(p\): the current softmax; \(\odot\): element-wise product</li>
+      <li>\(-\nabla_a\mathcal L\) is the direction in which the logits move in a descent step (we checked the sign by differentiating the loss)</li>
+      <li>the negative goes down with strength \((1+\alpha)\,p_{\text{neg}}\), more than under plain cross-entropy; the other tokens go down <i>less</i> (\(m_i&lt;1\)) and inherit the freed mass</li>
+      <li>if \(\alpha\,p_{\text{neg}}/(1-p_{\text{neg}})&gt;1\) (for example, \(\alpha=1\) and \(p_{\text{neg}}&gt;0.5\)), \(m_i\) turns negative and the other tokens' logits actually <b>rise</b>: the dominant negative is actively drained. The figure below starts in this regime</li>
+    </ul>
+  </div>
+  <p>The sequence-level version (Eq. 7–8) penalizes the tokens that form repeated n-grams in continuations <b>decoded by the model itself</b>. This attacks the mismatch between training and generation: the model is corrected precisely on the mistakes it makes when it generates, and not only on the reference texts.</p>
+  <figure class="la-fig" id="fig-unlikelihood" data-title="Saying “not that”: the mass that leaves the forbidden token">
+    <div class="la-fig-stage" style="height:460px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>At the top, a degenerate continuation (illustrative) with a repeated n-gram in red. In the middle, step \(t\): logits of 8 tokens as cells with values, the softmax \(p\) as bars, the target \(x^*\) (green) and the negative \(c\) from the previous context (red outline). The row of “\(-\nabla\)” cells is \(x^*-m\odot p\). “Step” applies gradient descent steps to the logits. At the bottom, \(-\log(1-p)\) versus \(-\log p\), with the three values from the text marked. Logits are <b>illustrative</b>; gradients are exact.</figcaption>
+  </figure>
+  <h3>The relative that went wrong: DPO's “Unlikelihood” baseline</h3>
+  <p>The DPO paper tests a baseline by that name: maximize \(\log p(y_w)\) and minimize \(\log p(y_l)\) directly, <b>without</b> the adaptive weight \(\sigma(-\beta\Delta h)\), with the coefficient \(\alpha\in[0,1]\) swept over \(\{0.05,\ 0.1,\ 0.5,\ 1\}\) in the sentiment experiment. It was left out of the summarization and dialogue experiments because it produced responses that were “generally meaningless” (Table 3 shows a “when when when…”), which the authors attribute to unconstrained likelihood minimization. The lesson is InfoNCE's: a contrast with no brakes keeps pushing pairs that are already solved, and the mass that leaves \(y_l\) goes to places nobody chose. The brake is the weight that switches off once the pair is well ordered (in DPO) or the cross-entropy anchor (in Welleck's unlikelihood). Our reading: \(-\log(1-p)\) has the spirit of KTO's undesirable side, but with no reference and no saturation.</p>
+</section>
+
+<section class="la-sec">
+  <h2>The family tree and choosing the path</h2>
+  <p>Almost everything in this module fits into a three-part formula: a <b>score</b> \(s_\theta(x,y)\), a <b>contrast function</b> that compares scores (or weights examples) and a <b>regularizer</b> that keeps the model near some safe place. The table is our own synthesis.</p>
+  <table class="la-params">
+    <thead><tr><th>Method</th><th>Score \(s_\theta(x,y)\)</th><th>Contrast</th><th>Anchor / regularization</th></tr></thead>
+    <tbody>
+      <tr><td>DPO</td><td>\(\beta\log\frac{\pi_\theta}{\pi_{\text{ref}}}\)</td><td>logistic on \(s_w-s_l\)</td><td>\(\pi_{\text{ref}}\), inside the score</td></tr>
+      <tr><td>IPO</td><td>\(\log\frac{\pi_\theta}{\pi_{\text{ref}}}\)</td><td>quadratic toward the target \(1/(2\tau)\)</td><td>\(\pi_{\text{ref}}\) + finite target</td></tr>
+      <tr><td>KTO</td><td>\(\log\frac{\pi_\theta}{\pi_{\text{ref}}}\)</td><td>sigmoid against the reference point \(z_0\)</td><td>\(\pi_{\text{ref}}\) + \(z_0\) (KL)</td></tr>
+      <tr><td>SimPO</td><td>\(\frac{\beta}{|y|}\log\pi_\theta\)</td><td>logistic with margin \(\gamma\)</td><td>none explicit (small LR)</td></tr>
+      <tr><td>CPO / CPL (bandit)</td><td>\(\beta\log\pi_\theta\)</td><td>logistic</td><td>NLL (CPO) / bias \(\lambda\) on the negatives (CPL)</td></tr>
+      <tr><td>SLiC-HF</td><td>\(\log\pi_\theta\)</td><td>hinge with margin \(\delta\)</td><td>cross-entropy on the target</td></tr>
+      <tr><td>InfoNCE</td><td>any \(f(x,c)\)</td><td>softmax, 1 against \(N\)</td><td>—</td></tr>
+      <tr><td>Unlikelihood</td><td>\(p_\theta(c)\) per token</td><td>\(-\log(1-p)\)</td><td>target NLL</td></tr>
+      <tr><td>AWR / RAFT / ReST</td><td>— (does not contrast)</td><td>weight \(e^{A/\beta}\), \(\mathbb 1[\cdot]\) or argmax</td><td>it is SFT itself: stays within the data's support</td></tr>
+    </tbody>
+  </table>
+  <p>The figure connects the methods through the transformations that lead from one to another. Some edges are written in the papers: DPO is a special case of CPL; with rankings, CPL recovers InfoNCE; the closed form DPO uses comes from Peng et al. and from Peters &amp; Schaal, as the KTO paper records; and, in DPO's author contributions, one of the authors “initiated the discussion around using weighted regression methods as an alternative to PPO”. Others are our own derivations, marked as such: “DPO = InfoNCE with one negative”, “CPL in the token MDP = CPO” and “AWR, ReST-EM and DPO share the tilted optimum”.</p>
+  <figure class="la-fig wide" id="fig-parentesco" data-title="The family tree: regression, contrast and RL">
+    <div class="la-fig-stage" style="height:500px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Click a method (or pick one from the list) to light up its relatives and read, on each edge, the transformation that leads from one to the other. In the “what each one requires” view, the same list becomes a matrix of cells: does it need \(\pi_{\text{ref}}\)? a reward model or verifier? generation during training? what kind of data? Dashed edges are our own <b>derivations</b>; solid ones are written in the papers.</figcaption>
+  </figure>
+  <h3>When to regress or contrast instead of doing RL</h3>
+  <p>The guide below is our interpretation, assembled from the papers' own recommendations. It is not a rule.</p>
+  <ol class="la-steps">
+    <li><b>Verifiable reward and cheap generation</b> (math, code with tests): start with RFT, ReST-EM or RAFT. It is SFT, so it is stable, cheap to debug and needs no critic or reward model. When the loop stalls, tell the two symptoms apart. <b>(a)</b> On prompts with a mix of successes and failures, the wrong responses are being thrown away: move on to <a data-ch="grpo-rlvr">GRPO</a> (or PPO) to use them as a negative signal. <b>(b)</b> On prompts with no success at all, GRPO does not help: every reward in the group is equal, every advantage is zero and the prompt yields no gradient, the same hole as the filter's. In that case, increase \(K\) or the temperature, give the answer as a hint (STaR's rationalization), use a curriculum with easier variants, partial or process rewards, or do SFT on reference solutions.</li>
+    <li><b>Scalar reward and offline logs</b> (an RM, user ratings, data from another policy): weight AWR-style (advantage centered per prompt, \(\beta\) and \(\omega_{\max}\), or A-LoL with positive advantage). Remember that the method never leaves the support of the samples.</li>
+    <li><b>Preference pairs</b>: the DPO family from chapters <a data-ch="dpo">57</a> and <a data-ch="ipo-kto-simpo">58</a>. SLiC-HF's hinge is a historical alternative: a reference-based version of it (RSO's, over log-ratios) lives in TRL as <code>loss_type="hinge"</code>, but the original SLiC-HF (raw log-prob + cross-entropy) has no dedicated trainer. If the comparisons are between <i>stretches</i> of behavior in a multi-step environment (robots, agents), CPL is the natural formulation.</li>
+    <li><b>A specific behavior to suppress</b> (repetition, a token, a pattern): an unlikelihood term with a small \(\alpha\), always anchored to the cross-entropy. Without an anchor, the contrast degenerates.</li>
+    <li><b>You need to explore beyond what the model already generates, or you need per-token credit</b>: then there is no shortcut, and the way forward is the on-policy RL of chapters <a data-ch="ppo-rlhf">55</a> and <a data-ch="grpo-rlvr">56</a>.</li>
+  </ol>
+  <table class="la-params">
+    <thead><tr><th>Method</th><th>Needs \(\pi_{\text{ref}}\)?</th><th>Data</th><th>Cost per step</th><th>Hyperparameters (published)</th><th>Stability / risk</th></tr></thead>
+    <tbody>
+      <tr><td>AWR / filtered BC (RAFT, ReST)</td><td>not necessarily</td><td>scalar or verifiable reward</td><td>\(K\) generations + RM or verifier + weighted SFT</td><td>\(\beta\) (0.05 in AWR), \(\omega_{\max}\) (20), \(K\) (8–32 in RAFT), threshold \(\tau\)</td><td>very stable (it is SFT); limited by the quality of the samples</td></tr>
+      <tr><td>SLiC-HF</td><td>no (regularizes with cross-entropy; a KL option exists)</td><td>pairs</td><td>2 policy forwards + CE</td><td>\(\delta\) = 1.0; LR \(10^{-5}\) (T5)</td><td>not a HALO; the hinge cuts the gradient off abruptly</td></tr>
+      <tr><td>CPL</td><td>no (maximum entropy = uniform reference)</td><td>segment pairs</td><td>forwards of both segments</td><td>\(\alpha\), \(\lambda\) (conservative bias)</td><td>convex and off-policy; with finite data, it needs the regularizer</td></tr>
+      <tr><td>Unlikelihood</td><td>no</td><td>target + negatives (context or decoded n-grams)</td><td>1 forward (+ decoding in the sequence version)</td><td>\(\alpha\) (sweep 0.05–1 in DPO's baseline)</td><td>without an anchor, it degenerates</td></tr>
+    </tbody>
+  </table>
+  <h3>In practice: the loop in code</h3>
+  <p>The weighted SFT loss is the SFT loss with one extra multiplication. The sketch below is illustrative (PyTorch), in the same style as the DPO chapter's pseudocode: the weights are computed per prompt, with a centered advantage and clipping, and they enter as constants, with no gradient.</p>
+  <pre data-lang="python"><code>import torch, torch.nn.functional as F
+
+def awr_weights(rewards, beta=0.5, w_max=20.0):
+    # rewards: [P, K]  (P prompts, K samples each)
+    adv = rewards - rewards.mean(dim=1, keepdim=True)       # A = R - V(x), V = prompt mean
+    w = torch.exp(adv / beta).clamp(max=w_max)              # clip at omega_max
+    # Prompt with no variance (K wrong, or K right): A = 0 everywhere and e^0 = 1, i.e.,
+    # pure behavior cloning of mu (AWR's implicit anchor). If mu only failed, this is
+    # SFT on the wrong responses. The mask does what GRPO's zero advantage does.
+    valid = (rewards.std(dim=1, keepdim=True) &gt; 0).float()
+    w = w * valid
+    return w / w.sum(dim=1, keepdim=True).clamp(min=1e-8)   # self-normalization per prompt
+
+def weighted_sft_loss(logits, labels, mask, w):
+    # logits [B,T,V] already shifted; mask = 1 on the RESPONSE tokens; w [B] (no gradient)
+    lp = torch.gather(logits.log_softmax(-1), 2, labels.unsqueeze(-1)).squeeze(-1)
+    seq_lp = (lp * mask).sum(-1)                            # log pi(y|x)
+    return -(w.detach() * seq_lp).sum() / mask.sum()        # normalize by the batch's tokens
+
+# usage: R [P, K] -&gt; one weight per sequence, in the SAME order as the batch of P*K responses
+w = awr_weights(R).flatten()                                # [P*K]: prompt 0 (K samples), prompt 1, ...
+loss = weighted_sft_loss(logits, labels, mask, w)</code></pre>
+  <p>Why the <code>valid</code> mask? On a prompt where all \(K\) samples failed, every advantage is zero, the weights become \(1/K\) and the prompt weighs as much as a solved one: imitation of the failures. In the original AWR, without per-prompt normalization, this “weight 1 on everything” is just the implicit anchor to \(\mu\), dominated by the good actions (weights up to 20). The mask also discards prompts where every sample succeeded; with a binary reward, to keep those as plain SFT, use <code>rewards.max(dim=1, keepdim=True).values &gt; 0</code>.</p>
+  <p>The outer loop is where <a data-ch="vllm-arquitetura">Module 1</a> comes back. Generating \(K\) responses per prompt is the expensive part: in OpenRLHF, the inference phase accounts for more than 90% of RLHF or RLVR time, and in Llama 2 generating with the training engine itself (FSDP) was about 20× slower. That is why RAFT, ReST and ReST-EM run generation on an inference engine. <span class="la-term" data-term="continuous-batching">Continuous batching</span> fills the GPU with the \(K\) samples of many prompts, and samples of the same prompt share their prefix, which <a data-ch="prefix-caching">prefix caching</a> takes advantage of (our interpretation of the setup; TRL, for example, exposes <code>use_vllm</code> in its online trainers). A sketch of the outer loop:</p>
+  <pre data-lang="python"><code># illustrative sketch of expert iteration (RFT / ReST-EM) with an inference engine
+import gc, torch
+from vllm import LLM, SamplingParams
+
+for rnd in range(R):
+    llm = LLM(model=current_ckpt)                              # weights from the previous round
+    outs = llm.generate(prompts, SamplingParams(n=K, temperature=0.85, max_tokens=1024))
+    # The engine reserved ~90% of the GPU (gpu_memory_utilization=0.9 by default) for
+    # weights + KV pool. Free it before training on the same GPU, or sft() will OOM.
+    # Alternatives: vLLM in a separate process/server, or enable_sleep_mode=True
+    # and llm.sleep(level=2) between rounds.
+    del llm; gc.collect(); torch.cuda.empty_cache()
+    data = [(p.prompt, o.text) for p in outs for o in p.outputs
+            if verifier(p.prompt, o.text)]                     # binary filter: only the correct ones
+    log(frac_prompts_no_hit(outs), pass_at_k(outs))            # watch the filter's hole
+    current_ckpt = sft(current_ckpt, data, lr=lr_for_round(rnd))  # ReST: smaller LR every round</code></pre>
+  <p>The three middle lines are the most concrete bridge to Module 1. At startup, the <span class="la-term" data-term="profile-run">profile run</span> measures how much is left after the weights, and vLLM preallocates the entire <a data-ch="paged-attention-kv">KV block pool</a>, up to the <span class="la-term" data-term="gpu-memory-utilization">gpu_memory_utilization</span> fraction of memory, so that the <a data-ch="vllm-arquitetura">scheduler</a> never has to ask for memory in the middle of a step. Great for serving, terrible for a loop that alternates generating and training on the same device: as long as <code>llm</code> exists, that 90% stays reserved. On the GB10's unified memory there is an extra wrinkle, seen in <a data-ch="ppo-rlhf">chapter 55</a>: level 1 <span class="la-term" data-term="sleep-mode">sleep mode</span> does not free physical memory; only level 2 does.</p>
+  <p>What to watch, besides the mean reward: the <b>fraction of prompts with no accepted sample</b> (the hole that STaR plugs); the <b>effective sample size</b> of the weights, \((\sum w)^2/\sum w^2\), and the fraction of clipped weights, which reveal whether a handful of examples is carrying the gradient (our suggestion, not the papers'); the <b>entropy</b> or diversity of the generations, and pass@k alongside pass@1, because iterating cools the effective temperature; and the <b>KL to the initial model</b> (each best-of-n round moves, on its own, at most \(\approx\log n - (n-1)/n\) away from the model it started from).</p>
+  <div class="la-callout recipe" data-recipe="glm"><b class="t"><span class="la-rb glm"></span> Bridge to the recipes</b><p>The SFT of GLM-5, the report that the GLM-5.3-Flash card points to as its tech report, used agent data improved with RL on expert models and rejection sampling. The <b>wrong segments of the trajectories stay in the context, but are masked out of the loss</b>. Through the gradient-coefficient lens, it is a weighted SFT with a per-token weight of 0, which teaches how to correct the mistake without reinforcing it. On the weight-editing side, Module 1's GLM recipe has load-time <a data-ch="abliteracao">abliteration</a> (<code>ABLIT=1</code>): it orthogonalizes <code>o_proj</code> against a refusal direction, \(W'=(I-\alpha rr^\top/\|r\|^2)W\), with no training at all. Unlikelihood and DPO do the opposite: they train to make a behavior less likely, and the freed mass goes wherever the model's geometry sends it. Serving the result does not change the inference recipe: same weights, same architecture.</p></div>
+  <p>You have seen that regression and contrast are two ways of reaching the tilted optimum without PPO, and that the “judge” who weighs or compares can be a verifier, a reward model or a human. The <a data-ch="constitutional-ai">next chapter</a> swaps the judge for a set of written principles. In Constitutional AI, the model itself critiques and revises its responses and does SFT on the revisions (a regression on rewritten data, not just filtered data), and then labels preferences that feed an RL stage.</p>
+</section>

@@ -1,0 +1,1525 @@
+LA.chapter({
+  id: 'geracao-amostragem',
+  part: 2,
+  order: 9,
+  title: 'Gerando texto: logits, amostragem e raciocínio',
+  navTitle: 'Geração & amostragem',
+  subtitle: 'Do vetor final ao token escolhido: lm_head, softmax, temperatura, top-p, Gumbel-max, penalidades, determinismo e modelos que pensam antes de responder.',
+  minutes: 65,
+  recipes: ['glm', 'tf', 'qwen', 'ds'],
+  tags: ['logits', 'softmax', 'temperatura', 'top-p', 'Gumbel-max', 'raciocínio', 'determinismo', 'generation_config', 'amostragem com chave'],
+  goals: [
+    'Seguir um passo do <b>laço autoregressivo</b> do estado oculto até o token, com as dimensões reais do <code>lm_head</code> de cada modelo',
+    'Explicar e combinar <b>temperatura, softcap, top-k, top-p, min-p e penalidades</b>, e saber de onde vêm os defaults (<code>generation_config</code>)',
+    'Entender o <b>truque Gumbel-max</b>, as sementes e por que greedy nem sempre é determinístico (patch do Qwen)',
+    'Controlar <b>modelos de raciocínio</b>: esforço, <code>max_tokens</code>, orçamento na GPU e o diagnóstico laço × cauda longa',
+    'Entender a <b>amostragem com chave</b> do TensorFold: por que a mesma requisição dá a mesma resposta e verificar um rascunho vira comparar tokens',
+  ],
+  prereqs: ['bloco-transformer'],
+  summary: [
+    'Gerar é repetir: forward completo → <code>lm_head</code> (<code>[V × d]</code>) → logits → softmax → amostrador → anexar → checar EOS/stop/<code>max_tokens</code>. Toda a aleatoriedade mora no amostrador.',
+    'Temperatura divide os logits (T=0 é greedy); softcap \\(c\\,\\tanh(z/c)\\) e multiplicador de saída são transformações fixas que precisam repetir o treino. Top-p e min-p se adaptam à confiança; top-k não.',
+    'Defaults vêm do <code>generation_config.json</code> (<code>auto</code>) ou do vLLM (<code>vllm</code>); a requisição sempre vence. GLM e Qwen herdam T=1/top_p 0,95; DeepSeek deixa o cliente decidir. O warmup precisa compilar as variantes só-k, só-p e k+p do amostrador.',
+    'Gumbel-max: \\(\\arg\\max(z/T+g)\\) sorteia exatamente da softmax com uma redução, sem normalizar nem sincronizar com a CPU. É o amostrador do Model Runner V2 (que DS e a lane vLLM do GLM rodam, com ruído por contador a partir de semente e posição) e o do seletor do DFlash2; o Model Runner V1 usa a forma equivalente \\(\\arg\\max\\, p/E\\).',
+    'Somas em float não são associativas: greedy só é bit-idêntico com ordem de redução fixa (Qwen: top-k do QSA ordenado + finalize de MoE não fundido, spread 0,25/6,07 → 0/0 nats, custo ~4%).',
+    'Esforço de raciocínio é texto no prompt (valores e mapeamentos mudam por família e quebram o prefix cache); <code>max_tokens</code> conta pensamento + resposta; o orçamento do DeepSeek força <code>&lt;/think&gt;</code> com kernels na GPU, sem o penhasco de ~4,7× da versão em CPU.',
+    'Especulação usa amostragem por rejeição: aceitação \\(=\\sum\\min(p,q)\\), máxima em greedy, mais um token bônus quando todos os rascunhos passam. Os benchmarks greedy do GLM e do Qwen superestimam o throughput servido a T≈1; os do DeepSeek já medem a T=0,6. Na lane TensorFold do GLM, o sorteio é chaveado por (seed ou SHA-256 do prompt, posição, token) e a verificação é por igualdade: resposta com rascunhos = serial e concorrente = sozinha, ao preço de uma API sem logprobs nem penalidades.',
+  ],
+  quiz: [
+    { q: 'Logits \\([3, 1, 0]\\). O que acontece com a distribuição quando a temperatura cai de 1 para 0,5?', o: ['Os tokens trocam de posição no ranking', 'Ela fica mais pontuda: o favorito ganha massa, e a ordem é preservada', 'Ela fica mais plana', 'Nada: a temperatura só age depois do top-p'], a: 1, e: 'Dividir por \\(T&lt;1\\) aumenta as diferenças entre logits, e a softmax concentra massa no maior. Como a divisão é monotônica, a ordem nunca muda. E a temperatura muda a distribuição por si só, com ou sem filtros de corte depois dela.' },
+    { q: 'Num contexto em que o favorito tem 87% de probabilidade, qual filtro guarda <i>menos</i> tokens: <code>top_k=20</code> ou <code>top_p=0.9</code>?', o: ['top_k=20, sempre', 'Os dois guardam exatamente 20', 'Depende só da temperatura', 'top_p=0.9: o núcleo que soma 90% tem só 2 ou 3 tokens'], a: 3, e: 'Top-k tem tamanho fixo. Top-p se adapta à confiança: quando o favorito já soma 87%, bastam um ou dois tokens a mais para chegar a 90%. Em contextos incertos acontece o contrário, e o top-p guarda muitos tokens.' },
+    { q: 'Por que a receita do DeepSeek reimplementou o <code>thinking_token_budget</code> com dois kernels Triton na GPU?', o: ['Porque a versão anterior copiava tokens para a CPU e os varria a cada passo, causando um penhasco de ~4,7× no decode', 'Para aumentar a aceitação especulativa', 'Porque o Triton amostra mais rápido que o FlashInfer', 'Para poder injetar um orçamento default no servidor'], a: 0, e: 'O hook antigo (#31/#34) fazia uma varredura O(n) em Python multiplicada pelas linhas MTP, com sincronização GPU→CPU por passo. Os kernels v2 mantêm o estado na GPU e só reescrevem a linha de logits no passo exato do limite. E, de propósito, o servidor não injeta default.' },
+    { q: 'No Qwen em TP2+EP, cinco execuções greedy idênticas deram cinco textos diferentes. Qual é a causa documentada?', o: ['Semente aleatória diferente a cada execução', 'Um bug no chat template', 'Ordem variável em reduções de ponto flutuante: índices do top-k do QSA em ordem diferente e finalize fundido do MoE', 'Temperatura default 1,0 do generation_config'], a: 2, e: 'Greedy não sorteia, então a semente é irrelevante. A soma em float não é associativa, e dois kernels somavam em ordem variável. Ordenar o top-k (<code>VLLM_QSA_DET_TOPK=1</code>) e usar o finalize não fundido (<code>VLLM_MOE_DET_FINALIZE=1</code>) zerou o espalhamento (0,25/6,07 → 0/0 nats) ao custo de ~4%.' },
+    { q: 'Uma resposta de raciocínio volta com <code>finish_reason: length</code> e <code>content</code> vazio. O <code>loop_detector.py</code> mostra a novidade de 8-gramas acima de 2% até o fim do traço. O que fazer?', o: ['Nada adianta: é um laço', 'É cauda longa: aumentar <code>max_tokens</code> (ou dar um orçamento de raciocínio) resolve', 'Ligar <code>repetition_penalty=2</code>', 'Trocar para greedy'], a: 1, e: 'Laço exige colapso da novidade abaixo do limiar por 3 janelas seguidas, sem recuperação até o fim. Se a novidade fica alta, o modelo continua dizendo coisas novas, só que muitas. Isso é cauda longa, e mais orçamento resolve.' },
+    { q: 'Por que um benchmark greedy superestima o throughput de um servidor com decodificação especulativa que atende a T=1?', o: ['Porque a T=1 o lm_head é mais lento', 'Porque a T=1 o KV cache dobra', 'Não superestima: a amostragem por rejeição não depende de T', 'Porque a aceitação por posição é \\(\\sum\\min(p,q)\\): máxima quando p e q são one-hot com o mesmo favorito, e menor quando as distribuições se espalham'], a: 3, e: 'A amostragem por rejeição preserva a distribuição do alvo, mas a taxa de aceitação depende da sobreposição entre alvo e rascunho na temperatura servida. A auditoria do Qwen anota exatamente isso: os números greedy de MTP ficam acima do throughput real de chat a T=1. Por isso o bench de decode do DeepSeek mede direto a T=0,6.' },
+    { q: 'Na lane TensorFold do GLM, a mesma requisição, sem <code>seed</code> e a T=1, roda sozinha e depois junto com três outras e com rascunhos. O que acontece com o texto?', o: ['Muda, porque sem <code>seed</code> o ruído é sorteado de novo a cada requisição', 'Fica idêntico, bit a bit: a chave vem do SHA-256 do prompt, o ruído é função de (chave, posição, token) e os kernels são invariantes ao lote', 'Fica idêntico só a T=0', 'Fica igual em distribuição, mas não na sequência, como na amostragem por rejeição'], a: 1, e: 'Sem <code>seed</code>, o TensorFold deriva a chave do prompt, e o empurrão de Gumbel de cada token é consultado por (chave, posição absoluta, id), sem depender de vizinhas ou de linhas de rascunho. Como os logits de cada linha também não dependem das outras linhas, a verificação por igualdade devolve a sequência serial. A receita publica 11 de 11 respostas iguais em execuções escalonadas e 11 de 11 em rajada. Igualdade só em distribuição é a garantia do vLLM.' },
+  ],
+  mount(root, LA) {
+    const V = LA.viz, UI = LA.ui;
+    const $ = (s) => root.querySelector(s);
+
+    /* ============================ helpers ============================ */
+    const FC = {};
+    const setFont = (g, sz, f = 'sans', wt = 400) => { const k = sz + '|' + f + '|' + wt; g.font = FC[k] || (FC[k] = V.font(sz, f, wt)); };
+    const measure = (g, s, sz, f, wt) => { setFont(g, sz, f, wt); return g.measureText(String(s)).width; };
+    const fmtInt = (n) => Math.round(n).toLocaleString('pt-BR');
+    const pct = (v, d) => (v * 100).toFixed(d == null ? (v < 0.1 ? 1 : 0) : d).replace('.', ',') + '%';
+    const num = (v, d = 2) => (+v).toFixed(d).replace('.', ',');
+    function fitH(fig, hd, hm, bp = 600) {
+      const st = fig.querySelector('.la-fig-stage');
+      const apply = () => { const w = fig.clientWidth || 800; const want = (w < bp ? hm : hd) + 'px'; if (st.style.height !== want) st.style.height = want; };
+      apply();
+      window.addEventListener('resize', apply);
+      LA.onCleanup(() => window.removeEventListener('resize', apply));
+    }
+    function pill(g, s, x, y, o = {}) {
+      const C = V.C();
+      const sz = o.size || 12, f = o.font || 'mono', wt = o.weight || 500, px = o.px == null ? 7 : o.px, hh = o.h || sz + 10;
+      const w = Math.max(o.minW || 0, measure(g, s, sz, f, wt) + px * 2);
+      if (o.dry) return w;
+      if (o.glow) V.glow(g, x + w / 2, y + hh / 2, Math.max(w, hh) * 0.75, o.glow, 0.45);
+      if (o.dash) g.setLineDash(o.dash);
+      V.box(g, x, y, w, hh, { r: o.r == null ? 7 : o.r, fill: o.fill || V.alpha(C.muted, 0.1), stroke: o.stroke, lw: o.lw || 1.2 });
+      g.setLineDash([]);
+      V.text(g, noLig(s), x + w / 2, y + hh / 2 + 0.5, { size: sz, font: f, weight: wt, color: o.color || C.ink, align: 'center', base: 'middle', alpha: o.alpha });
+      return w;
+    }
+    function wrapLines(g, s, maxW, sz, f = 'sans', wt = 400) {
+      const words = String(s).split(' ');
+      const out = []; let line = '';
+      words.forEach((wd) => { const tt = line ? line + ' ' + wd : wd; if (measure(g, tt, sz, f, wt) > maxW && line) { out.push(line); line = wd; } else line = tt; });
+      if (line) out.push(line);
+      return out;
+    }
+    function textBlock(g, s, x, y, maxW, o = {}) {
+      const sz = o.size || 12.5, lh = o.lh || Math.round(sz * 1.42);
+      const L = wrapLines(g, s, maxW, sz, o.font || 'sans', o.weight || 400);
+      L.forEach((l, i) => V.text(g, l, x, y + i * lh, Object.assign({ size: sz }, o)));
+      return y + L.length * lh;
+    }
+    function clip(g, s, maxW, sz, f = 'mono', wt = 400) {
+      s = String(s);
+      if (measure(g, s, sz, f, wt) <= maxW) return s;
+      while (s.length > 1 && measure(g, s + '…', sz, f, wt) > maxW) s = s.slice(0, -1);
+      return s + '…';
+    }
+    const softmax = (z, T = 1) => {
+      if (T <= 0) { let bi = 0; z.forEach((v, i) => { if (v > z[bi]) bi = i; }); return z.map((_, i) => (i === bi ? 1 : 0)); }
+      const m = Math.max(...z); const e = z.map((v) => Math.exp((v - m) / T)); const s = e.reduce((a, b) => a + b, 0); return e.map((v) => v / s);
+    };
+    const entropy = (p) => p.reduce((s, v) => (v > 0 ? s - v * Math.log(v) : s), 0);
+    const argmax = (a) => { let bi = 0; a.forEach((v, i) => { if (v > a[bi]) bi = i; }); return bi; };
+    const vis = (s) => String(s).replace(/^ /, '');
+    const noLig = (s) => String(s).replace(/<\|/g, '<\u200B|').replace(/\|>/g, '|\u200B>');
+    function hatch(g, x, y, w, h, col) {
+      g.save(); g.beginPath(); g.rect(x, y, w, h); g.clip();
+      g.strokeStyle = col; g.lineWidth = 1;
+      for (let k = -h; k < w; k += 6) { g.beginPath(); g.moveTo(x + k, y + h); g.lineTo(x + k + h, y); g.stroke(); }
+      g.restore();
+    }
+    function star(g, x, y, r, col) {
+      g.beginPath();
+      for (let k = 0; k < 10; k++) { const a = -Math.PI / 2 + (k * Math.PI) / 5, rr = k % 2 ? r * 0.45 : r; g.lineTo(x + Math.cos(a) * rr, y + Math.sin(a) * rr); }
+      g.closePath(); g.fillStyle = col; g.fill();
+    }
+    const onInk = () => (V.C().dark ? '#00210F' : '#ffffff');
+    function scissors(g, x, y, s, col) {
+      g.strokeStyle = col; g.lineWidth = 1.6;
+      g.beginPath(); g.arc(x - s * 0.55, y - s * 0.32, s * 0.28, 0, Math.PI * 2); g.stroke();
+      g.beginPath(); g.arc(x - s * 0.55, y + s * 0.32, s * 0.28, 0, Math.PI * 2); g.stroke();
+      g.beginPath(); g.moveTo(x - s * 0.32, y - s * 0.2); g.lineTo(x + s * 0.7, y + s * 0.28); g.moveTo(x - s * 0.32, y + s * 0.2); g.lineTo(x + s * 0.7, y - s * 0.28); g.stroke();
+    }
+
+    /* ================= Figura 1: o laço autoregressivo ================= */
+    const f1 = $('#fig-laco');
+    fitH(f1, 390, 440);
+    const M1 = {
+      glm: { name: 'GLM-5.3-Flash', L: 45, d: 4096, V: 154880, eos: '<|user|>', col: 'glm' },
+      qwen: { name: 'Qwen3.8-Flash-Next', L: 48, d: 2560, V: 248320, eos: '<|im_end|>', col: 'qwen' },
+      ds: { name: 'DeepSeek-V4-Flash', L: 43, d: 4096, V: 129280, eos: '<｜end▁of▁sentence｜>', col: 'ds' },
+    };
+    const PROMPT1 = ['O', ' gato', ' subiu', ' no'];
+    const GEN1 = [' telhado', ' e', ' miou', '.', 'EOS'];
+    const PICK1 = [0, 0, 1, 0, 0];
+    const CAND1 = [
+      [[' telhado', 6.1], [' muro', 5.4], [' sofá', 4.9], [' carro', 4.2], [' topo', 3.1]],
+      [[' e', 5.8], ['.', 5.5], [',', 4.6], [' da', 3.9], [' sem', 3.0]],
+      [[' dormiu', 5.9], [' miou', 5.6], [' ficou', 4.8], [' olhou', 4.4], [' caiu', 3.2]],
+      [['.', 6.4], [' ali', 4.9], [' ao', 4.1], [',', 3.8], [' até', 3.0]],
+      [['EOS', 6.8], [' Depois', 4.2], ['\\n', 4.0], [' Ele', 2.9], [' E', 2.1]],
+    ];
+    const S1 = { model: 'glm', gen: 0, prev: 0 };
+    const c1 = UI.controls(f1);
+    UI.seg(c1, { label: 'Modelo', options: [{ v: 'glm', label: 'GLM' }, { v: 'qwen', label: 'Qwen' }, { v: 'ds', label: 'DeepSeek' }], value: 'glm', onChange: (v) => { S1.model = v; } });
+    const st1 = UI.stepper(f1, [
+      { t: 'Contexto', d: 'Os tokens do prompt (lilás) e os já gerados (menta) formam a entrada. O modelo olha para tudo, mas só o vetor da <b>última posição</b> decide o próximo token.' },
+      { t: 'Forward pelas camadas', d: 'O vetor da última posição atravessa todas as camadas do tronco (45 no GLM, 48 no Qwen, 43 no DeepSeek). É o passo caro: os pesos ativos de todas as camadas são lidos da memória.' },
+      { t: 'lm_head → logits', d: 'A RMSNorm final e o <code>lm_head [V × d]</code> transformam o vetor \\(h\\) (d números) em V logits, uma nota crua por token do vocabulário.' },
+      { t: 'Softmax', d: 'As notas viram probabilidades positivas que somam 1. Mostramos as 5 maiores; o resto do vocabulário divide a sobra.' },
+      { t: 'Amostrar', d: 'O amostrador sorteia um token. Temperatura, top-p e companhia vêm nas próximas seções. Repare que nem sempre sai o favorito.' },
+      { t: 'Anexar e checar a parada', d: 'O token escolhido vai para o fim da sequência. Se for um token de fim (EOS), a geração para com <code>finish_reason: stop</code>. Senão, o laço recomeça com um token a mais.' },
+    ], {
+      autoplay: 3600,
+      onStep: (i) => {
+        if (S1.prev === 5 && i === 0) S1.gen = (S1.gen + 1) % GEN1.length;
+        S1.prev = i;
+      },
+    });
+    V.fig(f1, (g, w, h, t) => {
+      const C = V.C();
+      const m = M1[S1.model];
+      const mc = C[m.col] || C.a;
+      const narrow = w < 600;
+      const i = st1.i;
+      const e = V.clamp(st1.elapsed() / 2.2, 0, 1);
+      const gi = S1.gen;
+      const cands = CAND1[gi];
+      const pick = PICK1[gi];
+      const tokLabel = (s) => (s === 'EOS' ? m.eos : vis(s));
+      // cabeçalho
+      V.text(g, clip(g, narrow ? `${m.name} · ${m.L} camadas · d = ${m.d}` : `${m.name} · ${m.L} camadas · d = ${m.d} · V = ${fmtInt(m.V)}`, w - 32, 11.5, 'mono'), 16, 20, { size: 11.5, font: 'mono', color: mc });
+      // faixa da sequência
+      const seq = PROMPT1.map((s) => ({ s, k: 'p' })).concat(GEN1.slice(0, gi).map((s) => ({ s, k: 'g' })));
+      let x = 16, y = 32;
+      const ph = 24;
+      const pos = [];
+      seq.forEach((tk, k) => {
+        const lab = tokLabel(tk.s);
+        const pw = pill(g, lab, 0, 0, { dry: true, size: 12 });
+        if (x + pw > w - 16) { x = 16; y += ph + 6; }
+        const on0 = i === 0;
+        const isLast = k === seq.length - 1;
+        const col = tk.k === 'p' ? C.b : C.a;
+        pill(g, lab, x, y, { size: 12, fill: V.alpha(col, on0 ? 0.22 + 0.1 * Math.sin(performance.now() / 300 + k) : 0.13), stroke: (i === 1 && isLast) ? mc : V.alpha(col, 0.7), lw: (i === 1 && isLast) ? 2.2 : 1.2 });
+        pos.push([x, y, pw]);
+        x += pw + 6;
+      });
+      // vaga do próximo token
+      const nextLab = i === 5 && e > 0.75 ? tokLabel(GEN1[gi]) : '?';
+      const npw = pill(g, nextLab, 0, 0, { dry: true, size: 12 });
+      if (x + npw > w - 16) { x = 16; y += ph + 6; }
+      const slot = [x, y, npw];
+      if (nextLab === '?') pill(g, '?', x, y, { size: 12, dash: [3, 3], stroke: V.alpha(C.muted, 0.7), fill: 'transparent', color: C.muted });
+      else pill(g, nextLab, x, y, { size: 12, fill: V.alpha(C.a, 0.3), stroke: C.a, glow: C.a });
+      // regiões
+      const top = y + ph + (narrow ? 20 : 26);
+      const mx = 16, mw = narrow ? w - 32 : Math.min(360, w * 0.4), mh = narrow ? 104 : h - top - 44;
+      const my = top;
+      // máquina (tronco)
+      V.box(g, mx, my, mw, mh, { r: 14, fill: V.alpha(mc, 0.06), stroke: V.alpha(mc, 0.45), lw: 1.4 });
+      V.text(g, `Transformer · ${m.L} camadas`, mx + 12, my + 18, { size: 12, weight: 600, color: C.ink });
+      const nL = m.L, slotW = (mw - 24) / nL;
+      const sy = my + 30, sh = mh - 50;
+      const dotX = mx + 12 + e * (mw - 24);
+      for (let k = 0; k < nL; k++) {
+        const sx = mx + 12 + k * slotW;
+        const lit = i === 1 ? sx < dotX : i > 1;
+        V.box(g, sx + 0.5, sy, Math.max(1.5, slotW - 1.8), sh, { r: 2, fill: lit ? V.alpha(mc, 0.55) : V.alpha(C.muted, 0.16) });
+      }
+      V.text(g, 'cada fatia = uma camada (atenção + FFN/MoE)', mx + 12, my + mh - 8, { size: 10.5, font: 'mono', color: C.muted });
+      if (i === 0) {
+        // tokens descendo para a máquina (ids → embeddings)
+        pos.forEach(([px0, py0, pw0], k) => {
+          const u = (t * 0.55 + k * 0.23) % 1;
+          const sx = px0 + pw0 / 2, sy0 = py0 + ph + 2;
+          const tx = V.clamp(sx, mx + 16, mx + mw - 16), ty = sy + 6;
+          const q = V.ease.inOut(u);
+          V.dot(g, V.lerp(sx, tx, q), V.lerp(sy0, ty, q), 3, V.alpha(k < PROMPT1.length ? C.b : C.a, 1 - 0.6 * u));
+        });
+        V.text(g, 'ids → embeddings', mx + mw - 12, my + 18, { size: 11.5, font: 'mono', align: 'right', color: C.muted });
+      }
+      if (i === 1) {
+        V.glow(g, dotX, sy + sh / 2, 18, mc);
+        V.dot(g, dotX, sy + sh / 2, 4, C.ink);
+        const layer = Math.min(nL, Math.max(1, Math.ceil(e * nL)));
+        V.text(g, `camada ${layer} / ${nL}`, mx + mw - 12, my + 18, { size: 11.5, font: 'mono', align: 'right', color: mc });
+      } else if (i > 1) V.text(g, `h: ${m.d} números`, mx + mw - 12, my + 18, { size: 11.5, font: 'mono', align: 'right', color: C.muted });
+      // lm_head + barras
+      let bx, by, bw, bh, lx;
+      if (narrow) { lx = 16; by = my + mh + 24; bx = 104; bw = w - bx - 16; bh = h - by - 14; }
+      else { lx = mx + mw + 24; bx = lx + 110; by = my; bw = w - bx - 16; bh = mh; }
+      // ícone do lm_head
+      const iw = narrow ? 74 : 86, ih = Math.min(narrow ? bh - 26 : bh - 40, 150);
+      const iy = by + (narrow ? 18 : 22);
+      const lmOn = i >= 2;
+      V.box(g, lx, iy, iw, ih, { r: 8, fill: V.alpha(C.d, lmOn ? 0.18 : 0.06), stroke: V.alpha(C.d, lmOn ? 0.9 : 0.35) });
+      for (let r = 1; r < 9; r++) V.line(g, lx + 4, iy + (ih * r) / 9, lx + iw - 4, iy + (ih * r) / 9, { color: V.alpha(C.d, 0.25), lw: 1 });
+      V.text(g, 'lm_head', lx + iw / 2, iy + ih / 2 - 6, { size: 12, weight: 600, align: 'center', color: C.ink });
+      V.text(g, `[${fmtInt(m.V)}`, lx + iw / 2, iy + ih / 2 + 10, { size: 10.5, font: 'mono', align: 'center', color: C.muted });
+      V.text(g, `× ${m.d}]`, lx + iw / 2, iy + ih / 2 + 23, { size: 10.5, font: 'mono', align: 'center', color: C.muted });
+      if (!narrow) V.arrow(g, mx + mw + 4, my + mh / 2, lx - 4, iy + ih / 2, { color: V.alpha(C.muted, lmOn ? 0.9 : 0.35), lw: 1.6 });
+      // barras dos candidatos
+      const z = cands.map((c) => c[1]);
+      const pz = softmax(z).map((v) => v * 0.96);
+      const zmin = Math.min(...z) - 1, zmax = Math.max(...z);
+      const head = i <= 2 ? 'logits z (5 maiores)' : 'probabilidades (5 maiores de V)';
+      V.text(g, head, bx, by + 12, { size: 11, font: 'mono', color: C.muted });
+      const rowH = Math.min(28, (bh - 38) / 5.6);
+      const labW = narrow ? 70 : 84;
+      const barX = bx + labW, barW = Math.max(40, bw - labW - 50);
+      let hiIdx = -1;
+      if (i === 4) hiIdx = Math.floor(V.ease.out(e) * (15 + pick)) % 5;
+      if (i === 5) hiIdx = pick;
+      cands.forEach(([s, zv], k) => {
+        const ry = by + 22 + k * rowH;
+        const lab = clip(g, tokLabel(s), labW - 8, 11.5, 'mono');
+        const isHi = k === hiIdx;
+        V.text(g, noLig(lab), barX - 8, ry + rowH / 2, { size: 11.5, font: 'mono', align: 'right', base: 'middle', color: isHi ? C.c : C.ink });
+        if (i < 2) { V.box(g, barX, ry + 4, barW * 0.2, rowH - 8, { r: 4, fill: V.alpha(C.muted, 0.12) }); return; }
+        const lz = (zv - zmin) / (zmax - zmin);
+        const lp = pz[k] / Math.max(...pz);
+        const u = i === 2 ? lz : i === 3 ? V.lerp(lz, lp, V.ease.inOut(e)) : lp;
+        const col = isHi ? C.c : i === 2 ? C.d : C.a;
+        V.box(g, barX, ry + 4, Math.max(3, u * barW), rowH - 8, { r: 4, fill: V.alpha(col, isHi ? 0.85 : 0.6) });
+        const val = i === 2 ? num(zv, 1) : pct(pz[k]);
+        V.text(g, val, barX + Math.max(3, u * barW) + 6, ry + rowH / 2, { size: 11, font: 'mono', base: 'middle', color: C.ink });
+        if (isHi && i === 4) V.glow(g, barX + u * barW, ry + rowH / 2, 14, C.c, 0.7);
+      });
+      const footY = by + 22 + 5 * rowH + 14;
+      if (i >= 3) V.text(g, clip(g, `+ ${fmtInt(m.V - 5)} outros tokens · 4%`, bw, 11, 'mono'), bx, footY, { size: 11, font: 'mono', color: C.muted });
+      else if (i === 2) V.text(g, clip(g, `z_v = ⟨w_v, h⟩ para os ${fmtInt(m.V)} tokens`, bw, 11, 'mono'), bx, footY, { size: 11, font: 'mono', color: C.muted });
+      // passo 6: o token voa para a fila
+      if (i === 5) {
+        const k = pick;
+        const sx0 = barX - 30, sy0 = by + 22 + k * rowH;
+        const u = V.ease.inOut(V.clamp(e / 0.75, 0, 1));
+        const px = V.lerp(sx0, slot[0], u), py = V.lerp(sy0, slot[1], u) - Math.sin(u * Math.PI) * 40;
+        if (e < 0.75) pill(g, tokLabel(GEN1[gi]), px, py, { size: 12, fill: V.alpha(C.c, 0.35), stroke: C.c, glow: C.c });
+        const isE = GEN1[gi] === 'EOS';
+        const msg = isE ? 'EOS → fim da geração (finish_reason: stop)' : 'não é EOS → o laço recomeça com t + 1';
+        V.text(g, clip(g, msg, w - 32, 12, 'sans', 600), narrow ? 16 : bx, h - 10, { size: 12, weight: 600, color: isE ? C.c : C.a });
+      }
+      if (i === 4) V.text(g, 'sorteio: a roleta passa por todos e para num token', narrow ? 16 : bx, h - 10, { size: 12, color: C.muted });
+    });
+
+    /* ================= Figura 2: lm_head (matvec + softmax) ================= */
+    const f2 = $('#fig-lmhead');
+    fitH(f2, 420, 500);
+    const TOK2 = [' azul', ' nublado', ' 4', ' cinco', ' rei', ' dragão', '.', ' e'];
+    const W2 = [[2.0, 0, 0, 0, 0, 0.3], [1.6, 0, 0, 0, 0.2, -0.4], [0, 2.2, 0, 0, 0, 0.2], [0, 1.5, 0, 0, 0, -0.5], [0, 0, 2.0, 0, 0, 0.4], [0, 0, 1.8, 0, 0, -0.3], [0, 0.3, 0, 1.5, 0.2, 0], [0.3, 0, 0.3, 0.2, 1.4, 0]];
+    const CTX2 = {
+      ceu: { label: 'O céu está', h: [2.2, 0, 0.1, 0.4, 0.5, 0.6] },
+      soma: { label: '2 + 2 =', h: [0, 2.4, 0, 0.5, 0.1, 0.3] },
+      conto: { label: 'Era uma vez um', h: [0, 0, 2.0, 0.1, 0.6, -0.2] },
+    };
+    const S2 = { ctx: 'ceu', tp: false, t0: 0 };
+    const c2 = UI.controls(f2);
+    UI.seg(c2, { label: 'Contexto', options: [{ v: 'ceu', label: '“O céu está”' }, { v: 'soma', label: '“2 + 2 =”' }, { v: 'conto', label: '“Era uma vez um”' }], value: 'ceu', onChange: (v) => { S2.ctx = v; S2.t0 = H2.t; } });
+    UI.toggle(c2, { label: 'vocab-parallel (TP = 2)', value: false, onChange: (v) => { S2.tp = v; } });
+    const r2a = UI.readout(c2, 'favorito', '—');
+    const r2b = UI.readout(c2, 'entropia H', '—');
+    const H2 = V.fig(f2, (g, w, h, t) => {
+      const C = V.C();
+      const narrow = w < 600;
+      const hv = CTX2[S2.ctx].h;
+      const z = W2.map((row) => row.reduce((s, a, k) => s + a * hv[k], 0));
+      const p = softmax(z);
+      const top = argmax(p);
+      r2a.set(`${vis(TOK2[top])} · ${pct(p[top])}`);
+      r2b.set(`${num(entropy(p))} nats`);
+      const tt = t - S2.t0;
+      const per = 0.75, nR = 8, cyc = nR * per + 3.2;
+      const ph = tt % cyc;
+      const row = ph < nR * per ? Math.floor(ph / per) : 8;
+      const barsE = ph < nR * per ? 0 : V.clamp((ph - nR * per) / 1.1, 0, 1);
+      const cell = narrow ? 19 : 32, gap = narrow ? 2 : 3;
+      const labW = narrow ? 62 : 84;
+      const x0 = 16 + labW, y0 = 52;
+      V.text(g, `contexto: “${CTX2[S2.ctx].label}” → h (d = 6)`, 16, 20, { size: 12, font: 'mono', color: C.ink });
+      V.text(g, 'W_U  [V = 8 × d = 6]', x0, y0 - 12, { size: 11, font: 'mono', color: C.muted });
+      const gm = V.matrix(g, { x: x0, y: y0, data: W2, cell, gap, cmap: 'div', min: -2.2, max: 2.2, values: !narrow, digits: 1, hiRow: row < 8 ? row : null, hiColor: C.c });
+      TOK2.forEach((s, k) => V.text(g, vis(s), x0 - 8, y0 + k * (cell + gap) + cell / 2, { size: narrow ? 11 : 12, font: 'mono', align: 'right', base: 'middle', color: k === row ? C.c : C.ink }));
+      if (S2.tp) {
+        const hh = 4 * (cell + gap) - gap;
+        [[0, C.a, 'GPU 0'], [4, C.b, 'GPU 1']].forEach(([r0, col, lab]) => {
+          g.setLineDash([5, 4]);
+          V.box(g, x0 - labW + 2, y0 + r0 * (cell + gap) - 3, labW - 6 + gm.w + 6, hh + 6, { r: 8, stroke: col, lw: 1.6 });
+          g.setLineDash([]);
+          g.save(); g.translate(x0 - labW + 13, y0 + r0 * (cell + gap) + hh / 2); g.rotate(-Math.PI / 2);
+          V.text(g, lab, 0, 0, { size: 10.5, font: 'mono', align: 'center', base: 'middle', color: col });
+          g.restore();
+        });
+      }
+      // vetor h
+      const hx = x0 + gm.w + (narrow ? 12 : 26);
+      const hy = y0 + (8 * (cell + gap) - 6 * (cell + gap)) / 2;
+      V.text(g, '×', hx - (narrow ? 7 : 14), y0 + (8 * (cell + gap)) / 2, { size: 16, align: 'center', base: 'middle', color: C.muted });
+      V.text(g, 'h', hx + cell / 2, hy - 12, { size: 11, font: 'mono', align: 'center', color: C.muted });
+      V.matrix(g, { x: hx, y: hy, data: hv.map((v) => [v]), cell, gap, cmap: 'div', min: -2.4, max: 2.4, values: !narrow, digits: 1, hiCol: row < 8 ? 0 : null, hiColor: C.c });
+      // coluna z
+      const zx = hx + cell + (narrow ? 14 : 30);
+      const zw = narrow ? 34 : 50;
+      V.text(g, '=', zx - (narrow ? 8 : 15), y0 + (8 * (cell + gap)) / 2, { size: 16, align: 'center', base: 'middle', color: C.muted });
+      V.text(g, 'z', zx + zw / 2, y0 - 12, { size: 11, font: 'mono', align: 'center', color: C.muted });
+      z.forEach((v, k) => {
+        const ry = y0 + k * (cell + gap);
+        const done = k < row || row === 8;
+        const gcol = S2.tp ? (k < 4 ? C.a : C.b) : C.d;
+        V.box(g, zx, ry, zw, cell, { r: 5, fill: done ? V.alpha(gcol, 0.22) : V.alpha(C.muted, 0.08), stroke: k === row ? C.c : V.alpha(gcol, done ? 0.7 : 0.25), lw: k === row ? 2.2 : 1 });
+        V.text(g, done || k === row ? num(v, 1) : '?', zx + zw / 2, ry + cell / 2 + 0.5, { size: narrow ? 11 : 12, font: 'mono', align: 'center', base: 'middle', color: done ? C.ink : C.muted });
+      });
+      // barras de softmax
+      let bx, by, bw, rowH;
+      if (narrow) { bx = 16 + labW; by = y0 + 8 * (cell + gap) + 64; bw = w - bx - 50; rowH = Math.min(22, (h - by - 50) / 8); }
+      else { bx = zx + zw + 84; by = y0; bw = w - bx - 60; rowH = cell + gap; }
+      if (!narrow) {
+        V.arrow(g, zx + zw + 8, y0 + 4 * (cell + gap), bx - 10, y0 + 4 * (cell + gap), { color: V.alpha(C.muted, 0.8) });
+        V.text(g, S2.tp ? 'all-gather' : 'softmax', (zx + zw + bx) / 2, y0 + 4 * (cell + gap) - 10, { size: 11, font: 'mono', align: 'center', color: S2.tp ? C.b : C.muted });
+        if (S2.tp) V.text(g, '+ softmax', (zx + zw + bx) / 2, y0 + 4 * (cell + gap) + 18, { size: 11, font: 'mono', align: 'center', color: C.muted });
+      } else {
+        V.text(g, S2.tp ? '↓ all-gather + softmax' : '↓ softmax', bx, by - 14, { size: 11, font: 'mono', color: S2.tp ? C.b : C.muted });
+        TOK2.forEach((s, k) => V.text(g, vis(s), bx - 8, by + k * rowH + rowH / 2, { size: 11, font: 'mono', align: 'right', base: 'middle', color: C.ink }));
+      }
+      const pm = Math.max(...p);
+      p.forEach((v, k) => {
+        const ry = by + k * rowH;
+        const len = Math.max(2, (v / pm) * bw * V.ease.out(barsE));
+        if (barsE <= 0) { V.box(g, bx, ry + 3, Math.min(bw, 60), rowH - 6, { r: 4, fill: V.alpha(C.muted, 0.08) }); return; }
+        V.box(g, bx, ry + 3, len, rowH - 6, { r: 4, fill: V.alpha(k === top ? C.c : C.a, 0.7) });
+        if (barsE > 0.3) V.text(g, pct(v), bx + len + 6, ry + rowH / 2, { size: 11, font: 'mono', base: 'middle', color: C.ink });
+      });
+      // conta da linha atual
+      const fy = h - 14;
+      if (row < 8) {
+        const terms = W2[row].map((a, k) => [a, hv[k]]).filter(([a, b]) => a !== 0 && b !== 0);
+        const s = terms.map(([a, b]) => `${num(a, 1)}·${num(b, 1)}`).join(' + ') || '0';
+        V.text(g, clip(g, `z(“${vis(TOK2[row])}”) = ⟨w, h⟩ = ${s} = ${num(z[row], 2)}`, w - 32, narrow ? 11 : 12.5, 'mono'), 16, fy, { size: narrow ? 11 : 12.5, font: 'mono', color: C.c });
+      } else V.text(g, clip(g, S2.tp ? 'cada GPU calculou metade das linhas; o all-gather junta os 8 logits antes do sorteio' : 'p = softmax(z): notas viram probabilidades', w - 32, 12, 'sans'), 16, fy, { size: 12, color: C.muted });
+    });
+
+    /* ================= Figura 3: temperatura + softcap ================= */
+    const f3 = $('#fig-temperatura');
+    fitH(f3, 400, 490);
+    const TOK3 = [' quente', ' frio', ' ótimo', ' forte', ' amargo', ' pronto', ' delicioso', ' fraco', ' doce', ' queimado'];
+    const Z3 = [5.2, 4.4, 4.1, 3.6, 3.2, 2.7, 2.4, 1.8, 1.3, 0.4];
+    const S3 = { T: 1, cap: 0, cur: null };
+    const c3 = UI.controls(f3);
+    UI.slider(c3, { label: 'Temperatura', min: 0, max: 2, step: 0.05, value: 1, fmt: (v) => (v === 0 ? '0 greedy' : num(v, 2)), onInput: (v) => { S3.T = v; } });
+    UI.seg(c3, { label: 'Softcap', options: [{ v: 0, label: 'off' }, { v: 6, label: 'c = 6' }, { v: 3, label: 'c = 3' }, { v: 1.5, label: 'c = 1,5' }], value: 0, onChange: (v) => { S3.cap = v; } });
+    const r3a = UI.readout(c3, 'H', '—');
+    const r3b = UI.readout(c3, 'escolhas efetivas (exp H)', '—');
+    const r3c = UI.readout(c3, 'p(favorito)', '—');
+    const capf = (z, c) => (c > 0 ? c * Math.tanh(z / c) : z);
+    V.fig(f3, (g, w, h, t, dt) => {
+      const C = V.C();
+      const narrow = w < 600;
+      const zc = Z3.map((v) => capf(v, S3.cap));
+      const p = softmax(zc, S3.T);
+      if (!S3.cur) S3.cur = p.slice();
+      S3.cur = S3.cur.map((v, k) => v + (p[k] - v) * Math.min(1, dt * 9));
+      const H = entropy(p);
+      r3a.set(num(H) + ' nats'); r3b.set(num(Math.exp(H), 1)); r3c.set(pct(p[0]));
+      // barras horizontais
+      const bx0 = 16, bwAll = narrow ? w - 32 : w * 0.58 - 24;
+      const labW = narrow ? 78 : 92;
+      const by0 = 34, bh = narrow ? 230 : h - 60;
+      const rowH = bh / TOK3.length;
+      V.text(g, `p(v) = softmax(${S3.cap > 0 ? 'c·tanh(z/c)' : 'z'} / T)   T = ${S3.T === 0 ? '0 (greedy)' : num(S3.T, 2)}`, bx0, 20, { size: 11.5, font: 'mono', color: C.muted });
+      const barW = bwAll - labW - 52;
+      S3.cur.forEach((v, k) => {
+        const ry = by0 + k * rowH;
+        V.text(g, vis(TOK3[k]), bx0 + labW - 8, ry + rowH / 2, { size: 11.5, font: 'mono', align: 'right', base: 'middle', color: C.ink });
+        V.box(g, bx0 + labW, ry + 3, barW, rowH - 6, { r: 4, fill: V.alpha(C.muted, 0.08) });
+        const len = Math.max(2, v * barW);
+        V.box(g, bx0 + labW, ry + 3, len, rowH - 6, { r: 4, fill: V.alpha(k === 0 ? C.c : C.a, 0.75) });
+        V.text(g, pct(v), bx0 + labW + len + 6, ry + rowH / 2, { size: 11, font: 'mono', base: 'middle', color: C.ink });
+      });
+      // mini-gráficos
+      let ax, ay, aw, ah, bxp, byp;
+      if (narrow) { aw = (w - 44) / 2; ah = h - by0 - bh - 56; ax = 16; ay = by0 + bh + 34; bxp = ax + aw + 12; byp = ay; }
+      else { ax = w * 0.58 + 10; aw = w - ax - 18; ah = (h - 92) / 2; ay = 34; bxp = ax; byp = ay + ah + 44; }
+      // (a) curva do softcap
+      const plot = (px, py, pw, phh, title) => {
+        V.box(g, px, py, pw, phh, { r: 8, fill: V.alpha(C.muted, 0.05), stroke: V.alpha(C.muted, 0.25), lw: 1 });
+        V.text(g, clip(g, title, pw - 4, 11, 'mono'), px + 2, py - 8, { size: 11, font: 'mono', color: C.muted });
+      };
+      const cs = String(S3.cap).replace('.', ',');
+      plot(ax, ay, aw, ah, narrow ? (S3.cap > 0 ? `softcap c = ${cs}` : 'softcap off') : S3.cap > 0 ? `softcap: z → ${cs}·tanh(z/${cs})` : 'softcap desligado: z → z');
+      const zx = (v) => ax + 8 + ((v + 0.5) / 6.5) * (aw - 16);
+      const zy = (v) => ay + ah - 8 - ((v + 0.5) / 6.5) * (ah - 16);
+      g.setLineDash([4, 4]); V.line(g, zx(-0.5), zy(-0.5), zx(6), zy(6), { color: V.alpha(C.muted, 0.5), lw: 1 }); g.setLineDash([]);
+      g.beginPath();
+      for (let k = 0; k <= 60; k++) { const zz = -0.5 + (k / 60) * 6.5; const yy = capf(zz, S3.cap); k ? g.lineTo(zx(zz), zy(yy)) : g.moveTo(zx(zz), zy(yy)); }
+      g.strokeStyle = C.d; g.lineWidth = 2; g.stroke();
+      Z3.forEach((v, k) => { V.dot(g, zx(v), zy(capf(v, S3.cap)), k === 0 ? 4.5 : 3, k === 0 ? C.c : C.a); });
+      if (S3.cap > 0) { g.setLineDash([2, 4]); V.line(g, zx(-0.5), zy(S3.cap), zx(6), zy(S3.cap), { color: V.alpha(C.d, 0.6), lw: 1 }); g.setLineDash([]); V.text(g, '+c', zx(6) - 4, zy(S3.cap) - 4, { size: 10.5, font: 'mono', align: 'right', color: C.d }); }
+      V.text(g, 'z', ax + aw - 10, ay + ah - 12, { size: 10.5, font: 'mono', color: C.muted });
+      // (b) entropia × T
+      plot(bxp, byp, aw, ah, narrow ? 'entropia H(T)' : 'entropia H(T)  ·  máx = ln 10');
+      const hmax = Math.log(TOK3.length);
+      const tx = (T) => bxp + 8 + (T / 2) * (aw - 16);
+      const hy = (Hh) => byp + ah - 8 - (Hh / hmax) * (ah - 16);
+      g.setLineDash([3, 4]); V.line(g, tx(0), hy(hmax), tx(2), hy(hmax), { color: V.alpha(C.muted, 0.5), lw: 1 }); g.setLineDash([]);
+      g.beginPath();
+      for (let k = 0; k <= 60; k++) { const T = (k / 60) * 2; const Hh = entropy(softmax(zc, T)); k ? g.lineTo(tx(T), hy(Hh)) : g.moveTo(tx(T), hy(Hh)); }
+      g.strokeStyle = C.b; g.lineWidth = 2; g.stroke();
+      const mxp = tx(S3.T), myp = hy(H);
+      V.glow(g, mxp, myp, 12 + 2 * Math.sin(t * 3), C.c, 0.6);
+      V.dot(g, mxp, myp, 4.5, C.c);
+      V.text(g, 'T', bxp + aw - 10, byp + ah - 12, { size: 10.5, font: 'mono', color: C.muted });
+    });
+
+    /* ================= Figura 4: filtros ================= */
+    const f4 = $('#fig-filtros');
+    fitH(f4, 410, 560);
+    const CTX4 = {
+      conf: {
+        label: '“A capital da França é”', tail: 0.015,
+        tok: [' Paris', ' a', ' uma', ' conhecida', ' também', ' Lyon', ' famosa', ' hoje', ' um', ' chamada', ' sem', ' linda', ' o', ' desde', ' na', ' muito', ' e', ',', ' bem', ' talvez'],
+        z: [9.0, 5.6, 5.2, 4.8, 4.5, 4.2, 4.0, 3.8, 3.6, 3.5, 3.3, 3.1, 3.0, 2.9, 2.8, 2.6, 2.5, 2.3, 2.2, 2.0],
+      },
+      inc: {
+        label: '“Meu animal favorito é o”', tail: 0.08,
+        tok: [' cachorro', ' gato', ' cavalo', ' golfinho', ' lobo', ' leão', ' coelho', ' papagaio', ' tigre', ' urso', ' peixe', ' pinguim', ' elefante', ' macaco', ' jabuti', ' hamster', ' polvo', ' pato', ' furão', ' camaleão'],
+        z: [4.0, 3.8, 3.2, 3.0, 2.8, 2.7, 2.6, 2.5, 2.4, 2.3, 2.2, 2.1, 2.0, 1.9, 1.8, 1.7, 1.6, 1.5, 1.4, 1.3],
+      },
+    };
+    const S4 = { ctx: 'conf', meth: 'topp', k: 20, p: 0.95, mp: 0.1, cur: null };
+    const c4 = UI.controls(f4);
+    UI.seg(c4, { label: 'Contexto', options: [{ v: 'conf', label: 'confiante' }, { v: 'inc', label: 'incerto' }], value: 'conf', onChange: (v) => { S4.ctx = v; } });
+    UI.seg(c4, { label: 'Método', options: [{ v: 'none', label: 'nenhum' }, { v: 'greedy', label: 'greedy' }, { v: 'topk', label: 'top-k' }, { v: 'topp', label: 'top-p' }, { v: 'minp', label: 'min-p' }], value: 'topp', onChange: (v) => { S4.meth = v; vis4(); } });
+    const sK = UI.slider(c4, { label: 'k', min: 1, max: 20, step: 1, value: 20, onInput: (v) => { S4.k = v; } });
+    const sP = UI.slider(c4, { label: 'p', min: 0.5, max: 1, step: 0.01, value: 0.95, fmt: (v) => num(v, 2), onInput: (v) => { S4.p = v; } });
+    const sM = UI.slider(c4, { label: 'min_p', min: 0, max: 0.5, step: 0.01, value: 0.1, fmt: (v) => num(v, 2), onInput: (v) => { S4.mp = v; } });
+    const r4a = UI.readout(c4, 'mantidos', '—');
+    const r4b = UI.readout(c4, 'massa mantida', '—');
+    const r4c = UI.readout(c4, 'p(favorito) depois', '—');
+    function vis4() { sK.el.style.display = S4.meth === 'topk' ? '' : 'none'; sP.el.style.display = S4.meth === 'topp' ? '' : 'none'; sM.el.style.display = S4.meth === 'minp' ? '' : 'none'; }
+    vis4();
+    function filt4() {
+      const D = CTX4[S4.ctx];
+      const pe = softmax(D.z).map((v) => v * (1 - D.tail));
+      const keep = pe.map(() => false);
+      let tailKeep = 0;
+      if (S4.meth === 'none') { keep.fill(true); tailKeep = D.tail; }
+      else if (S4.meth === 'greedy') keep[0] = true;
+      else if (S4.meth === 'topk') for (let k = 0; k < S4.k; k++) keep[k] = true;
+      else if (S4.meth === 'topp') {
+        let acc = 0;
+        for (let k = 0; k < pe.length; k++) { keep[k] = true; acc += pe[k]; if (acc >= S4.p - 1e-9) break; }
+        if (acc < S4.p - 1e-9) tailKeep = Math.min(D.tail, S4.p - acc);
+        if (S4.p >= 0.999) tailKeep = D.tail;
+      } else if (S4.meth === 'minp') {
+        const th = S4.mp * pe[0];
+        pe.forEach((v, k) => { keep[k] = v >= th; });
+        if (S4.mp === 0) tailKeep = D.tail;
+      }
+      const kept = pe.reduce((s, v, k) => s + (keep[k] ? v : 0), 0) + tailKeep;
+      const post = pe.map((v, k) => (keep[k] ? v / kept : 0));
+      return { D, pe, keep, tailKeep, kept, post, tailPost: tailKeep / kept };
+    }
+    V.fig(f4, (g, w, h, t, dt) => {
+      const C = V.C();
+      const narrow = w < 600;
+      const F = filt4();
+      const n = F.pe.length;
+      if (!S4.cur || S4.cur.length !== n + 1) S4.cur = F.post.concat([F.tailPost]);
+      const tgt = F.post.concat([F.tailPost]);
+      S4.cur = S4.cur.map((v, k) => v + (tgt[k] - v) * Math.min(1, dt * 8));
+      const nk = F.keep.filter(Boolean).length;
+      r4a.set(nk + (F.tailKeep > 0 ? ' + cauda' : ''));
+      r4b.set(pct(F.kept, 1)); r4c.set(pct(F.post[0], 1));
+      const minpLine = S4.meth === 'minp' && narrow;
+      V.text(g, clip(g, `contexto: ${F.D.label}  ·  T = 1`, S4.meth === 'minp' && !narrow ? w - 300 : w - 32, 12, 'mono'), 16, 20, { size: 12, font: 'mono', color: C.ink });
+      const cols = narrow ? 1 : 2;
+      const perCol = Math.ceil((n + 1) / cols);
+      const top = minpLine ? 50 : 36, bottom = h - 46;
+      const rowH = (bottom - top) / perCol;
+      const colW = (w - 32 - (cols - 1) * 24) / cols;
+      const labW = narrow ? 84 : 92;
+      const barW = colW - labW - 58;
+      const scale = Math.max(F.pe[0], ...F.post, 0.05);
+      let cutY = null;
+      for (let k = 0; k <= n; k++) {
+        const col = Math.floor(k / perCol), r = k % perCol;
+        const x = 16 + col * (colW + 24), y = top + r * rowH;
+        const isTail = k === n;
+        const orig = isTail ? F.D.tail : F.pe[k];
+        const kept = isTail ? F.tailKeep > 0 : F.keep[k];
+        const lab = isTail ? 'cauda' : vis(F.D.tok[k]);
+        V.text(g, clip(g, lab, labW - 8, 11, 'mono'), x + labW - 8, y + rowH / 2, { size: 11, font: 'mono', align: 'right', base: 'middle', color: kept ? C.ink : C.muted });
+        const ow = Math.max(2, (orig / scale) * barW);
+        const bh = Math.max(4, rowH - 5);
+        if (kept) {
+          V.box(g, x + labW, y + (rowH - bh) / 2, ow, bh, { r: 3, stroke: V.alpha(C.a, 0.6), lw: 1 });
+          const nw = Math.max(2, (S4.cur[k] / scale) * barW);
+          V.box(g, x + labW, y + (rowH - bh) / 2, Math.min(barW, nw), bh, { r: 3, fill: V.alpha(k === 0 ? C.c : C.a, 0.72) });
+          V.text(g, pct(isTail ? F.tailPost : F.post[k]), x + labW + Math.min(barW, Math.max(ow, nw)) + 5, y + rowH / 2, { size: 10.5, font: 'mono', base: 'middle', color: C.ink });
+          if (isTail && F.tailKeep < F.D.tail - 1e-9) V.text(g, '(parte)', x + labW + Math.min(barW, Math.max(ow, nw)) + 44, y + rowH / 2, { size: 10.5, font: 'mono', base: 'middle', color: C.muted });
+        } else {
+          V.box(g, x + labW, y + (rowH - bh) / 2, ow, bh, { r: 3, fill: V.alpha(C.muted, 0.12) });
+          hatch(g, x + labW, y + (rowH - bh) / 2, ow, bh, V.alpha(C.muted, 0.45));
+          V.text(g, isTail ? `${pct(orig)} em ${fmtInt(154860)} tokens` : pct(orig), x + labW + ow + 5, y + rowH / 2, { size: 10.5, font: 'mono', base: 'middle', color: C.muted, alpha: 0.8 });
+          if (cutY == null && col === 0) cutY = y;
+        }
+      }
+      // tesoura na fronteira do corte (coluna 0)
+      if (cutY != null) {
+        const sx = 16 + labW - 4, sy = cutY - 1 + Math.sin(t * 3) * 1.5;
+        g.setLineDash([4, 3]); V.line(g, 16, sy, 16 + colW, sy, { color: V.alpha(C.c, 0.7), lw: 1.4 }); g.setLineDash([]);
+        scissors(g, sx - labW + 20, sy, 9, C.c);
+      }
+      // linha do min-p
+      if (S4.meth === 'minp') {
+        const th = S4.mp * F.pe[0];
+        for (let cc = 0; cc < cols; cc++) {
+          const lx = 16 + cc * (colW + 24) + labW + (th / scale) * barW;
+          g.setLineDash([3, 3]); V.line(g, lx, top - 2, lx, top + perCol * rowH, { color: C.d, lw: 1.4 }); g.setLineDash([]);
+        }
+        if (minpLine) V.text(g, `linha âmbar: min_p · p_máx = ${pct(th, 1)}`, 16, 38, { size: 10.5, font: 'mono', color: C.d });
+        else V.text(g, `linha âmbar: min_p · p_máx = ${pct(th, 1)}`, w - 16, 20, { size: 10.5, font: 'mono', align: 'right', color: C.d });
+      }
+      // faixa de massa acumulada
+      const fy = h - 22, fx = 16, fw = w - 32;
+      let acc = 0;
+      V.box(g, fx, fy, fw, 10, { r: 5, fill: V.alpha(C.muted, 0.1) });
+      F.pe.forEach((v, k) => { const x = fx + acc * fw, ww = v * fw; V.box(g, x, fy, Math.max(0.5, ww - 0.5), 10, { r: 2, fill: F.keep[k] ? V.alpha(k === 0 ? C.c : C.a, 0.75) : V.alpha(C.muted, 0.25) }); acc += v; });
+      if (F.tailKeep > 0) V.box(g, fx + acc * fw, fy, F.tailKeep * fw, 10, { r: 2, fill: V.alpha(C.a, 0.4) });
+      if (S4.meth === 'topp') { const px = fx + S4.p * fw; V.line(g, px, fy - 5, px, fy + 15, { color: C.d, lw: 2 }); V.text(g, 'p', px, fy - 8, { size: 11, font: 'mono', align: 'center', color: C.d }); }
+      V.text(g, 'massa acumulada (ordem decrescente)', fx, fy - 6, { size: 10.5, font: 'mono', color: C.muted });
+    });
+
+    /* ================= Figura 5: corrida de Gumbel ================= */
+    const f5 = $('#fig-gumbel');
+    fitH(f5, 400, 500);
+    const TOK5 = [' sim', ' não', ' talvez', ' nunca', ' claro', ' hmm'];
+    const Z5 = [2.0, 1.5, 1.0, 0.3, 0.0, -0.5];
+    const R5 = V.rng(2026);
+    const gum = () => { let u = R5(); while (u <= 1e-12) u = R5(); return -Math.log(-Math.log(u)); };
+    const S5 = { T: 1, speed: 'lento', counts: Z5.map(() => 0), n: 0, race: null, acc: 0, age: 0 };
+    const newRace = () => {
+      const g = Z5.map(() => (S5.T > 0 ? gum() : 0));
+      const s = Z5.map((z, k) => (S5.T > 0 ? z / S5.T + g[k] : z));
+      const win = argmax(s);
+      return { g, s, win };
+    };
+    const reset5 = (seed = 0) => { S5.counts = Z5.map(() => 0); S5.n = 0; S5.race = null; S5.age = 0; for (let k = 0; k < seed; k++) { const rc = newRace(); S5.counts[rc.win]++; S5.n++; } };
+    const c5 = UI.controls(f5);
+    UI.slider(c5, { label: 'Temperatura', min: 0, max: 2, step: 0.05, value: 1, fmt: (v) => (v === 0 ? '0 argmax' : num(v, 2)), onInput: (v) => { S5.T = v; reset5(40); } });
+    UI.seg(c5, { label: 'Ritmo', options: [{ v: 'lento', label: '1 corrida' }, { v: 'rapido', label: '10/s' }, { v: 'turbo', label: 'turbo' }], value: 'lento', onChange: (v) => { S5.speed = v; } });
+    UI.button(c5, '↺ zerar', () => reset5());
+    reset5(60);
+    const r5a = UI.readout(c5, 'corridas', '0');
+    const r5b = UI.readout(c5, 'TV(empírico, softmax)', '—');
+    V.fig(f5, (g, w, h, t, dt) => {
+      const C = V.C();
+      const narrow = w < 600;
+      const target = softmax(Z5, S5.T);
+      const dur = S5.speed === 'lento' ? 1.7 : 0.1;
+      if (!LA.paused) {
+        if (S5.speed === 'turbo') {
+          for (let k = 0; k < 12; k++) { const rc = newRace(); S5.counts[rc.win]++; S5.n++; S5.race = rc; }
+          S5.age = dur;
+        } else {
+          S5.age += dt;
+          if (!S5.race || S5.age >= dur) { if (S5.race && S5.age >= dur) { /* contado ao fim */ } S5.race = newRace(); S5.age = 0; S5.counted = false; }
+          if (!S5.counted && S5.age >= dur * 0.7) { S5.counts[S5.race.win]++; S5.n++; S5.counted = true; }
+        }
+      }
+      const emp = S5.counts.map((c) => (S5.n ? c / S5.n : 0));
+      r5a.set(fmtInt(S5.n));
+      r5b.set(S5.n ? num(0.5 * emp.reduce((s, v, k) => s + Math.abs(v - target[k]), 0), 3) : '—');
+      const rc = S5.race || { g: Z5.map(() => 0), s: Z5.map((z) => z), win: 0 };
+      const ph = S5.speed === 'lento' ? V.clamp(S5.age / dur, 0, 1) : 1;
+      // raias
+      const lx = 16, lw = narrow ? w - 32 : w * 0.6 - 24;
+      const ly = 34, lh = narrow ? 250 : h - 60;
+      const labW = narrow ? 58 : 66;
+      const tx0 = lx + labW, tx1 = lx + lw - 10;
+      const base = Z5.map((z) => (S5.T > 0 ? z / S5.T : z));
+      const smin = Math.min(...base) - 2.2, smax = Math.max(...base) + 5.2;
+      const X = (v) => tx0 + V.clamp((v - smin) / (smax - smin), 0, 1) * (tx1 - tx0);
+      const rowH = lh / Z5.length;
+      V.text(g, clip(g, S5.T > 0 ? (narrow ? 'escore = z/T + g (rosa = ruído)' : 'escore = z/T + g  (bandeira = z/T; trecho rosa = ruído g)') : 'T = 0: sem ruído, vence o maior logit', w - 32, 11.5, 'mono'), lx, 20, { size: 11.5, font: 'mono', color: C.muted });
+      Z5.forEach((z, k) => {
+        const y = ly + k * rowH + rowH / 2;
+        const isW = ph >= 0.7 && rc.win === k;
+        V.text(g, vis(TOK5[k]), tx0 - 8, y, { size: 12, font: 'mono', align: 'right', base: 'middle', color: isW ? C.c : C.ink });
+        V.line(g, tx0, y, tx1, y, { color: V.alpha(C.muted, 0.25), lw: 1 });
+        const fx = X(base[k]);
+        // bandeira
+        V.line(g, fx, y - rowH * 0.36, fx, y + rowH * 0.1, { color: C.d, lw: 1.6 });
+        g.beginPath(); g.moveTo(fx, y - rowH * 0.36); g.lineTo(fx + 9, y - rowH * 0.3); g.lineTo(fx, y - rowH * 0.22); g.closePath(); g.fillStyle = C.d; g.fill();
+        // corredor
+        const p1 = V.clamp(ph / 0.3, 0, 1), p2 = V.clamp((ph - 0.3) / 0.4, 0, 1);
+        const x1 = V.lerp(X(smin), fx, V.ease.out(p1));
+        const xs = X(rc.s[k]);
+        const xr = p1 < 1 ? x1 : V.lerp(fx, xs, V.ease.out(p2));
+        if (p1 >= 1 && S5.T > 0) V.line(g, fx, y + 1, xr, y + 1, { color: V.alpha(C.c, 0.85), lw: 4 });
+        V.line(g, X(smin), y + 1, Math.min(fx, xr), y + 1, { color: V.alpha(C.a, 0.5), lw: 4 });
+        if (isW) V.glow(g, xr, y, 16, C.c);
+        V.dot(g, xr, y + 1, isW ? 6 : 4.5, isW ? C.c : C.ink);
+        if (isW) V.text(g, 'vence', Math.min(xr + 10, tx1 - 30), y - 8, { size: 11, weight: 600, color: C.c });
+      });
+      // histograma
+      let hx, hy, hw, hh;
+      if (narrow) { hx = 16; hy = ly + lh + 30; hw = w - 32; hh = h - hy - 34; }
+      else { hx = w * 0.6 + 10; hy = 40; hw = w - hx - 18; hh = h - 90; }
+      V.text(g, 'vencedores × softmax(z/T)', hx, hy - 10, { size: 11, font: 'mono', color: C.muted });
+      const bw = hw / Z5.length;
+      const mx = Math.max(0.05, ...target, ...emp) * 1.15;
+      Z5.forEach((_, k) => {
+        const x = hx + k * bw + 5, bwi = bw - 10;
+        const eh = (emp[k] / mx) * (hh - 22), th = (target[k] / mx) * (hh - 22);
+        V.box(g, x, hy + hh - 22 - eh, bwi, Math.max(1, eh), { r: 4, fill: V.alpha(rc.win === k && ph >= 0.7 ? C.c : C.a, 0.7) });
+        V.line(g, x - 3, hy + hh - 22 - th, x + bwi + 3, hy + hh - 22 - th, { color: C.d, lw: 2.4 });
+        V.text(g, clip(g, vis(TOK5[k]), bw - 2, 11, 'mono'), x + bwi / 2, hy + hh - 6, { size: 11, font: 'mono', align: 'center', color: C.muted });
+        if (S5.n) V.text(g, pct(emp[k]), x + bwi / 2, hy + hh - 26 - eh, { size: 10.5, font: 'mono', align: 'center', color: C.ink });
+      });
+    });
+
+    /* ================= Figura 6: penalidades ================= */
+    const f6 = $('#fig-penalidades');
+    fitH(f6, 420, 520);
+    const SEQ6 = ['O', ' gato', ' viu', ' o', ' gato', '.', ' O', ' gato', ' viu'];
+    const CAND6 = [[' o', 4.2], [' um', 3.6], [' a', 3.1], [' gato', 2.8], [' rato', 2.6], ['.', 2.2], [' pássaro', 1.9], [' viu', -0.8]];
+    const cnt6 = {}; SEQ6.forEach((s) => { cnt6[s] = (cnt6[s] || 0) + 1; });
+    const S6 = { r: 1, a: 0, b: 0, cur: null };
+    const c6 = UI.controls(f6);
+    UI.slider(c6, { label: 'repetition_penalty', min: 1, max: 2, step: 0.05, value: 1, fmt: (v) => num(v, 2), onInput: (v) => { S6.r = v; } });
+    UI.slider(c6, { label: 'presence_penalty', min: 0, max: 2, step: 0.1, value: 0, fmt: (v) => num(v, 1), onInput: (v) => { S6.a = v; } });
+    UI.slider(c6, { label: 'frequency_penalty', min: 0, max: 1, step: 0.05, value: 0, fmt: (v) => num(v, 2), onInput: (v) => { S6.b = v; } });
+    const r6a = UI.readout(c6, 'greedy escolhe', '—');
+    const r6b = UI.readout(c6, 'p(escolhido)', '—');
+    const pen6 = (z, c) => { let v = z; if (c > 0) v = v > 0 ? v / S6.r : v * S6.r; return v - S6.a * (c > 0 ? 1 : 0) - S6.b * c; };
+    V.fig(f6, (g, w, h, t, dt) => {
+      const C = V.C();
+      const narrow = w < 600;
+      const zs = CAND6.map(([s, z]) => pen6(z, cnt6[s] || 0));
+      if (!S6.cur) S6.cur = zs.slice();
+      S6.cur = S6.cur.map((v, k) => v + (zs[k] - v) * Math.min(1, dt * 8));
+      const win = argmax(zs);
+      const p = softmax(zs);
+      r6a.set(`“${vis(CAND6[win][0])}”`); r6b.set(pct(p[win]));
+      // sequência
+      V.text(g, 'já gerado:', 16, 20, { size: 11, font: 'mono', color: C.muted });
+      let x = 16, y = 30;
+      const lastIdx = {}; SEQ6.forEach((s, k) => { lastIdx[s] = k; });
+      SEQ6.forEach((s, k) => {
+        const lab = vis(s);
+        const pw = pill(g, lab, 0, 0, { dry: true, size: 12 });
+        if (x + pw + 18 > w - 16) { x = 16; y += 32; }
+        const rep = cnt6[s] > 1;
+        pill(g, lab, x, y, { size: 12, fill: V.alpha(rep ? C.d : C.b, 0.16), stroke: V.alpha(rep ? C.d : C.b, 0.7) });
+        if (rep && lastIdx[s] === k) { V.dot(g, x + pw, y + 1, 9, C.d); V.text(g, '×' + cnt6[s], x + pw, y + 1.5, { size: 10.5, font: 'mono', weight: 700, align: 'center', base: 'middle', color: onInk() }); }
+        x += pw + 8;
+      });
+      pill(g, '?', x, y, { size: 12, dash: [3, 3], stroke: V.alpha(C.muted, 0.7), fill: 'transparent', color: C.muted });
+      // candidatos
+      const top = y + 44, bottom = h - 44;
+      const rowH = (bottom - top) / CAND6.length;
+      const labW = narrow ? 82 : 100;
+      const zmin = -2.5, zmax = 4.6;
+      const ax0 = 16 + labW, ax1 = w - (narrow ? 84 : 120);
+      const X = (v) => ax0 + ((v - zmin) / (zmax - zmin)) * (ax1 - ax0);
+      V.line(g, X(0), top - 6, X(0), bottom, { color: V.alpha(C.muted, 0.6), lw: 1 });
+      V.text(g, '0', X(0), top - 10, { size: 10.5, font: 'mono', align: 'center', color: C.muted });
+      V.text(g, 'logit', ax1, top - 10, { size: 10.5, font: 'mono', align: 'right', color: C.muted });
+      const hiK = [0, 3, 5, 7][Math.floor(t / 2.4) % 4];
+      CAND6.forEach(([s, z], k) => {
+        const yy = top + k * rowH;
+        const c = cnt6[s] || 0;
+        const isW = k === win;
+        V.text(g, vis(s) + (c ? `  ×${c}` : ''), ax0 - 8, yy + rowH / 2, { size: 11.5, font: 'mono', align: 'right', base: 'middle', color: isW ? C.c : C.ink });
+        const bh = Math.max(6, Math.min(24, rowH - 8));
+        const xo = X(Math.min(0, z)), wo = Math.abs(X(z) - X(0));
+        V.box(g, xo, yy + (rowH - bh) / 2, Math.max(1, wo), bh, { r: 3, stroke: V.alpha(C.muted, 0.7), lw: 1 });
+        const zc = S6.cur[k];
+        const xn = X(Math.min(0, zc)), wn = Math.abs(X(zc) - X(0));
+        V.box(g, xn, yy + (rowH - bh) / 2 + 2, Math.max(1, wn), bh - 4, { r: 3, fill: V.alpha(isW ? C.c : c ? C.d : C.a, 0.75) });
+        const endX = Math.max(X(z), X(zc), X(0));
+        V.text(g, c ? `${num(z, 1)} → ${num(zs[k], 2)}` : num(z, 1), endX + 6, yy + rowH / 2, { size: 10.5, font: 'mono', base: 'middle', color: c ? C.d : C.muted });
+        if (isW) star(g, ax0 - 8 - measure(g, vis(s) + (c ? `  ×${c}` : ''), 11.5, 'mono') - 10, yy + rowH / 2, 6, C.c);
+        if (k === hiK) V.box(g, 14, yy + 1, w - 28, rowH - 2, { r: 6, stroke: V.alpha(C.b, 0.5), lw: 1 });
+      });
+      // conta do destacado
+      const [hs, hz] = CAND6[hiK], hc = cnt6[hs] || 0;
+      const step1 = hz > 0 ? `${num(hz, 1)}/${num(S6.r, 2)}` : `${num(hz, 1)}·${num(S6.r, 2)}`;
+      const txt = `“${vis(hs)}” (×${hc}): ${step1} − ${num(S6.a, 1)}·1 − ${num(S6.b, 2)}·${hc} = ${num(zs[hiK], 2)}`;
+      V.text(g, clip(g, txt, w - 32, narrow ? 11 : 12.5, 'mono'), 16, h - 14, { size: narrow ? 11 : 12.5, font: 'mono', color: C.b });
+    });
+
+    /* ================= Figura 7: painel de raciocínio ================= */
+    const f7 = $('#fig-raciocinio');
+    fitH(f7, 360, 380);
+    const MT7 = [256, 512, 800, 1024, 2048, 4096, 8192, 16384, 32768, 65536];
+    const LEN7 = { glm: { Low: 1500, High: 5000, Max: 9000 }, qwen: { low: 1200, medium: 3000, xhigh: 6000 }, ds: { low: 4000, high: 7000, max: 12500 } };
+    const ANS7 = 700;
+    const S7 = { rec: 'ds', think: true, eff: 'max', mt: 2, budget: 'none', hot: false, t0: -10 };
+    const c7 = UI.controls(f7);
+    const restart7 = () => { S7.t0 = H7 ? H7.t : 0; };
+    UI.seg(c7, { label: 'Receita', options: [{ v: 'glm', label: 'GLM' }, { v: 'qwen', label: 'Qwen' }, { v: 'ds', label: 'DeepSeek' }], value: 'ds', onChange: (v) => { S7.rec = v; restart7(); } });
+    UI.toggle(c7, { label: 'thinking', value: true, onChange: (v) => { S7.think = v; restart7(); } });
+    UI.select(c7, { label: 'Esforço', options: [{ v: 'none', label: '(ausente)' }, { v: 'low', label: 'low' }, { v: 'medium', label: 'medium' }, { v: 'high', label: 'high' }, { v: 'xhigh', label: 'xhigh' }, { v: 'max', label: 'max' }], value: 'max', onChange: (v) => { S7.eff = v; restart7(); } });
+    UI.slider(c7, { label: 'max_tokens', min: 0, max: MT7.length - 1, step: 1, value: 2, fmt: (v) => fmtInt(MT7[v]), onInput: (v) => { S7.mt = v; restart7(); } });
+    UI.seg(c7, { label: 'thinking_token_budget', options: [{ v: 'none', label: 'sem campo' }, { v: '0', label: '0' }, { v: '1024', label: '1024' }, { v: '4096', label: '4096' }], value: 'none', onChange: (v) => { S7.budget = v; restart7(); } });
+    UI.toggle(c7, { label: 'hotfix #31 no boot (DS)', value: false, onChange: (v) => { S7.hot = v; restart7(); } });
+    function resolve7() {
+      const r = S7.rec, e = S7.eff, th = S7.think;
+      const o = { http: 200, err: '', level: 'off', dirTok: 0, kw: '', rule: '', tail: '', think: 0, forced: false, budNote: '', budWarn: false };
+      const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1);
+      const effStr = e === 'none' ? '' : `, "reasoning_effort": "${e}"`;
+      if (r === 'glm') {
+        o.kw = `{"enable_thinking": ${th}${effStr}}`;
+        if (!th) { o.rule = 'thinking off: o esforço é ignorado; o template fecha <think></think>'; o.tail = '<|assistant|><think></think>'; }
+        else {
+          o.level = e === 'low' || e === 'high' ? cap(e) : 'Max';
+          o.rule = e === 'low' || e === 'high' ? `“${e}” é aceito → o template escreve Reasoning Effort: ${cap(e)}` : e === 'none' ? 'ausente → max, escrito Reasoning Effort: Max (fallback do template)' : `“${e}” está fora de low/high → max, escrito Reasoning Effort: Max`;
+          o.tail = `<|system|>Reasoning Effort: ${o.level} … <|assistant|><think>`;
+          o.think = LEN7.glm[o.level];
+        }
+        if (S7.budget !== 'none') o.budNote = 'a receita não documenta orçamento de raciocínio: só max_tokens limita';
+      } else if (r === 'qwen') {
+        o.kw = `{"enable_thinking": ${th}${effStr}}`;
+        if (!th) { o.rule = e === 'high' || e === 'max' ? `“${e}” seria inválido, mas com thinking off é ignorado em silêncio` : 'thinking off: <think></think> vazio pré-preenchido'; o.tail = '<|im_start|>assistant\\n<think></think>'; }
+        else if (e === 'high' || e === 'max') { o.http = 400; o.err = `Unexpected reasoning effort ${e}. Supported types are xhigh (default), medium, and low.`; o.rule = `“${e}” não é aceito no ramo de thinking`; }
+        else { o.level = e === 'none' ? 'xhigh' : e; o.rule = e === 'none' ? 'ausente → xhigh (default do template)' : `“${e}” é válido`; o.tail = '<|im_start|>assistant\\n<think>'; o.think = LEN7.qwen[o.level]; }
+        if (S7.budget !== 'none') o.budNote = 'chat_template_kwargs.thinking_budget não é honrado por este build';
+      } else {
+        o.kw = th ? `{"thinking": true${effStr}}` : '{"thinking": false}';
+        if (!th) { o.rule = 'thinking off: {"thinking": false}'; o.tail = '<｜Assistant｜></think>'; }
+        else {
+          o.level = e === 'max' || e === 'xhigh' ? 'max' : e === 'high' ? 'high' : 'low';
+          o.dirTok = o.level === 'max' ? 93 : o.level === 'high' ? 80 : 0;
+          o.rule = e === 'none' ? 'ausente → DEFAULT_THINKING=low' : e === 'max' || e === 'xhigh' || e === 'high' ? `“${e}” → ${o.level} (patch inline)` : `“${e}” → low (patch: qualquer outro vira low)`;
+          o.tail = `<BOS>${o.dirTok ? '[diretiva ' + o.level + ']' : ''} … <｜Assistant｜><think>`;
+          o.think = LEN7.ds[o.level];
+        }
+        if (S7.budget !== 'none') {
+          if (!S7.hot) { o.http = 400; o.err = 'thinking_token_budget is not yet supported by the V2 model runner'; o.rule += ' · orçamento sem o hotfix'; }
+          else if (th) {
+            const B = +S7.budget, M = MT7[S7.mt];
+            if (B === 0) { o.think = 0; o.budNote = 'orçamento 0: raciocínio desligado nesta requisição'; }
+            else if (o.think > B && B < M) { o.think = B; o.forced = true; o.budNote = `orçamento ${B}: </think> forçado na fronteira`; }
+            else if (o.think > B) { o.budWarn = true; o.budNote = `orçamento ${B} ≥ max_tokens ${M}: o teto corta antes do </think> forçado. Mantenha max_tokens folgadamente acima do orçamento.`; }
+            else o.budNote = `orçamento ${B} não atingido: </think> natural`;
+          }
+        }
+      }
+      return o;
+    }
+    const H7 = V.fig(f7, (g, w, h, t) => {
+      const C = V.C();
+      const narrow = w < 600;
+      const o = resolve7();
+      const M = MT7[S7.mt];
+      const rc = C[S7.rec] || C.a;
+      // bloco 1: requisição → template
+      let y = 18;
+      V.text(g, 'chat_template_kwargs', 16, y, { size: 11, font: 'mono', color: C.muted });
+      y += 8;
+      const kwW = pill(g, clip(g, o.kw, narrow ? w - 46 : w * 0.46, 11.5, 'mono'), 16, y, { size: 11.5, fill: V.alpha(rc, 0.12), stroke: V.alpha(rc, 0.7) });
+      let rx, ry;
+      if (narrow) { rx = 16; ry = y + 34; } else { rx = 16 + kwW + 40; ry = y; V.arrow(g, 16 + kwW + 6, y + 11, rx - 6, y + 11, { color: C.muted }); }
+      if (o.http === 400) {
+        pill(g, 'HTTP 400', rx, ry, { size: 12, weight: 700, fill: V.alpha(C.red, 0.18), stroke: C.red, color: C.red });
+        let yy = textBlock(g, o.err, 16, ry + 44, w - 32, { size: 12.5, font: 'mono', color: C.red, lh: 18 });
+        yy = textBlock(g, 'A requisição falha antes de chegar ao motor: nenhum token é gerado.', 16, yy + 10, w - 32, { size: 12.5, color: C.muted });
+        if (o.rule) textBlock(g, o.rule, 16, yy + 8, w - 32, { size: 12, color: C.muted, lh: 16 });
+        return;
+      }
+      pill(g, clip(g, `nível: ${o.level}${o.dirTok ? ` · +${o.dirTok} tokens no prompt` : ''}`, narrow ? w - 32 : w - rx - 16, 11.5, 'mono'), rx, ry, { size: 11.5, fill: V.alpha(C.b, 0.15), stroke: V.alpha(C.b, 0.7) });
+      const y2 = ry + 32;
+      const yRule = textBlock(g, o.rule, 16, y2 + 10, w - 32, { size: 12, color: C.ink, lh: 16 });
+      V.text(g, noLig(clip(g, 'fim do prompt (simplificado): ' + o.tail, w - 32, 11, 'mono')), 16, yRule + 4, { size: 11, font: 'mono', color: C.muted });
+      // bloco 2: a faixa de tokens
+      const total = o.think + (S7.think ? 1 : 0) + ANS7;
+      const Xmax = Math.max(M, total) * 1.04;
+      const bx = 16, bw = w - 32, by = yRule + 40, bh = 34;
+      const X = (n) => bx + (n / Xmax) * bw;
+      const tt = t - S7.t0;
+      const prog = V.clamp(tt / 2.6, 0, 1);
+      const genEnd = Math.min(M, total);
+      const front = genEnd * V.ease.inOut(prog);
+      // rótulo centrado no marcador, mas preso dentro da faixa (nunca sai pelas bordas)
+      const markLabel = (s, x, yy, o2) => { const lw = measure(g, noLig(s), o2.size, 'mono', o2.weight || 400); const lx = V.clamp(x - lw / 2, bx, bx + bw - lw); V.text(g, noLig(s), lx, yy, Object.assign({ font: 'mono', align: 'left' }, o2)); };
+      V.text(g, 'tokens gerados →', bx, by - 8, { size: 11, font: 'mono', color: C.muted });
+      V.box(g, bx, by, bw, bh, { r: 8, fill: V.alpha(C.muted, 0.07), stroke: V.alpha(C.muted, 0.25), lw: 1 });
+      // fantasma do que teria sido gerado
+      if (total > M) {
+        g.setLineDash([4, 4]); V.box(g, X(M) + 2, by + 4, X(total) - X(M) - 2, bh - 8, { r: 5, stroke: V.alpha(C.muted, 0.5), lw: 1 }); g.setLineDash([]);
+        if (X(total) - X(M) > 90) V.text(g, 'não gerado (cortado)', (X(M) + X(total)) / 2, by + bh / 2 + 0.5, { size: 10.5, font: 'mono', align: 'center', base: 'middle', color: C.muted });
+      }
+      const segTh = Math.min(front, o.think);
+      if (segTh > 0) V.box(g, X(0), by + 4, Math.max(1, X(segTh) - X(0)), bh - 8, { r: 5, fill: V.alpha(C.b, 0.7) });
+      const ansStart = o.think + (S7.think ? 1 : 0);
+      if (front > ansStart) V.box(g, X(ansStart), by + 4, Math.max(1, X(Math.min(front, total)) - X(ansStart)), bh - 8, { r: 5, fill: V.alpha(C.a, 0.75) });
+      // partículas correndo no que já foi gerado (streaming)
+      for (let k = 0; k < 14; k++) {
+        const u = ((t * 0.18 + k / 14) % 1) * front;
+        if (front < 2) break;
+        V.dot(g, X(u), by + 9 + ((k * 7) % 17), 1.6, V.alpha(C.ink, 0.55));
+      }
+      if (prog < 1) V.glow(g, X(front), by + bh / 2, 12, C.c, 0.8);
+      // marcadores (legendas abaixo da faixa, uma por linha)
+      let ly = by + bh + 15;
+      if (S7.think && front > o.think) {
+        const ex = X(o.think);
+        V.line(g, ex, by - 2, ex, by + bh + 4, { color: o.forced ? C.red : C.ink, lw: 2.4 });
+        if (o.forced) star(g, ex, by - 6, 6, C.red);
+        markLabel(o.forced ? `</think> forçado (token ${fmtInt(o.think)})` : `</think> natural (token ${fmtInt(o.think)})`, ex, ly, { size: 10.5, color: o.forced ? C.red : C.ink });
+        ly += 15;
+      }
+      const mxX = X(M);
+      V.line(g, mxX, by - 4, mxX, by + bh + 4, { color: C.d, lw: 2 });
+      markLabel(`max_tokens = ${fmtInt(M)}`, mxX, ly, { size: 11, weight: 600, color: C.d });
+      ly += 15;
+      if (S7.rec === 'ds' && S7.hot && S7.budget !== 'none' && +S7.budget > 0) {
+        const bX = X(+S7.budget);
+        const bCol = o.forced ? C.red : C.muted;
+        g.setLineDash(o.forced ? [3, 3] : [2, 4]); V.line(g, bX, o.forced ? by + bh : by - 2, bX, ly - 10, { color: bCol, lw: 1.2 }); g.setLineDash([]);
+        markLabel(`thinking_token_budget = ${S7.budget}${o.forced ? '' : ' (não alcançado)'}`, bX, ly, { size: 10.5, color: bCol });
+        ly += 15;
+      }
+      // bloco 3: resultado
+      const ry3 = ly + 8;
+      const cutThink = M < o.think;
+      const cutAns = !cutThink && M < total;
+      const fin = cutThink || cutAns ? 'length' : 'stop';
+      const done = prog >= 1;
+      const reasonN = Math.min(o.think, M);
+      const contentN = Math.max(0, Math.min(M, total) - ansStart);
+      const cards = [
+        ['finish_reason', done ? fin : '…', fin === 'length' ? C.red : C.a],
+        ['reasoning', done ? `${fmtInt(reasonN)} tokens` : '…', C.b],
+        ['content', done ? (cutThink ? 'null / vazio' : cutAns ? `cortado (${fmtInt(contentN)})` : `ok (${fmtInt(contentN)})`) : '…', cutThink ? C.red : C.a],
+      ];
+      const cw = (w - 32 - 2 * 10) / 3;
+      cards.forEach(([k, v, col], j) => {
+        const cx = 16 + j * (cw + 10);
+        V.box(g, cx, ry3, cw, 50, { r: 10, fill: V.alpha(col, 0.1), stroke: V.alpha(col, 0.5) });
+        V.text(g, k, cx + 10, ry3 + 17, { size: 10.5, font: 'mono', color: C.muted });
+        V.text(g, clip(g, v, cw - 16, narrow ? 11.5 : 13, 'mono', 600), cx + 10, ry3 + 38, { size: narrow ? 11.5 : 13, font: 'mono', weight: 600, color: col });
+      });
+      const noteY = ry3 + 74;
+      let note = o.budNote;
+      if (!note) note = S7.rec === 'ds' && o.level === 'max' ? 'DS max: ~12,5 mil tokens de raciocínio num prompt moderado (medido); ≈ 3× a latência de low' : 'comprimentos de raciocínio ilustrativos (exceto DS max, medido); resposta ilustrativa de 700 tokens';
+      textBlock(g, note, 16, noteY, w - 32, { size: 12, color: o.forced ? C.red : o.budWarn ? C.d : C.muted, weight: o.budWarn ? 600 : 400, lh: 17 });
+    });
+
+    /* ================= Figura 8: detector de laços ================= */
+    const f8 = $('#fig-loop');
+    fitH(f8, 380, 540);
+    const R8 = V.rng(88);
+    const SYL = ['ra', 'te', 'mi', 'no', 'ca', 'lo', 'sa', 'vi', 'du', 'pe', 'ta', 'ri', 'mo', 'le', 'ga', 'zu', 'fe', 'bo', 'ni', 'xa', 'po', 'se'];
+    const mkWord = () => { const n = 2 + R8.int(2); let s = ''; for (let k = 0; k < n; k++) s += SYL[R8.int(SYL.length)]; return s; };
+    const LEX = Array.from({ length: 3000 }, mkWord);
+    const COMMON = ['então', 'o', 'de', 'que', 'a', 'para', 'vamos', 'isso', 'é', 'um', 'no', 'se', 'com', 'resultado', 'passo', 'valor', 'mas', 'agora'];
+    const PHRASES = [
+      ['vamos', 'verificar', 'o', 'resultado', 'de', 'novo', 'com', 'cuidado', 'agora'],
+      ['isso', 'confirma', 'o', 'passo', 'anterior', 'e', 'podemos', 'seguir', 'em', 'frente'],
+      ['então', 'o', 'valor', 'final', 'deve', 'ser', 'coerente', 'com', 'a', 'hipótese'],
+      ['preciso', 'lembrar', 'que', 'a', 'condição', 'inicial', 'vale', 'para', 'todos'],
+      ['olhando', 'de', 'outro', 'jeito', 'o', 'problema', 'fica', 'mais', 'simples'],
+      ['a', 'próxima', 'etapa', 'é', 'somar', 'os', 'termos', 'que', 'sobraram'],
+    ];
+    const healthy = (n) => { const out = []; while (out.length < n) { if (R8() < 0.04) out.push(...PHRASES[R8.int(PHRASES.length)]); else out.push(R8() < 0.32 ? COMMON[R8.int(COMMON.length)] : LEX[R8.int(LEX.length)]); } return out.slice(0, n); };
+    const TPL = [['espera', 'deixa', 'eu', 'conferir', 'de', 'novo', 'o', 'passo', '#', 'com', 'cuidado'], ['na', 'verdade', 'o', 'passo', '#', 'parece', 'certo', 'mas', 'vamos', 'revisar'], ['então', 'o', 'valor', 'de', '#', 'continua', 'o', 'mesmo', 'de', 'antes']];
+    const VAR = ['dois', 'três', 'x', 'y'];
+    const looping = (n) => { const out = []; while (out.length < n) { const tp = TPL[R8.int(TPL.length)], v = VAR[R8.int(VAR.length)]; tp.forEach((wd) => out.push(wd === '#' ? v : wd)); } return out.slice(0, n); };
+    const WIN = 700;
+    const TR8 = {
+      tail: healthy(WIN * 36),
+      loop: healthy(WIN * 9).concat(looping(WIN * 27)),
+      trans: (() => { const a = healthy(WIN * 14); const quote = a.slice(WIN * 3, WIN * 7); return a.concat(quote, healthy(WIN * 18)); })(),
+    };
+    function analyse8(words) {
+      const seen = new Set();
+      const rows = [];
+      let chars = 0;
+      for (let i = 0; i + WIN / 2 <= words.length; i += WIN) {
+        const chunk = words.slice(i, i + WIN);
+        if (chunk.length < WIN / 2) break;
+        const sh = new Set();
+        for (let j = 0; j + 8 <= chunk.length; j++) sh.add(chunk.slice(j, j + 8).join(' '));
+        let nov = 0; sh.forEach((s) => { if (!seen.has(s)) nov++; });
+        sh.forEach((s) => seen.add(s));
+        rows.push({ tok: chars / 4, nov: sh.size ? nov / sh.size : 1, text: chunk.slice(0, 16).join(' ') });
+        chunk.forEach((wd) => { chars += wd.length + 1; });
+      }
+      return rows;
+    }
+    const RW8 = { tail: analyse8(TR8.tail), loop: analyse8(TR8.loop), trans: analyse8(TR8.trans) };
+    function verdict8(rows, th) {
+      let dry = 0, onset = null; const trans = [];
+      rows.forEach((r, i) => {
+        if (r.nov < th) { dry++; if (dry === 3 && onset == null) onset = i - 2; }
+        else { if (onset != null) { trans.push([onset, i]); onset = null; } dry = 0; }
+      });
+      return { onset, trans };
+    }
+    const S8 = { tr: 'loop', th: 0.02, t0: -6 };
+    const c8 = UI.controls(f8);
+    UI.seg(c8, { label: 'Traço', options: [{ v: 'tail', label: 'cauda longa' }, { v: 'loop', label: 'laço templado' }, { v: 'trans', label: 'repetição transitória' }], value: 'loop', onChange: (v) => { S8.tr = v; S8.t0 = H8.t - 0.5; } });
+    UI.slider(c8, { label: 'limiar', min: 0.005, max: 0.1, step: 0.005, value: 0.02, fmt: (v) => pct(v, 1), onInput: (v) => { S8.th = v; } });
+    const H8 = V.fig(f8, (g, w, h, t, dt, S, HH) => {
+      const C = V.C();
+      const narrow = w < 600;
+      const rows = RW8[S8.tr];
+      const vd = verdict8(rows, S8.th);
+      const px = 52, py = 30, pw = w - px - 18, phh = h - py - (narrow ? 130 : 104);
+      const tmax = rows[rows.length - 1].tok * 1.02;
+      const X = (tk) => px + (tk / tmax) * pw;
+      const Y = (nv) => py + phh - Math.sqrt(V.clamp(nv, 0, 1)) * phh;
+      V.box(g, px, py, pw, phh, { r: 6, fill: V.alpha(C.muted, 0.04), stroke: V.alpha(C.muted, 0.2), lw: 1 });
+      [0, 0.02, 0.1, 0.25, 0.5, 1].forEach((v) => { V.line(g, px, Y(v), px + pw, Y(v), { color: V.alpha(C.muted, 0.12), lw: 1 }); V.text(g, pct(v, 0), px - 6, Y(v), { size: 10.5, font: 'mono', align: 'right', base: 'middle', color: C.muted }); });
+      V.text(g, narrow ? 'novidade de 8-gramas (eixo √)' : 'novidade de 8-gramas por janela (eixo em raiz quadrada)', px, py - 10, { size: 11, font: 'mono', color: C.muted });
+      for (let k = 0; k <= 4; k++) { const tk = (tmax * k) / 4; V.text(g, `${fmtInt(tk / 1000)}k`, X(tk), py + phh + 14, { size: 10.5, font: 'mono', align: 'center', color: C.muted }); }
+      V.text(g, 'tokens ≈ chars/4', px + pw, py + phh + 28, { size: 10.5, font: 'mono', align: 'right', color: C.muted });
+      // limiar
+      g.setLineDash([5, 4]); V.line(g, px, Y(S8.th), px + pw, Y(S8.th), { color: C.red, lw: 1.5 }); g.setLineDash([]);
+      V.text(g, `limiar ${pct(S8.th, 1)}`, px + pw - 4, Y(S8.th) - 6, { size: 10.5, font: 'mono', align: 'right', color: C.red });
+      // regiões de veredito
+      // cursor de leitura
+      const tt = t - S8.t0, per = 6;
+      const f = V.clamp((tt % (per + 5)) / per, 0, 1);
+      const nShow = Math.max(1, Math.ceil(f * rows.length));
+      if (f >= 1) {
+        vd.trans.forEach(([a, b]) => { V.box(g, X(rows[a].tok), py + 1, X(rows[b].tok) - X(rows[a].tok), phh - 2, { r: 0, fill: V.alpha(C.d, 0.14) }); });
+        if (vd.onset != null) V.box(g, X(rows[vd.onset].tok), py + 1, px + pw - X(rows[vd.onset].tok), phh - 2, { r: 0, fill: V.alpha(C.red, 0.12) });
+      }
+      g.beginPath();
+      rows.slice(0, nShow).forEach((r, i) => { const xx = X(r.tok), yy = Y(r.nov); i ? g.lineTo(xx, yy) : g.moveTo(xx, yy); });
+      g.strokeStyle = C.a; g.lineWidth = 2; g.stroke();
+      rows.slice(0, nShow).forEach((r) => V.dot(g, X(r.tok), Y(r.nov), 3, r.nov < S8.th ? C.red : C.a));
+      let hi = nShow - 1;
+      const P = HH.pointer;
+      if (P.inside && P.x >= px && P.x <= px + pw && P.y <= py + phh + 20) { let best = 0; rows.forEach((r, i) => { if (Math.abs(X(r.tok) - P.x) < Math.abs(X(rows[best].tok) - P.x)) best = i; }); hi = best; }
+      const hr = rows[hi];
+      V.line(g, X(hr.tok), py, X(hr.tok), py + phh, { color: V.alpha(C.c, 0.6), lw: 1 });
+      V.glow(g, X(hr.tok), Y(hr.nov), 12, C.c, 0.7);
+      // veredito + trecho
+      const vy = py + phh + (narrow ? 50 : 48);
+      let vtxt, vcol;
+      if (f < 1 && !P.inside) { vtxt = 'lendo o traço…'; vcol = C.muted; }
+      else if (vd.onset != null) { vtxt = `LAÇO a partir de ~${fmtInt(rows[vd.onset].tok)} tokens: aumentar max_tokens não ajuda`; vcol = C.red; }
+      else if (vd.trans.length) { vtxt = `repetição transitória (~${fmtInt(rows[vd.trans[0][0]].tok)}–${fmtInt(rows[vd.trans[0][1]].tok)}); depois recupera: não é laço`; vcol = C.d; }
+      else { vtxt = 'CAUDA LONGA: a novidade nunca colapsa; aumentar max_tokens ajuda'; vcol = C.a; }
+      textBlock(g, vtxt, 16, vy, w - 32, { size: narrow ? 12 : 13, weight: 600, color: vcol, lh: 17 });
+      V.text(g, clip(g, `janela ${hi + 1} · novidade ${pct(hr.nov, 1)} · “${hr.text} …”`, w - 32, 11, 'mono'), 16, h - 12, { size: 11, font: 'mono', color: C.muted });
+    });
+
+    /* ================= Figura 9: não-associatividade ================= */
+    const f9 = $('#fig-float');
+    fitH(f9, 410, 460);
+    const VALS9 = [256, 0.75, 0.75, -256, 0.75, 0.5, 1.25, -0.25];
+    const EXACT9 = VALS9.reduce((a, b) => a + b, 0);
+    const R9 = V.rng(9);
+    const S9 = { fmt: 'bf16', fixed: false, auto: true, perm: VALS9.map((_, i) => i), hist: [], t0: 0 };
+    const rnd9 = (x) => LA.num.round(S9.fmt, x);
+    function tree9(perm) {
+      const lv = [perm.map((i) => ({ v: rnd9(VALS9[i]), ex: VALS9[i], lost: false }))];
+      while (lv[lv.length - 1].length > 1) {
+        const prev = lv[lv.length - 1], nxt = [];
+        for (let k = 0; k < prev.length; k += 2) { const ex = prev[k].v + prev[k + 1].v; const v = rnd9(ex); nxt.push({ v, ex, lost: v !== ex }); }
+        lv.push(nxt);
+      }
+      return lv;
+    }
+    function run9() {
+      if (S9.fixed) S9.perm = VALS9.map((_, i) => i);
+      else { const p = VALS9.map((_, i) => i); for (let k = p.length - 1; k > 0; k--) { const j = R9.int(k + 1); [p[k], p[j]] = [p[j], p[k]]; } S9.perm = p; }
+      const lv = tree9(S9.perm);
+      S9.hist.push(lv[lv.length - 1][0].v);
+      if (S9.hist.length > 30) S9.hist.shift();
+      S9.t0 = H9 ? H9.t : 0;
+    }
+    const c9 = UI.controls(f9);
+    UI.button(c9, '▶ rodar de novo', () => run9(), { primary: true });
+    UI.toggle(c9, { label: 'ordem fixa (patch de determinismo)', value: false, onChange: (v) => { S9.fixed = v; S9.hist = []; run9(); } });
+    UI.seg(c9, { label: 'Formato', options: [{ v: 'bf16', label: 'BF16' }, { v: 'fp32', label: 'FP32' }], value: 'bf16', onChange: (v) => { S9.fmt = v; S9.hist = []; run9(); } });
+    UI.toggle(c9, { label: 'rodar sozinho', value: true, onChange: (v) => { S9.auto = v; } });
+    V.every(2600, () => { if (S9.auto) run9(); });
+    let H9 = null;
+    H9 = V.fig(f9, (g, w, h, t) => {
+      const C = V.C();
+      const narrow = w < 600;
+      const lv = tree9(S9.perm);
+      const root9 = lv[lv.length - 1][0].v;
+      const tt = t - S9.t0;
+      const reveal = Math.floor(tt / 0.35);
+      const cellW = Math.min(64, (w - 32 - 7 * 6) / 8), cellH = 26;
+      const levY = [40, 92, 144, 196].map((v) => v + (narrow ? 4 : 0));
+      V.text(g, `soma de 8 termos em ${S9.fmt === 'bf16' ? 'BF16' : 'FP32'} · exato = ${num(EXACT9, 2)}`, 16, 20, { size: 11.5, font: 'mono', color: C.muted });
+      const centers = [];
+      lv.forEach((lev, L) => {
+        const n = lev.length;
+        const span = 8 * cellW + 7 * 6;
+        const x0 = (w - span) / 2;
+        const cs = [];
+        lev.forEach((nd, k) => {
+          const slotW = span / n;
+          const cx = x0 + slotW * k + slotW / 2;
+          cs.push(cx);
+          const on = L <= reveal;
+          const bw = Math.min(L ? cellW * 1.45 : cellW, slotW - 6);
+          const col = L === 3 ? C.c : L === 0 ? C.b : C.a;
+          if (L > 0 && on) {
+            const pc = centers[L - 1];
+            V.line(g, pc[2 * k], levY[L - 1] + cellH, cx, levY[L], { color: V.alpha(C.muted, 0.5), lw: 1.2 });
+            V.line(g, pc[2 * k + 1], levY[L - 1] + cellH, cx, levY[L], { color: V.alpha(C.muted, 0.5), lw: 1.2 });
+          }
+          V.box(g, cx - bw / 2, levY[L], bw, cellH, { r: 6, fill: on ? V.alpha(col, 0.18) : V.alpha(C.muted, 0.06), stroke: on ? V.alpha(col, 0.8) : V.alpha(C.muted, 0.3), lw: 1.2 });
+          const s = on ? (Math.abs(nd.v) >= 100 ? String(nd.v).replace('.', ',') : num(nd.v, 2)) : '·';
+          V.text(g, s, cx, levY[L] + cellH / 2 + 0.5, { size: 11.5, font: 'mono', align: 'center', base: 'middle', color: C.ink });
+          if (on && nd.lost) { V.dot(g, cx + bw / 2 - 3, levY[L] + 3, 4, C.red); }
+        });
+        centers.push(cs);
+      });
+      // linha dos resultados
+      const ly = narrow ? 290 : 262, lx0 = 40, lx1 = w - 40;
+      const vmin = 1.5, vmax = 5;
+      const LX = (v) => lx0 + ((V.clamp(v, vmin, vmax) - vmin) / (vmax - vmin)) * (lx1 - lx0);
+      V.line(g, lx0, ly, lx1, ly, { color: V.alpha(C.muted, 0.5), lw: 1.4 });
+      V.box(g, LX(3.5), ly - 16, lx1 - LX(3.5), 32, { r: 0, fill: V.alpha(C.b, 0.08) });
+      V.box(g, lx0, ly - 16, LX(3.5) - lx0, 32, { r: 0, fill: V.alpha(C.a, 0.08) });
+      V.line(g, LX(3.5), ly - 20, LX(3.5), ly + 20, { color: C.d, lw: 1.6 });
+      V.text(g, 'empate 3,5', LX(3.5) - 4, ly + 20, { size: 10.5, font: 'mono', align: 'right', color: C.d });
+      V.line(g, LX(EXACT9), ly - 12, LX(EXACT9), ly + 12, { color: C.ink, lw: 1, dash: [2, 2] });
+      V.text(g, 'exato 3,75', LX(EXACT9) + 4, ly + 20, { size: 10.5, font: 'mono', color: C.ink });
+      V.text(g, '← Paris vence', lx0, ly - 22, { size: 10.5, font: 'mono', color: C.a });
+      V.text(g, 'Lyon vence →', lx1, ly - 22, { size: 10.5, font: 'mono', align: 'right', color: C.b });
+      const tally = {};
+      S9.hist.forEach((v, k) => { const key = v.toFixed(3); tally[key] = (tally[key] || 0) + 1; const yy = ly - 3 - (tally[key] - 1) * 5; V.dot(g, LX(v), Math.max(ly - 14, yy), 3.2, V.alpha(v < 3.5 ? C.a : C.b, k === S9.hist.length - 1 ? 1 : 0.6)); });
+      const nP = S9.hist.filter((v) => v < 3.5).length, nL = S9.hist.length - nP;
+      V.text(g, `últimas ${S9.hist.length} rodadas: Paris ${nP} · Lyon ${nL}`, lx0, ly + 48, { size: 11, font: 'mono', color: C.muted });
+      // continuação
+      const cy = Math.min(h - 56, ly + 84);
+      const win = root9 < 3.5 ? 'Paris' : 'Lyon';
+      const margin = root9 - 3.5;
+      const cy2 = textBlock(g, `margem z(Lyon) − z(Paris) = soma − 3,5 = ${num(margin, 2)} → greedy escolhe “${win}”`, 16, cy, w - 32, { size: narrow ? 11 : 12, font: 'mono', color: C.ink, lh: 16 });
+      const cont = win === 'Paris' ? '“… a cidade mais visitada é Paris, a cidade luz.”' : '“… a cidade mais visitada é Lyon, a capital da gastronomia.”';
+      textBlock(g, cont + '  (continuações ilustrativas)', 16, cy2 + 6, w - 32, { size: 12.5, color: win === 'Paris' ? C.a : C.b, weight: 600, lh: 17 });
+    });
+    run9();
+
+    /* ================= Figura 10: aceitação × temperatura ================= */
+    const f10 = $('#fig-spec');
+    fitH(f10, 400, 540);
+    const R10 = V.rng(19);
+    const N10 = 48, SC10 = 2.2;
+    const ZP10 = []; for (let i = 0; i < N10; i++) ZP10.push(SC10 * (i === 0 ? 4.0 : 2.2 - 0.09 * i + R10.normal() * 0.3));
+    const ZQ10 = ZP10.map((v, i) => (i === 0 ? v - 0.6 * SC10 : v + R10.normal() * 0.6 * SC10));
+    const ORD10 = ZP10.map((v, i) => i).sort((a, b) => ZP10[b] - ZP10[a]);
+    const SHOW10 = ORD10.slice(0, 8), REST10 = ORD10.slice(8);
+    const ZQ10b = ZQ10.slice(); { const sec = ORD10[1]; const tmp = ZQ10b[0]; ZQ10b[0] = ZQ10b[sec]; ZQ10b[sec] = tmp; }
+    const LAB10 = [' Paris', ' a', ' uma', ' Lyon', ' o', ' conhecida', ' hoje', ' também'];
+    const S10 = { T: 1, diff: false };
+    const c10 = UI.controls(f10);
+    UI.slider(c10, { label: 'Temperatura', min: 0, max: 2, step: 0.05, value: 1, fmt: (v) => (v === 0 ? '0 greedy' : num(v, 2)), onInput: (v) => { S10.T = v; } });
+    UI.toggle(c10, { label: 'favoritos diferentes', value: false, onChange: (v) => { S10.diff = v; } });
+    const r10a = UI.readout(c10, 'aceitação', '—');
+    const r10b = UI.readout(c10, 'TV(p, q)', '—');
+    const r10c = UI.readout(c10, 'tokens/passo (k = 3, c/ bônus)', '—');
+    const alpha10 = (T) => { const p = softmax(ZP10, T), q = softmax(S10.diff ? ZQ10b : ZQ10, T); return { a: p.reduce((s, v, i) => s + Math.min(v, q[i]), 0), p, q }; };
+    V.fig(f10, (g, w, h, t) => {
+      const C = V.C();
+      const narrow = w < 600;
+      const { a, p, q } = alpha10(S10.T);
+      const k = 3;
+      const tps = a >= 0.9999 ? k + 1 : (1 - Math.pow(a, k + 1)) / (1 - a);
+      r10a.set(pct(a, 1)); r10b.set(num(1 - a, 3)); r10c.set(num(tps, 2));
+      const vals = (arr) => SHOW10.map((i) => arr[i]).concat([REST10.reduce((s, i) => s + arr[i], 0)]);
+      const pv = vals(p), qv = vals(q);
+      const labs = LAB10.concat(['cauda']);
+      // barras verticais
+      const bx = 16, bw = narrow ? w - 32 : w * 0.6 - 24, by = 34, bh = narrow ? 230 : h - 80;
+      const nb = pv.length, slot = bw / nb, bwi = Math.min(42, slot - 8);
+      const mx = Math.max(...pv, ...qv, 0.05);
+      V.text(g, clip(g, `${narrow ? 'p (menta) · q (lilás)' : 'alvo p (menta) · rascunhador q (lilás)'} · T = ${S10.T === 0 ? '0' : num(S10.T, 2)}`, w - 32, 11.5, 'mono'), bx, 20, { size: 11.5, font: 'mono', color: C.muted });
+      const labPad = narrow ? 74 : 20;
+      pv.forEach((pvv, j) => {
+        const x = bx + j * slot + (slot - bwi) / 2;
+        const base = by + bh - labPad;
+        const hp = (pvv / mx) * (bh - labPad - 24), hq = (qv[j] / mx) * (bh - labPad - 24), hm = Math.min(hp, hq);
+        V.box(g, x, base - hp, bwi, Math.max(1, hp), { r: 4, fill: V.alpha(C.a, 0.28) });
+        V.box(g, x, base - hm, bwi, Math.max(1, hm), { r: 4, fill: V.alpha(C.a, 0.85) });
+        V.box(g, x - 2, base - hq, bwi + 4, Math.max(1, hq), { r: 4, stroke: C.b, lw: 2 });
+        if (narrow) {
+          g.save(); g.translate(x + bwi / 2 + 4, base + 6); g.rotate(-Math.PI / 2);
+          V.text(g, vis(labs[j]), 0, 0, { size: 11, font: 'mono', align: 'right', color: C.muted });
+          g.restore();
+        } else V.text(g, clip(g, vis(labs[j]), slot - 2, 11, 'mono'), x + bwi / 2, by + bh - 4, { size: 11, font: 'mono', align: 'center', color: C.muted });
+      });
+      // curva α(T)
+      let cx, cy, cw, chh;
+      if (narrow) { cx = 40; cy = by + bh + 34; cw = w - 58; chh = h - cy - 34; }
+      else { cx = w * 0.6 + 34; cy = 44; cw = w - cx - 20; chh = h - 110; }
+      V.box(g, cx, cy, cw, chh, { r: 8, fill: V.alpha(C.muted, 0.05), stroke: V.alpha(C.muted, 0.25), lw: 1 });
+      V.text(g, 'aceitação α(T) = Σ min(p, q)', cx, cy - 10, { size: 11, font: 'mono', color: C.muted });
+      const TX = (T) => cx + 6 + (T / 2) * (cw - 12);
+      const AY = (v) => cy + chh - 6 - v * (chh - 12);
+      [0, 0.5, 1].forEach((v) => { V.line(g, cx, AY(v), cx + cw, AY(v), { color: V.alpha(C.muted, 0.14), lw: 1 }); V.text(g, pct(v, 0), cx - 4, AY(v), { size: 10.5, font: 'mono', align: 'right', base: 'middle', color: C.muted }); });
+      [[0, 'T = 0'], [1, '1'], [2, '2']].forEach(([T, l]) => V.text(g, l, TX(T), cy + chh + 14, { size: 10.5, font: 'mono', align: T === 0 ? 'left' : T === 2 ? 'right' : 'center', color: C.muted }));
+      g.beginPath();
+      for (let s = 1; s <= 80; s++) { const T = (s / 80) * 2; const v = alpha10(T).a; s > 1 ? g.lineTo(TX(T), AY(v)) : g.moveTo(TX(T), AY(v)); }
+      g.strokeStyle = C.b; g.lineWidth = 2; g.stroke();
+      const a0 = alpha10(0).a;
+      V.dot(g, TX(0), AY(a0), 4, C.d);
+      if (a0 > 0.9) {
+        // a curva fica plana perto de 100% e depois desce: rótulo em duas linhas curtas, logo abaixo do ponto
+        V.text(g, 'greedy:', TX(0) + 8, AY(a0) + 17, { size: 10.5, font: 'mono', color: C.d });
+        V.text(g, pct(a0, 0), TX(0) + 8, AY(a0) + 30, { size: 10.5, font: 'mono', color: C.d });
+      } else V.text(g, `greedy: ${pct(a0, 0)}`, TX(0) + 8, AY(a0) + (a0 > 0.5 ? 14 : -8), { size: 10.5, font: 'mono', color: C.d });
+      V.glow(g, TX(S10.T), AY(a), 12 + 2 * Math.sin(t * 3), C.c, 0.6);
+      V.dot(g, TX(S10.T), AY(a), 4.5, C.c);
+    });
+
+    /* ================= Figura 11: amostragem com chave (TensorFold) ================= */
+    const f11 = $('#fig-chave');
+    fitH(f11, 520, 740);
+    const M64 = (1n << 64n) - 1n;
+    const mix64 = (x) => { x ^= x >> 30n; x = (x * 0xBF58476D1CE4E5B9n) & M64; x ^= x >> 27n; x = (x * 0x94D049BB133111EBn) & M64; return x ^ (x >> 31n); };
+    // o mesmo uniform(seed, position, ids) do TensorFold (engine/exact_sampling.py): três rodadas de splitmix64
+    const keyedU = (k, pos, id) => {
+      let x = mix64((k + 0x9E3779B97F4A7C15n) & M64);
+      x = mix64(x ^ ((BigInt(pos) * 0xD1B54A32D192ED03n) & M64));
+      x = mix64(x ^ BigInt(id));
+      return Number(x >> 11n) * 2 ** -53 + 2 ** -54;
+    };
+    const TOK11 = [' rei', ' gato', ' lua', ' que', ' viu', ' a', ' e', ' riu', ' dormiu'];
+    const ID11 = [1203, 4410, 2290, 977, 2318, 264, 323, 11904, 7316];
+    const Z11 = [
+      [-4, -4, -4, 2.4, 1.5, -4, 0.9, 0.6, 1.0], // depois de “rei”
+      [-4, -4, -4, 2.2, 1.7, -4, 1.1, 0.8, 1.3], // “gato”
+      [-4, -4, -4, 0.9, -4, -4, 2.4, 0.5, -4], // “lua”
+      [-4, -4, -4, -4, 2.4, -4, -4, 1.2, 1.0], // “que”
+      [-4, -4, -4, -4, -4, 2.8, -4, -4, -4], // “viu”
+      [-4, -4, 2.8, -4, -4, -4, -4, -4, -4], // “a”
+      [-4, -4, -4, -4, 0.6, -4, -4, 2.2, 1.9], // “e”
+      [-4, -4, -4, 0.3, -4, -4, 1.6, -4, -4], // “riu”
+      [-4, -4, -4, 0.3, -4, -4, 1.6, -4, -4], // “dormiu”
+      [2.4, 2.1, -4, -4, -4, -4, -4, -4, -4], // fim do prompt A (“… um”)
+      [2.9, 1.6, -4, -4, -4, -4, -4, -4, -4], // fim do prompt B (“… um”)
+    ];
+    const PR11 = {
+      A: { label: 'Era uma vez um', key: 8324308469202069954n, row: 9 },
+      B: { label: 'No castelo havia um', key: 2263849561746361393n, row: 10 },
+    };
+    const N11 = 7, P11 = 4; // tokens gerados; posição absoluta do primeiro (prompt de 4 tokens)
+    const RUN11 = ['sozinha', 'em lote (+3 vizinhas)', 'com rascunhos'];
+    const S11 = { prompt: 'A', seed: false, T: 1, inv: true, step: 0, age: 1.85, res: null };
+    const pick11 = (z, T, gs) => {
+      let b = 0, bs = -Infinity;
+      for (let i = 0; i < z.length; i++) {
+        const s = T > 0 ? z[i] / T + gs[i] : z[i];
+        if (s > bs || (s === bs && ID11[i] < ID11[b])) { bs = s; b = i; }
+      }
+      return b;
+    };
+    // kernels que dependem do lote: um desvio pequeno (exagerado) nos logits das execuções 2 e 3
+    const logits11 = (prev, run, pos) => {
+      const z = Z11[prev].slice();
+      if (!S11.inv && run > 0) { const r = V.rng(1000 * run + 17 * pos + 5); for (let i = 0; i < z.length; i++) z[i] += (r() - 0.5) * 0.7; }
+      return z;
+    };
+    const keyNoise11 = (k, pos) => ID11.map((id) => -Math.log(-Math.log(keyedU(k, pos, id))));
+    // rodadas especulativas: 2 rascunhos (palpite greedy), verificados linha a linha pela regra de sorteio
+    function rounds11(first, noiseFor) {
+      const out = []; let prev = first;
+      while (out.length < N11) {
+        const drafts = []; let p = prev;
+        for (let j = 0; j < 2; j++) { const d = pick11(Z11[p], 0, null); drafts.push(d); p = d; }
+        const base = out.length;
+        const samples = [prev, drafts[0], drafts[1]].map((pp, j) => pick11(logits11(pp, 2, P11 + base + j), S11.T, noiseFor(P11 + base + j)));
+        let j = 0;
+        while (j < 2 && samples[j] === drafts[j] && out.length < N11) { out.push(samples[j]); j++; }
+        if (out.length < N11) out.push(samples[j]);
+        prev = out[out.length - 1];
+      }
+      return out.slice(0, N11);
+    }
+    function genKeyed11(run, k) {
+      const first = PR11[S11.prompt].row;
+      if (run === 2) return rounds11(first, (pos) => keyNoise11(k, pos));
+      const out = []; let prev = first;
+      for (let i = 0; i < N11; i++) { const c = pick11(logits11(prev, run, P11 + i), S11.T, keyNoise11(k, P11 + i)); out.push(c); prev = c; }
+      return out;
+    }
+    function genSeq11(run) {
+      const R = V.rng(S11.seed ? 42 : 7);
+      const draw = () => ID11.map(() => { let u = R(); while (u <= 1e-12) u = R(); return -Math.log(-Math.log(u)); });
+      const first = PR11[S11.prompt].row;
+      if (run === 2) return rounds11(first, () => draw());
+      const out = []; let prev = first;
+      for (let i = 0; i < N11; i++) {
+        let mine = null;
+        if (run === 1) { for (let s = 0; s < 4; s++) { const gg = draw(); if (s === 2) mine = gg; } } else mine = draw();
+        const c = pick11(logits11(prev, run, P11 + i), S11.T, mine); out.push(c); prev = c;
+      }
+      return out;
+    }
+    const c11 = UI.controls(f11);
+    let r11 = null;
+    function compute11() {
+      const k = S11.seed ? 42n : PR11[S11.prompt].key;
+      const seq = [0, 1, 2].map(genSeq11), key = [0, 1, 2].map((r) => genKeyed11(r, k));
+      const steps = []; let prev = PR11[S11.prompt].row;
+      for (let i = 0; i < N11; i++) {
+        const pos = P11 + i, u = ID11.map((id) => keyedU(k, pos, id));
+        steps.push({ pos, prev, z: Z11[prev], u, g: u.map((x) => -Math.log(-Math.log(x))), w: key[0][i] });
+        prev = key[0][i];
+      }
+      S11.res = { seq, key, k, steps };
+      if (r11) r11.set(S11.seed ? '42 (seed)' : '0x' + k.toString(16).padStart(16, '0'));
+    }
+    UI.seg(c11, { label: 'Prompt', options: [{ v: 'A', label: 'A' }, { v: 'B', label: 'B' }], value: 'A', onChange: (v) => { S11.prompt = v; compute11(); } });
+    UI.toggle(c11, { label: 'seed = 42', value: false, onChange: (v) => { S11.seed = v; compute11(); } });
+    UI.slider(c11, { label: 'Temperatura', min: 0, max: 1.5, step: 0.05, value: 1, fmt: (v) => (v === 0 ? '0 greedy' : num(v, 2)), onInput: (v) => { S11.T = v; compute11(); } });
+    UI.toggle(c11, { label: 'logits invariantes ao lote', value: true, onChange: (v) => { S11.inv = v; compute11(); } });
+    r11 = UI.readout(c11, 'chave k', '—');
+    compute11();
+    function chips11(g, toks, x, y, maxW, o) {
+      const C = V.C();
+      let sz = 11.5;
+      const widths = (s) => toks.map((ti) => measure(g, vis(TOK11[ti]), s, 'mono', 500) + 12);
+      let ws = widths(sz);
+      const gap = 4;
+      while (sz > 9.5 && ws.reduce((a, b) => a + b, 0) + gap * (toks.length - 1) > maxW) { sz -= 0.5; ws = widths(sz); }
+      let cx = x;
+      toks.forEach((ti, i) => {
+        const cur = i === o.cursor, bad = i === o.diff;
+        if (cur) V.glow(g, cx + ws[i] / 2, y + 11, ws[i] * 0.6, C.c, 0.35);
+        V.box(g, cx, y, ws[i], 22, { r: 6, fill: V.alpha(bad ? C.red : o.col, bad ? 0.2 : 0.13), stroke: bad ? C.red : cur ? C.c : V.alpha(o.col, 0.55), lw: cur || bad ? 2 : 1 });
+        V.text(g, vis(TOK11[ti]), cx + ws[i] / 2, y + 11.5, { size: sz, font: 'mono', weight: 500, align: 'center', base: 'middle', color: C.ink });
+        cx += ws[i] + gap;
+      });
+      return cx;
+    }
+    V.fig(f11, (g, w, h, t, dt) => {
+      const C = V.C();
+      const narrow = w < 600;
+      const R = S11.res;
+      const dur = 2.6;
+      if (!LA.paused) { S11.age += dt; if (S11.age >= dur) { S11.age = 0; S11.step = (S11.step + 1) % N11; } }
+      const st = R.steps[S11.step];
+      const pad = 14;
+      let y = 6;
+      V.text(g, clip(g, `prompt ${S11.prompt}: “${PR11[S11.prompt].label}” → ${N11} tokens gerados`, w - 2 * pad, 11.5, 'mono'), pad, y + 10, { size: 11.5, font: 'mono', color: C.muted });
+      y += 22;
+      const lanes = [
+        { name: narrow ? 'Gerador sequencial (com estado)' : 'Gerador sequencial (com estado): a próxima fatia de um fluxo único', col: C.d, data: R.seq },
+        { name: narrow ? 'Com chave: u = H(k, t, v)' : 'Com chave (sem estado): u = H(k, t, v), consultado', col: C.a, data: R.key },
+      ];
+      const labW = narrow ? 0 : 158;
+      lanes.forEach((L) => {
+        V.text(g, clip(g, L.name, w - 2 * pad, 12.5, 'sans', 600), pad, y + 8, { size: 12.5, weight: 600, color: L.col });
+        y += 18;
+        L.data.forEach((toks, r) => {
+          const diff = toks.findIndex((v, i) => v !== L.data[0][i]);
+          let cy = y;
+          if (narrow) { V.text(g, RUN11[r], pad, y + 9, { size: 11, color: C.muted }); cy = y + 15; }
+          else V.text(g, RUN11[r], pad, y + 11.5, { size: 11.5, color: C.muted, base: 'middle' });
+          const x0 = pad + labW, maxW = w - x0 - pad - 30;
+          const xe = chips11(g, toks, x0, cy, maxW, { col: L.col, cursor: S11.step, diff: r > 0 ? diff : -1 });
+          const vx = Math.min(xe + 8, w - pad - 18);
+          if (r === 0) V.text(g, 'ref.', vx, cy + 11.5, { size: 10.5, font: 'mono', base: 'middle', color: C.muted });
+          else V.text(g, diff < 0 ? '✓' : '✗', vx + 4, cy + 11.5, { size: 15, weight: 700, base: 'middle', color: diff < 0 ? C.e : C.red });
+          y += narrow ? 46 : 27;
+        });
+        y += 6;
+      });
+      // a máquina do passo destacado
+      const my = y + 2, mh = h - my - 6;
+      V.box(g, pad, my, w - 2 * pad, mh, { r: 10, fill: V.alpha(C.muted, 0.05), stroke: V.alpha(C.muted, 0.25), lw: 1 });
+      const prevLab = st.prev >= 9 ? 'um' : vis(TOK11[st.prev]);
+      const head11 = narrow ? `${S11.step + 1}/${N11} · t = ${st.pos} · após “${prevLab}”` : `passo ${S11.step + 1} de ${N11} · posição t = ${st.pos} · depois de “${prevLab}”`;
+      V.text(g, clip(g, head11, w - 2 * pad - 110, 11.5, 'mono'), pad + 10, my + 16, { size: 11.5, font: 'mono', color: C.ink });
+      star(g, w - pad - 86, my + 12, 5.5, C.c);
+      V.text(g, '= argmax', w - pad - 76, my + 16, { size: 11, font: 'mono', weight: 600, color: C.c });
+      const scanEnd = 0.7 * dur;
+      const j = Math.min(ID11.length - 1, Math.floor((S11.age / scanEnd) * ID11.length));
+      const done = S11.age >= scanEnd;
+      const greedy = S11.T <= 0;
+      const kTxt = S11.seed ? 'k = 42 (seed)' : 'k = 0x' + R.k.toString(16).padStart(16, '0');
+      let bx0, by0, bw, bh;
+      if (!narrow) {
+        // pipeline vertical à esquerda
+        const pw = Math.min(236, w * 0.33), px = pad + 10;
+        let py = my + 30;
+        const row = (txt, col, hh = 24) => { V.box(g, px, py, pw, hh, { r: 7, fill: V.alpha(col, 0.13), stroke: V.alpha(col, 0.6), lw: 1.2 }); V.text(g, clip(g, txt, pw - 12, 11, 'mono'), px + pw / 2, py + hh / 2 + 0.5, { size: 11, font: 'mono', align: 'center', base: 'middle', color: C.ink }); py += hh; };
+        const arrow = () => { V.arrow(g, px + pw / 2, py + 2, px + pw / 2, py + 14, { color: C.muted, lw: 1.4, head: 6 }); py += 16; };
+        row(kTxt, C.b);
+        py += 4;
+        row(greedy ? 't = ' + st.pos + ' · (sem ruído)' : `t = ${st.pos} · v = ${ID11[j]} (“${vis(TOK11[j])}”)`, C.b);
+        arrow();
+        const spin = greedy ? '' : ' ' + '◐◓◑◒'[Math.floor(t * 8) % 4];
+        row('splitmix64 × 3' + spin, C.f);
+        arrow();
+        row(greedy ? 'T = 0: u não é usado' : `u = ${num(st.u[j], 4)}`, C.c);
+        arrow();
+        row(greedy ? 'vence o maior z' : `g = −log(−log u) = ${st.g[j] >= 0 ? '+' : ''}${num(st.g[j], 2)}`, C.c);
+        wrapLines(g, 'a mesma entrada dá sempre o mesmo u', pw, 10.5).slice(0, 2).forEach((l, li) => V.text(g, l, px, Math.min(py + 18, my + mh - 22) + li * 13, { size: 10.5, color: C.muted }));
+        bx0 = px + pw + 22; by0 = my + 30; bw = w - pad - 10 - bx0; bh = mh - 40;
+      } else {
+        const px = pad + 10, pw = w - 2 * pad - 20;
+        let py = my + 26;
+        const line = (txt, col) => { V.box(g, px, py, pw, 22, { r: 6, fill: V.alpha(col, 0.12), stroke: V.alpha(col, 0.5), lw: 1 }); V.text(g, clip(g, txt, pw - 10, 11, 'mono'), px + 6, py + 11.5, { size: 11, font: 'mono', base: 'middle', color: C.ink }); py += 26; };
+        line(kTxt, C.b);
+        line(greedy ? `t = ${st.pos} · T = 0: argmax, sem ruído` : `H(k, t=${st.pos}, v=${ID11[j]}) → u = ${num(st.u[j], 3)}`, C.f);
+        line(greedy ? 'vence o maior z' : `g = −log(−log u) = ${st.g[j] >= 0 ? '+' : ''}${num(st.g[j], 2)}`, C.c);
+        bx0 = px; by0 = py + 4; bw = pw; bh = my + mh - by0 - 8;
+      }
+      // barras: z/T (bandeira) + g (trecho rosa) para cada token
+      const n = ID11.length, rh = Math.min(26, bh / n);
+      const labWb = narrow ? 58 : 66, valW = narrow ? 0 : 118;
+      const base = st.z.map((z) => (greedy ? z : z / S11.T));
+      const score = base.map((b, i) => (greedy ? b : b + st.g[i]));
+      const lo = Math.min(...base, ...score) - 0.3, hi = Math.max(...base, ...score) + 0.3 + (Math.max(...base, ...score) - Math.min(...base, ...score) + 0.6) * 0.06;
+      const ax0 = bx0 + labWb, ax1 = bx0 + bw - valW - 6;
+      const X = (v) => ax0 + ((v - lo) / (hi - lo)) * (ax1 - ax0);
+      if (lo < 0 && hi > 0) V.line(g, X(0), by0, X(0), by0 + n * rh, { color: V.alpha(C.muted, 0.3), lw: 1, dash: [3, 3] });
+      for (let i = 0; i < n; i++) {
+        const yy = by0 + i * rh + rh / 2;
+        const seen = greedy || done || i <= j;
+        const isW = (done || greedy) && i === st.w;
+        const dim = st.z[i] <= -4;
+        V.text(g, vis(TOK11[i]), bx0 + labWb - 8, yy, { size: 11.5, font: 'mono', align: 'right', base: 'middle', color: isW ? C.c : dim ? C.muted : C.ink });
+        V.line(g, ax0, yy, ax1, yy, { color: V.alpha(C.muted, 0.18), lw: 1 });
+        const fx = X(base[i]);
+        V.line(g, fx, yy - rh * 0.32, fx, yy + rh * 0.2, { color: V.alpha(C.d, dim ? 0.5 : 1), lw: 1.6 });
+        g.beginPath(); g.moveTo(fx, yy - rh * 0.32); g.lineTo(fx + 7, yy - rh * 0.26); g.lineTo(fx, yy - rh * 0.18); g.closePath(); g.fillStyle = C.d; g.fill();
+        if (seen && !greedy) {
+          V.line(g, fx, yy + 1, X(score[i]), yy + 1, { color: V.alpha(C.c, i === j && !done ? 1 : 0.75), lw: 4 });
+          V.dot(g, X(score[i]), yy + 1, isW ? 6 : 4, isW ? C.c : C.ink);
+        } else if (greedy) V.dot(g, fx, yy + 1, isW ? 6 : 4, isW ? C.c : C.ink);
+        if (isW) { V.glow(g, X(score[i]), yy, 16, C.c); star(g, X(score[i]) + 13, yy + 1, 6, C.c); }
+        if (!narrow && seen && !greedy) V.text(g, `u ${num(st.u[i], 3)}  g ${st.g[i] >= 0 ? '+' : ''}${num(st.g[i], 2)}`, ax1 + 16, yy, { size: 10.5, font: 'mono', weight: isW ? 600 : 400, base: 'middle', color: isW ? C.c : i === j && !done ? C.ink : C.muted });
+        if (i === j && !done && !greedy) { V.rr(g, bx0 + 2, yy - rh / 2 + 1, bw - 4, rh - 2, 6); g.strokeStyle = V.alpha(C.f, 0.7); g.lineWidth = 1.2; g.stroke(); }
+      }
+    });
+
+    /* ================= Figura 12: dois sorteios, um só dado ================= */
+    const f12 = $('#fig-acoplamento');
+    fitH(f12, 470, 700);
+    const TOK12 = [' lua', ' sol', ' mar', ' céu', ' rio', ' sal'];
+    const ZP12 = [2.2, 1.7, 1.2, 0.5, 0.0, -0.6];
+    const D12 = [-0.5, 0.6, 0.3, -0.4, 0.5, -0.3]; // direção do erro do rascunhador (ilustrativa)
+    const NR12 = 3000;
+    const gum12 = (R) => { let u = R(); while (u <= 1e-12) u = R(); return -Math.log(-Math.log(u)); };
+    const GK12 = [], GO12 = [];
+    { const Ra = V.rng(4242), Rb = V.rng(777); for (let r = 0; r < NR12; r++) { GK12.push(ZP12.map(() => gum12(Ra))); GO12.push(ZP12.map(() => gum12(Rb))); } }
+    const MODES12 = [
+      { v: 'ign', label: 'ignora o ruído', short: 'ignora' },
+      { v: 'own', label: 'ruído próprio', short: 'próprio' },
+      { v: 's07', label: 'ruído do alvo ×0,7', short: 'alvo ×0,7' },
+      { v: 's1', label: 'ruído do alvo ×1', short: 'alvo ×1' },
+    ];
+    const S12 = { mode: 's07', delta: 0.3, T: 1, speed: 'lento', r: 9, age: 1.3, hist: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9], stats: null };
+    const am12 = (a) => { let b = 0; for (let i = 1; i < a.length; i++) if (a[i] > a[b]) b = i; return b; };
+    const zq12 = () => ZP12.map((v, i) => v + S12.delta * D12[i]);
+    const noise12 = (mode, r) => (mode === 'ign' ? ZP12.map(() => 0) : mode === 'own' ? GO12[r] : GK12[r].map((x) => x * (mode === 's07' ? 0.7 : 1)));
+    const draft12 = (mode, zq, r, T) => (T <= 0 || mode === 'ign' ? am12(zq) : am12(zq.map((v, i) => v / T + noise12(mode, r)[i])));
+    const target12 = (r, T) => (T <= 0 ? am12(ZP12) : am12(ZP12.map((v, i) => v / T + GK12[r][i])));
+    const c12 = UI.controls(f12);
+    let r12a = null, r12b = null;
+    function stats12() {
+      const T = S12.T, zq = zq12();
+      const p = softmax(ZP12, T), q = softmax(zq, T);
+      const acc = {};
+      MODES12.forEach((m) => { acc[m.v] = 0; });
+      for (let r = 0; r < NR12; r++) { const x = target12(r, T); MODES12.forEach((m) => { if (draft12(m.v, zq, r, T) === x) acc[m.v]++; }); }
+      MODES12.forEach((m) => { acc[m.v] /= NR12; });
+      S12.stats = { p, q, zq, acc, min: p.reduce((s, v, i) => s + Math.min(v, q[i]), 0), pq: p.reduce((s, v, i) => s + v * q[i], 0) };
+      if (r12a) { r12a.set(pct(acc[S12.mode], 0)); r12b.set(pct(S12.stats.min, 0)); }
+    }
+    UI.seg(c12, { label: 'Rascunhador', options: MODES12.map((m) => ({ v: m.v, label: m.label })), value: 's07', onChange: (v) => { S12.mode = v; stats12(); } });
+    UI.slider(c12, { label: 'Erro do rascunhador δ', min: 0, max: 1.5, step: 0.05, value: 0.3, fmt: (v) => num(v, 2), onInput: (v) => { S12.delta = v; stats12(); } });
+    UI.slider(c12, { label: 'Temperatura', min: 0, max: 1.5, step: 0.05, value: 1, fmt: (v) => (v === 0 ? '0 greedy' : num(v, 2)), onInput: (v) => { S12.T = v; stats12(); } });
+    UI.seg(c12, { label: 'Ritmo', options: [{ v: 'lento', label: '1 rodada' }, { v: 'rapido', label: 'rápido' }], value: 'lento', onChange: (v) => { S12.speed = v; } });
+    r12a = UI.readout(c12, 'concordância', '—');
+    r12b = UI.readout(c12, 'teto Σ min(p,q)', '—');
+    stats12();
+    V.fig(f12, (g, w, h, t, dt) => {
+      const C = V.C();
+      const narrow = w < 640;
+      const ST = S12.stats, T = S12.T, zq = ST.zq;
+      const dur = S12.speed === 'lento' ? 2.4 : 0.22;
+      if (!LA.paused) {
+        S12.age += dt;
+        if (S12.age >= dur) { S12.age = 0; S12.r = (S12.r + 1) % NR12; S12.hist.push(S12.r); if (S12.hist.length > 12) S12.hist.shift(); }
+      }
+      const r = S12.r, ph = S12.speed === 'lento' ? V.clamp(S12.age / dur, 0, 1) : 1;
+      const x = target12(r, T), d = draft12(S12.mode, zq, r, T);
+      const nz = noise12(S12.mode, r);
+      const pad = 14;
+      const lw = narrow ? w - 2 * pad : w * 0.58 - pad;
+      const modeLab = MODES12.find((m) => m.v === S12.mode).label;
+      V.text(g, clip(g, `rodada ${fmtInt(r + 1)} · rascunhador: ${modeLab}`, lw, 11.5, 'mono'), pad, 16, { size: 11.5, font: 'mono', color: C.muted });
+      // raias
+      const ry0 = 30, rH = narrow ? 210 : h - 170;
+      const n = ZP12.length, lh = rH / n, labW = 44;
+      const lo = (T > 0 ? Math.min(...ZP12, ...zq) / T : Math.min(...ZP12, ...zq)) - (T > 0 ? 2.4 : 0.5);
+      const hi = (T > 0 ? Math.max(...ZP12, ...zq) / T : Math.max(...ZP12, ...zq)) + (T > 0 ? 4.6 : 0.5);
+      const ax0 = pad + labW, ax1 = pad + lw - 8;
+      const X = (v) => ax0 + V.clamp((v - lo) / (hi - lo), 0, 1) * (ax1 - ax0);
+      const p1 = V.clamp(ph / 0.22, 0, 1), p2 = V.clamp((ph - 0.22) / 0.26, 0, 1), show = ph >= 0.5;
+      for (let i = 0; i < n; i++) {
+        const yy = ry0 + i * lh + lh / 2;
+        V.text(g, vis(TOK12[i]), ax0 - 8, yy, { size: 11.5, font: 'mono', align: 'right', base: 'middle', color: C.ink });
+        V.line(g, ax0, yy - 5, ax1, yy - 5, { color: V.alpha(C.muted, 0.15), lw: 1 });
+        V.line(g, ax0, yy + 5, ax1, yy + 5, { color: V.alpha(C.muted, 0.15), lw: 1 });
+        const bp = T > 0 ? ZP12[i] / T : ZP12[i], bq = T > 0 ? zq[i] / T : zq[i];
+        const sp = T > 0 ? bp + GK12[r][i] : bp, sq = T > 0 ? bq + nz[i] : bq;
+        const xp = V.lerp(X(lo), X(bp), V.ease.out(p1)), xq = V.lerp(X(lo), X(bq), V.ease.out(p1));
+        V.line(g, X(lo), yy - 5, xp, yy - 5, { color: V.alpha(C.a, 0.75), lw: 5 });
+        V.line(g, X(lo), yy + 5, xq, yy + 5, { color: V.alpha(C.b, 0.75), lw: 5 });
+        if (p1 >= 1 && T > 0) {
+          const ep = V.lerp(X(bp), X(sp), V.ease.out(p2)), eq = V.lerp(X(bq), X(sq), V.ease.out(p2));
+          V.line(g, X(bp), yy - 5, ep, yy - 5, { color: C.c, lw: 3 });
+          if (S12.mode !== 'ign') V.line(g, X(bq), yy + 5, eq, yy + 5, { color: S12.mode === 'own' ? C.d : V.alpha(C.c, S12.mode === 's07' ? 0.6 : 1), lw: 3 });
+        }
+        if (show) {
+          if (i === x) { V.glow(g, X(sp), yy - 5, 12, C.a, 0.5); star(g, X(sp), yy - 5, 6.5, C.a); }
+          if (i === d) { g.beginPath(); const cx = X(sq), cy = yy + 5; g.moveTo(cx, cy - 6); g.lineTo(cx + 5, cy); g.lineTo(cx, cy + 6); g.lineTo(cx - 5, cy); g.closePath(); g.fillStyle = C.b; g.fill(); }
+        }
+      }
+      // veredito
+      let vy = ry0 + rH + 8;
+      if (show) {
+        const ok = x === d;
+        pill(g, ok ? `✓ aceito: “${vis(TOK12[d])}” = amostra do alvo` : `✗ rejeitado: o alvo emite “${vis(TOK12[x])}”`, pad, vy, { size: 11.5, font: 'sans', weight: 600, color: ok ? C.e : C.red, fill: V.alpha(ok ? C.e : C.red, 0.12), stroke: V.alpha(ok ? C.e : C.red, 0.5) });
+      }
+      // fita: o que o alvo emite × o que o rascunhador propôs
+      vy += 34;
+      const tapeLab = narrow ? 64 : 76;
+      [['emitido', 0], ['rascunho', 1]].forEach(([lab, k]) => {
+        const ty = vy + k * 28;
+        V.text(g, lab, pad, ty + 11, { size: 11, color: C.muted, base: 'middle' });
+        let cx = pad + tapeLab;
+        const shown = S12.hist.slice(-(narrow ? 6 : 8));
+        shown.forEach((rr) => {
+          const xx = target12(rr, T), dd = draft12(S12.mode, zq, rr, T);
+          const tok = k === 0 ? xx : dd, ok = xx === dd;
+          const s = vis(TOK12[tok]), cw = measure(g, s, 11, 'mono', 500) + 12;
+          if (cx + cw > pad + lw) return;
+          const col = k === 0 ? C.a : ok ? C.e : C.red;
+          V.box(g, cx, ty, cw, 22, { r: 6, fill: V.alpha(col, 0.14), stroke: V.alpha(col, 0.6), lw: 1 });
+          V.text(g, s, cx + cw / 2, ty + 11.5, { size: 11, font: 'mono', weight: 500, align: 'center', base: 'middle', color: C.ink });
+          cx += cw + 4;
+        });
+      });
+      // gráfico de concordância
+      let gx, gy, gw, gh;
+      if (narrow) { gx = pad; gy = vy + 96; gw = w - 2 * pad; gh = 170; }
+      else { gx = w * 0.6 + 6; gy = 34; gw = w - gx - pad; gh = h * 0.56; }
+      V.text(g, clip(g, `concordância em ${fmtInt(NR12)} rodadas`, gw, 11, 'mono'), gx, gy - 12, { size: 11, font: 'mono', color: C.muted });
+      const cy0 = gy + 4, cyb = gy + gh - 34;
+      const Y = (v) => cyb - v * (cyb - cy0);
+      [0, 0.5, 1].forEach((v) => { V.line(g, gx + 30, Y(v), gx + gw, Y(v), { color: V.alpha(C.muted, 0.14), lw: 1 }); V.text(g, pct(v, 0), gx + 26, Y(v), { size: 10.5, font: 'mono', align: 'right', base: 'middle', color: C.muted }); });
+      const lblW = 58, bw = (gw - 34 - lblW) / MODES12.length;
+      MODES12.forEach((m, k) => {
+        const v = ST.acc[m.v], bx = gx + 34 + k * bw + 6, bwi = bw - 12, cur = m.v === S12.mode;
+        V.box(g, bx, Y(v), bwi, Math.max(1, cyb - Y(v)), { r: 4, fill: V.alpha(cur ? C.c : C.b, cur ? 0.8 : 0.45) });
+        const near = Math.abs(Y(v) - 8 - Y(ST.min)) < 11 || Math.abs(Y(v) - 8 - Y(ST.pq)) < 11;
+        if (near && cyb - Y(v) > 24) V.text(g, pct(v, 0), bx + bwi / 2, Y(v) + 14, { size: 10.5, font: 'mono', weight: 600, align: 'center', color: C.ink });
+        else V.text(g, pct(v, 0), bx + bwi / 2, Y(v) - 8, { size: 10.5, font: 'mono', align: 'center', color: C.ink });
+        const L = wrapLines(g, m.short, bwi + 10, 10.5);
+        L.forEach((l, li) => V.text(g, l, bx + bwi / 2, cyb + 13 + li * 12, { size: 10.5, align: 'center', color: cur ? C.c : C.muted, weight: cur ? 600 : 400 }));
+      });
+      V.line(g, gx + 30, Y(ST.min), gx + gw - lblW + 4, Y(ST.min), { color: C.d, lw: 1.6, dash: [6, 4] });
+      V.line(g, gx + 30, Y(ST.pq), gx + gw - lblW + 4, Y(ST.pq), { color: C.muted, lw: 1.4, dash: [2, 3] });
+      let yMin = Y(ST.min), yPq = Y(ST.pq);
+      if (yPq - yMin < 28) { const mid = Math.max((yMin + yPq) / 2, cy0 + 12); yMin = mid - 14; yPq = mid + 14; }
+      const lx = gx + gw - lblW + 10;
+      V.text(g, 'teto', lx, yMin - 1, { size: 10.5, font: 'mono', color: C.d });
+      V.text(g, pct(ST.min, 0), lx, yMin + 11, { size: 10.5, font: 'mono', weight: 600, color: C.d });
+      V.text(g, 'Σ p·q', lx, yPq - 1, { size: 10.5, font: 'mono', color: C.muted });
+      V.text(g, pct(ST.pq, 0), lx, yPq + 11, { size: 10.5, font: 'mono', color: C.muted });
+      // p e q
+      const qy = gy + gh + 4, qh = narrow ? 92 : h - qy - 24;
+      if (qh > 50) {
+        V.text(g, clip(g, 'p do alvo (menta) × q (contorno)', gw, 10.5, 'mono'), gx, qy + 8, { size: 10.5, font: 'mono', color: C.muted });
+        const mx = Math.max(...ST.p, ...ST.q) * 1.1, qb = qy + qh, qt = qy + 18;
+        const sw = gw / n;
+        for (let i = 0; i < n; i++) {
+          const bx = gx + i * sw + 5, bwi = sw - 10;
+          const hp = (ST.p[i] / mx) * (qb - qt - 14), hq = (ST.q[i] / mx) * (qb - qt - 14);
+          V.box(g, bx, qb - 14 - hp, bwi, Math.max(1, hp), { r: 3, fill: V.alpha(C.a, 0.6) });
+          V.rr(g, bx + 2, qb - 14 - hq, bwi - 4, Math.max(1, hq), 3); g.strokeStyle = C.b; g.lineWidth = 1.6; g.stroke();
+          V.text(g, clip(g, vis(TOK12[i]), sw - 2, 10.5, 'mono'), bx + bwi / 2, qb - 2, { size: 10.5, font: 'mono', align: 'center', color: C.muted });
+        }
+      }
+    });
+  },
+});

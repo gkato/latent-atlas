@@ -1,0 +1,471 @@
+<p class="la-lead">Em 2018, um classificador que enxergava só 6 pixels de um dígito do MNIST acertava 59,4 % das vezes; quando dois agentes passaram a escolher os pixels, um defendendo o dígito verdadeiro e o outro tentando enganar, o mesmo juiz míope subiu para 88,9 %. Em 2024, um Llama 2 70B que julgava as próprias respostas e treinava nos próprios veredictos foi de 9,94 % para 20,44 % de win rate no AlpacaEval 2.0 em duas rodadas. Em 2025, um modelo que inventava os próprios exercícios de programação, sem dado curado, superou modelos treinados com dezenas de milhares de exemplos rotulados. A ideia comum: em vez de pedir mais rótulos humanos, pôr o modelo para <i>interagir</i> com um adversário, com cópias de si, com a versão de ontem ou com um juiz. Você vai separar as três famílias que vivem sob o nome <span class="la-term" data-term="self-play">self-play</span>, escrever as perdas de SPIN, SPPO e Absolute Zero, rodar um debate no laboratório e, o mais importante, reconhecer quando um laço autorreferente melhora o modelo e quando ele só convence a si mesmo.</p>
+
+<section class="la-sec">
+  <h2>O tabuleiro: quem joga e quem apita</h2>
+  <p>Em jogos como Go e xadrez, self-play é uma ideia antiga e poderosa: o jogador treina contra cópias de si mesmo. Cada partida ensina algo, e o adversário melhora no mesmo ritmo, então a dificuldade sobe sozinha. Ninguém precisa rotular nada, porque o tabuleiro decide quem ganhou. É um <b>currículo automático</b>: o oponente está sempre na beira da sua habilidade.</p>
+  <p>Num LLM não existe tabuleiro. Quando duas respostas competem, alguém precisa apitar: um humano, um verificador (testes de unidade, um executor de Python, um checador de matemática), um <a data-ch="preferencias-reward-models">modelo de preferência</a> ou o próprio modelo. Essa escolha, <b>quem apita</b>, define tanto o poder quanto o risco de cada método deste capítulo. Guarde uma pergunta para fazer a cada seção: <i>de onde vem a verdade neste laço?</i></p>
+  <p>A pesquisa que sustenta este capítulo separa três famílias que costumam ser confundidas:</p>
+  <div class="la-cards">
+    <div class="la-card"><span class="ic">⚖️</span><h4>Debate para supervisão</h4><p>Dois agentes discutem e um <b>juiz mais fraco</b> decide. O objetivo é extrair a verdade quando o juiz não consegue verificar a resposta sozinho. É um tema de segurança.</p></div>
+    <div class="la-card"><span class="ic">🗣️</span><h4>Debate multiagente</h4><p>Várias cópias propõem respostas, leem as das outras e revisam. O objetivo é acurácia no <b>tempo de inferência</b>, sem treino nenhum.</p></div>
+    <div class="la-card"><span class="ic">♟️</span><h4>Self-play como treino</h4><p>O modelo joga contra si (a versão anterior, outro papel, um desafiante) e gera o próprio currículo, adversário ou recompensa: SPIN, Self-Rewarding, SPPO, Absolute Zero, R-Zero, SPIRAL, jogos prover-verifier.</p></div>
+  </div>
+  <p>Dentro dessas famílias, os pares de papéis se repetem: gerador × discriminador (SPIN), jogador × juiz (Self-Rewarding), jogador × jogador (SPPO), propositor × resolvedor (Absolute Zero), provador × verificador e debatedor × debatedor × juiz. Os papéis podem ser cópias, o mesmo modelo com outro prompt ou versões diferentes no tempo. Escolha um método na figura e acompanhe quem manda o quê para quem.</p>
+  <figure class="la-fig" id="fig-elenco" data-title="O elenco do self-play">
+    <div class="la-fig-stage" style="height:430px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Cada personagem é um papel; personagens da mesma cor são o <b>mesmo modelo</b> (menta = a política que está sendo treinada ou usada, lilás = uma versão anterior dela). Âmbar é quem apita, rosa são dados humanos, verde é um verificador por regra. As bolinhas correm pelas setas na ordem em que a informação flui. O painel de baixo responde, para cada método, às quatro perguntas que importam.</figcaption>
+  </figure>
+  <h3>A lente do coeficiente de gradiente</h3>
+  <p>No <a data-ch="grpo-rlvr">capítulo de GRPO</a> apareceu uma lente do paper DeepSeekMath que serve muito bem aqui. Quase todo método de pós-treino é o mesmo gradiente; o que muda são três escolhas:</p>
+  <div class="la-eq">
+    \[ \nabla_\theta J_{\mathcal A}(\theta) = \mathbb E_{(q,o)\sim\mathcal D}\Big[\frac{1}{|o|}\sum_t \mathrm{GC}_{\mathcal A}(q,o,t,\pi_{rf})\;\nabla_\theta \log \pi_\theta(o_t\mid q,o_{&lt;t})\Big] \]
+    <ul class="la-eq-legend">
+      <li>\(\mathcal D\): de onde vêm os dados (dataset fixo, amostras da própria política, de uma versão anterior…)</li>
+      <li>\(\pi_{rf}\): quem dá o sinal (regra, reward model, verificador, juiz, o próprio modelo)</li>
+      <li>\(\mathrm{GC}\): <i>gradient coefficient</i>, quanto e em que sentido cada token é empurrado (positivo sobe a probabilidade, negativo desce)</li>
+      <li>\(|o|\): comprimento da resposta; \(o_t\) é o \(t\)-ésimo token e \(o_{&lt;t}\) o prefixo</li>
+    </ul>
+  </div>
+  <p>O que torna um método “self-play” é que \(\mathcal D\), e muitas vezes também \(\pi_{rf}\), saem do próprio modelo. A tabela resume o capítulo inteiro, uma linha por método. As formas de GC de SPIN, Self-Rewarding e SPPO são derivação nossa a partir das perdas que veremos adiante.</p>
+  <table>
+    <thead><tr><th>Método</th><th>De onde vêm os dados</th><th>Quem apita</th><th>GC por token (forma simplificada)</th></tr></thead>
+    <tbody>
+      <tr><td>SFT</td><td>dataset humano fixo</td><td>ninguém (é imitação)</td><td>\(1\)</td></tr>
+      <tr><td>GRPO</td><td>\(G\) amostras da política por prompt</td><td>regra, verificador ou RM</td><td>\(\hat A_{i,t}\), a vantagem do grupo: uma “autocompetição” entre irmãs</td></tr>
+      <tr><td>SPIN</td><td>resposta humana × resposta da iteração anterior</td><td>discriminador implícito (log-ratio)</td><td>\(+\lambda\sigma(-t)\) na humana, \(-\lambda\sigma(-t)\) na própria</td></tr>
+      <tr><td>Self-Rewarding</td><td>candidatos do próprio modelo</td><td>o próprio modelo, com rubrica</td><td>\(\pm\beta\,\sigma(\cdot)\), o peso do DPO</td></tr>
+      <tr><td>SPPO</td><td>amostras de \(\pi_t\)</td><td>modelo de preferência (PairRM)</td><td>\(\propto \eta\big(\hat P - \tfrac12\big) - \log\tfrac{\pi_\theta}{\pi_t}\)</td></tr>
+      <tr><td>Absolute Zero</td><td>tarefas <i>e</i> soluções do próprio modelo</td><td>executor de Python</td><td>vantagem normalizada por (tipo de tarefa, papel)</td></tr>
+      <tr><td>Debate treinado</td><td>argumentos dos dois lados</td><td>juiz (humano ou modelo)</td><td>\(\pm 1\), soma zero</td></tr>
+    </tbody>
+  </table>
+  <div class="la-callout analogy"><b class="t">Analogia: o sparring que é você mesmo</b><p>Treinar com SFT é copiar os golpes do professor. Self-play é lutar com um sparring que tem exatamente o seu nível e sobe junto com você. O problema começa quando você também é o árbitro: dá para “vencer” mudando as regras na própria cabeça. O resto do capítulo é, no fundo, sobre como manter um árbitro honesto.</p></div>
+  <div class="la-callout why"><b class="t">Por que isso importa em 2026</b><p>O DeepSeek-V3 usou os <b>votos do próprio modelo</b> como feedback em tarefas sem verificação; no V4, o ator é o próprio juiz generativo. O V3.2 tem um agente que sintetiza ambientes, tarefas e funções de verificação para o próprio treino, e o MiMo-V2.6 mantém um “hack agent” que ataca os próprios ambientes de treino. Em todos esses casos, o modelo gera parte do próprio sinal de treino.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Debate: fazer a mentira dar mais trabalho que a verdade</h2>
+  <p>Todo pós-treino que vimos até aqui supõe que alguém sabe julgar a resposta: o anotador que rotula pares para o <a data-ch="preferencias-reward-models">reward model</a>, o verificador do RLVR, a constituição do <a data-ch="constitutional-ai">Constitutional AI</a>. Mas o que fazer quando o modelo sabe mais do que quem supervisiona? Pense num patch enorme num repositório que o revisor não conhece, numa prova longa, num contrato que o juiz não leu. Esse é o problema da <span class="la-term" data-term="supervisao-escalavel">supervisão escalável</span>: como supervisionar algo mais capaz do que você.</p>
+  <p>A proposta de Irving, Christiano e Amodei (OpenAI, 2018), <span class="la-term" data-term="debate-ia">AI Safety via Debate</span>, é um jogo. Dada uma pergunta ou uma ação proposta, <b>dois agentes alternam declarações curtas</b> até um limite de rodadas, e um <b>humano julga</b> quem deu a informação mais verdadeira e útil. A hipótese central é que, em jogo ótimo, mentir é mais difícil do que refutar uma mentira, e por isso a estratégia vencedora é a honesta.</p>
+  <div class="la-eq">
+    \[ R_A(\tau) = -R_B(\tau) = \begin{cases} +1 & \text{se } J(q,\tau) = A\\ -1 & \text{se } J(q,\tau) = B \end{cases} \qquad \tau = (a_1, b_1, a_2, b_2, \dots, a_n, b_n) \]
+    <ul class="la-eq-legend">
+      <li>\(q\): a pergunta (ou a ação proposta) em disputa</li>
+      <li>\(\tau\): a transcrição do debate, com declarações curtas e alternadas até um limite de \(n\) rodadas</li>
+      <li>\(J\): o juiz, humano no artigo original, que lê só a transcrição e escolhe um vencedor</li>
+      <li>\(R_A, R_B\): recompensas de <b>soma zero</b>: o que um ganha, o outro perde</li>
+    </ul>
+  </div>
+  <p>O treino proposto é o self-play dos sistemas de Go, xadrez e Dota, que aproxima o jogo ótimo: cada debatedor é uma cópia da política, e espera-se que, no equilíbrio, mentir não compense.</p>
+  <h3>Por que o juiz pode ser fraco: NP contra PSPACE</h3>
+  <p>Há duas formas de usar um especialista. Na primeira, ele entrega a resposta com uma justificativa que o juiz confere passo a passo; isso exige um <i>certificado</i> curto e verificável, como um sudoku preenchido. Em complexidade computacional, essa é a classe <b>NP</b>. Na segunda, dois especialistas discordam e o juiz só acompanha a briga. Agora cabem perguntas com quantificadores alternados (“existe um lance meu tal que, para todo lance seu, existe um lance meu…”), a estrutura de “as brancas ganham esta posição?”: a classe <b>PSPACE</b>. O artigo mostra, como analogia, que o debate com jogo ótimo e juiz de tempo polinomial responde qualquer pergunta em PSPACE, enquanto o julgamento direto só alcança NP.</p>
+  <p>O mecanismo por trás disso é a <b>decomposição recursiva</b>. A cada rodada, quem afirma algo grande precisa quebrar a afirmação em partes menores. O adversário escolhe a parte de que discorda, e a discussão desce por um único caminho até uma afirmação tão pequena que o juiz confere sozinho. A figura mostra isso com um exemplo que dá para conferir de cabeça: somar números.</p>
+  <figure class="la-fig" id="fig-arvore" data-title="Debate recursivo: o juiz confere uma folha só">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>O <b>mentiroso</b> (rosa) afirma um total errado para a soma da fileira de números. A cada rodada ele precisa dizer quanto vale cada metade, e o juiz só confere se as duas metades somam o que ele afirmou (uma adição). O <b>honesto</b> (menta) aponta a metade errada, que fica destacada, e o debate desce por ela. Na folha, o juiz olha <b>um único número</b> da entrada. Ligue “erro ofuscado” para ver o que acontece quando o honesto não consegue localizar o erro e precisa chutar. Exemplo didático, com números <b>ilustrativos</b>.</figcaption>
+  </figure>
+  <p>O mentiroso não tem saída. Como o total está errado, pelo menos uma das metades também está. Se ele declarar metades corretas, elas não somam o total que afirmou e o juiz pega a contradição na hora. Se mantiver a soma consistente, carrega o erro para baixo, e o honesto vai atrás. O trabalho do juiz é logarítmico:</p>
+  <div class="la-eq">
+    \[ C_{\text{juiz}}(N) = \underbrace{\lceil \log_2 N \rceil}_{\text{somas de consistência}} + \underbrace{1}_{\text{folha conferida}} \qquad\text{contra}\qquad C_{\text{sozinho}}(N) = N - 1 \]
+    <ul class="la-eq-legend">
+      <li>\(N\): quantidade de números a somar (o tamanho do problema)</li>
+      <li>\(\lceil\log_2 N\rceil\): número de rodadas; em cada uma, o juiz faz uma adição para conferir que as metades somam o que foi afirmado</li>
+      <li>\(1\): na folha, o juiz compara um único número com a entrada</li>
+      <li>com \(N = 32\): 6 conferências contra 31 adições</li>
+    </ul>
+  </div>
+  <p>Agora ligue o “erro ofuscado”. Em problemas difíceis, o desonesto pode decompor a afirmação de um jeito que nem o honesto consegue descobrir, em tempo razoável, qual parte está errada. O honesto passa a chutar, e a chance de o juiz pegar a mentira cai para \(2^{-L}\) com \(L\) níveis. Esse é o <span class="la-term" data-term="argumentos-ofuscados">problema dos argumentos ofuscados</span>, a principal ameaça teórica ao debate. Brown-Cohen, Irving e coautores (2025) propuseram o <i>prover-estimator debate</i>, um protocolo recursivo que, sob hipóteses de estabilidade, garante que o honesto vença com eficiência comparável à do desonesto. Antes disso, o <i>doubly-efficient debate</i> (Brown-Cohen, Irving e Piliouras, 2023) já estudava protocolos em que o honesto vence a um custo polinomial (conhecimento prévio).</p>
+  <p>O artigo de 2018 testou a ideia num brinquedo: os dois agentes revelam pixels de uma imagem do MNIST a um classificador esparso, o juiz, que só enxerga os pixels revelados. A acurácia do juiz sobe de 59,4 % para 88,9 % com 6 pixels e de 48,2 % para 85,2 % com 4 pixels. Os próprios autores listam as fraquezas: humanos como juízes, perguntas de valores sem resposta verificável e a dúvida sobre se a vantagem da honestidade se mantém em escala.</p>
+  <h3>O que os experimentos com LLMs e humanos mostraram</h3>
+  <p>Para comparar, os trabalhos empíricos usam uma linha de base chamada <span class="la-term" data-term="consultoria">consultoria</span> (<i>consultancy</i>): um único especialista defende <b>uma</b> resposta, que é a certa só metade das vezes, e o juiz decide se acredita nele. O debate põe dois especialistas defendendo respostas opostas.</p>
+  <ul>
+    <li><b>Michael et al. (NYU, 2023).</b> Debates entre <b>humanos</b> sobre perguntas difíceis de leitura (QuALITY). O juiz, que não leu o texto e vê só os argumentos e as citações reveladas, acertou <b>84 %</b> no debate contra <b>74 %</b> na consultoria. Na análise de erros, 46 % dos erros do debate vieram de falhas do debatedor honesto, que devem diminuir com mais habilidade, enquanto 52 % dos erros da consultoria vieram de ofuscação, que deve <i>aumentar</i> com mais habilidade.</li>
+    <li><b>Khan et al. (2024).</b> Especialistas LLM com acesso ao texto e juízes não especialistas (LLM ou humano). O debate levou a <b>76 %</b> com juiz LLM e <b>88 %</b> com juiz humano, contra <b>48 %</b> e <b>60 %</b> das linhas de base ingênuas. E otimizar os debatedores para serem mais <b>persuasivos</b>, sem rótulo de verdade nenhum, <b>melhorou</b> a capacidade do juiz de achar a verdade.</li>
+    <li><b>Kenton et al. (Google DeepMind, 2024).</b> Debate, consultoria e pergunta direta em QA extrativo, matemática, código, lógica e tarefas multimodais. O debate venceu a consultoria em todas as tarefas, mas só venceu a pergunta direta quando havia <span class="la-term" data-term="assimetria-de-informacao">assimetria de informação</span> (o debatedor vê algo que o juiz não vê). Debatedores mais fortes aumentaram a acurácia do juiz, mas menos do que estudos anteriores sugeriam.</li>
+  </ul>
+  <figure class="la-fig" id="fig-resultados" data-title="Debate nos experimentos publicados">
+    <div class="la-fig-stage" style="height:390px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Acurácia do juiz, em %, nos três estudos com números publicados. Em cima, uma miniatura do protocolo do estudo escolhido; embaixo, as barras crescem da linha de base (cinza) até o resultado com debate (menta). Todos os valores vêm dos artigos (Irving et al. 2018; Khan et al. 2024; Michael et al. 2023).</figcaption>
+  </figure>
+  <div class="la-callout warn"><b class="t">Persuasão não é verdade</b><p>O resultado de Khan et al. tem condições. O ganho depende de o juiz ter um ponto de apoio que o desonesto não falsifica, como as citações reveladas no setup de Michael et al.; sem assimetria de informação, Kenton et al. viram resultados mistos. E um debatedor otimizado para persuadir um juiz específico pode aprender os vieses <i>desse</i> juiz. Por isso o debate segue como agenda de pesquisa em segurança, não receita pronta de pós-treino: as bibliotecas verificadas na pesquisa do Módulo 2 não têm trainer de debate.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Debate multiagente: uma assembleia de cópias</h2>
+  <p>A segunda família mantém a forma do debate e troca o objetivo. Em vez de supervisionar um especialista, Du, Li, Torralba, Tenenbaum e Mordatch (2023) usam várias instâncias do <b>mesmo</b> LLM (o gpt-3.5 do ChatGPT, nos experimentos principais) para responder melhor, sem treino nenhum. O protocolo é este:</p>
+  <ol class="la-steps">
+    <li><b>Rodada 1.</b> Cada um dos \(N\) agentes responde à pergunta de forma independente.</li>
+    <li><b>Rodadas seguintes.</b> Cada agente recebe as respostas dos outros e revisa a sua: concorda, discorda ou corrige.</li>
+    <li><b>Fim.</b> Depois de \(R\) rodadas, fica a resposta de consenso (ou a da maioria).</li>
+  </ol>
+  <p>Empiricamente, os agentes convergem para uma resposta comum, mas nada garante isso em geral. Com 3 agentes e 2 rodadas (Tabela 1 do artigo):</p>
+  <table>
+    <thead><tr><th>Método</th><th>Aritmética (%)</th><th>GSM8K (%)</th><th>Xadrez (ΔPS)</th></tr></thead>
+    <tbody>
+      <tr><td>Agente único</td><td>67,0 ± 4,7</td><td>77,0 ± 4,2</td><td>91,4 ± 10,6</td></tr>
+      <tr><td>Agente único + reflexão</td><td>72,1 ± 4,5</td><td>75,0 ± 4,3</td><td>102,1 ± 11,9</td></tr>
+      <tr><td>Multiagente (maioria)</td><td>69,0 ± 4,6</td><td>81,0 ± 3,9</td><td>102,2 ± 6,2</td></tr>
+      <tr><td><b>Multiagente (debate)</b></td><td><b>81,8 ± 2,3</b></td><td><b>85,0 ± 3,5</b></td><td><b>122,9 ± 7,6</b></td></tr>
+    </tbody>
+  </table>
+  <p>Na coluna de xadrez, ΔPS é a vantagem, em <i>pawn score</i> do Stockfish, do lance sugerido; maior é melhor (conhecimento prévio). Mais agentes e mais rodadas trazem ganhos adicionais, e a duração do debate pode ser controlada pelo quanto o prompt faz o modelo confiar nas próprias respostas. Repare na linha da maioria. Votar entre 3 respostas independentes quase não ajuda na aritmética (69,0 contra 67,0), mas deixar os agentes lerem uns aos outros ajuda muito (81,8). O valor está na leitura cruzada, não na contagem de votos.</p>
+  <p>Para ver o mecanismo, a figura simula um <b>modelo de brinquedo</b>, que não é o algoritmo do artigo. Cada agente tem uma distribuição de crença sobre 4 respostas candidatas. Ao ler os outros, ele mistura a própria crença com a dos colegas, com peso \(s\) para si mesmo, e, no que vem da leitura, dá um bônus \(v\) à resposta certa quando ela aparece acompanhada de justificativa. É a versão de brinquedo da hipótese de Irving: um raciocínio correto, quando lido, convence mais do que um errado.</p>
+  <div class="la-eq">
+    \[ \log \tilde p_i^{(r+1)}(a) = s\,\log p_i^{(r)}(a) + (1-s)\Big[\frac{1}{N-1}\sum_{j\neq i}\log p_j^{(r)}(a) + v\,\mathbb 1[a=a^\star]\,f^{(r)}_{-i}\Big] \]
+    <ul class="la-eq-legend">
+      <li>\(p_i^{(r)}(a)\): crença do agente \(i\) na rodada \(r\) de que a resposta é \(a\); \(\tilde p\) é renormalizada depois (softmax)</li>
+      <li>\(s\): <b>autoconfiança</b>, o que o prompt “confie nas suas respostas” controla; com \(s=1\), ninguém muda de ideia</li>
+      <li>\(v\): vantagem do argumento correto quando lido (\(v = 0\): só conformismo); ele age só pela leitura, com o mesmo peso \(1-s\)</li>
+      <li>\(a^\star\): a resposta certa; \(f^{(r)}_{-i}\): fração dos outros agentes que a defendem na rodada \(r\)</li>
+      <li>modelo <b>ilustrativo</b>, para intuição</li>
+    </ul>
+  </div>
+  <figure class="la-fig" id="fig-mad" data-title="Rodadas de debate multiagente">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Cada personagem tem um mini-histograma de crença sobre as 4 respostas candidatas para “12 × 4 + 5”. A barra destacada é a resposta que o agente diz em voz alta (o argmax). A cada rodada as mensagens voam entre os agentes e a massa de probabilidade se move. Embaixo, o placar da maioria e o custo em tokens (com \(L = 300\) tokens por resposta, <b>ilustrativo</b>). Mude o cenário para “maioria começa errada” (com \(N = 3\)): com \(v = 0\) a assembleia converge firme e errada; com \(v \ge 2\) a resposta certa vira o jogo em poucas rodadas.</figcaption>
+  </figure>
+  <p>Brinque com três situações. Com \(v = 0\), a assembleia só converge para o que a maioria já pensava. Se a maioria começa errada, o consenso é errado e firme. Liang e colegas descrevem um problema parente, a <i>degeneration of thought</i> (um modelo que, confiante, para de considerar alternativas ao refletir sozinho), e propõem debate com papéis divergentes, como um agente obrigado a discordar (só o título foi verificado na pesquisa). Com \(s\) alto, ninguém muda de ideia, e o debate vira uma votação cara. O ganho aparece no meio, com confiança moderada e argumentos que se deixam verificar.</p>
+  <div class="la-callout warn"><b class="t">Compare no mesmo orçamento</b><p>Smit et al. (“Should we be going MAD?”, 2023) mostraram que, na forma corrente, os sistemas de debate <b>não superam de forma confiável</b> a <span class="la-term" data-term="self-consistency">self-consistency</span> (amostrar várias respostas independentes e votar) nem ensembles com o mesmo orçamento. Com ajuste fino (como personas múltiplas e o nível de concordância entre agentes), alguns superam, mas são mais sensíveis a hiperparâmetros. A regra é medir debate e self-consistency com o mesmo número de tokens gerados.</p></div>
+  <h3>Quanto custa uma assembleia, e como o motor de inferência ajuda</h3>
+  <p>O custo cresce em duas direções: mais agentes e mais rodadas geram mais texto, e cada rodada depois da primeira tem um prompt mais longo, porque inclui as respostas dos colegas.</p>
+  <div class="la-eq">
+    \[ T_{\text{gerados}} = N\cdot R\cdot L, \qquad T^{(r)}_{\text{prompt}} \approx |q| + N\cdot L \quad (r \ge 2) \]
+    <ul class="la-eq-legend">
+      <li>\(N\): agentes; \(R\): rodadas, contando a primeira; \(L\): tokens por resposta; \(|q|\): tokens da pergunta</li>
+      <li>\(T^{(r)}_{\text{prompt}}\): prompt de cada agente a partir da 2ª rodada (a pergunta, a própria resposta anterior e as \(N-1\) dos outros), se só a última rodada entra no prompt; estimativa nossa a partir do protocolo</li>
+      <li>se cada agente mantiver o histórico inteiro, o prompt da rodada \(r\) cresce para \(|q| + (r-1)\cdot N\cdot L\); resumir as respostas anteriores corta esse custo</li>
+      <li>com \(N = 3\), \(R = 2\) e \(L = 300\) (<b>ilustrativo</b>): 1.800 tokens gerados, 6× uma resposta única; a self-consistency equivalente vota entre 6 amostras</li>
+    </ul>
+  </div>
+  <p>É aqui que o Módulo 1 volta (interpretação nossa). Os \(N\) agentes de uma rodada são \(N\) requisições independentes, que entram juntas no mesmo lote do <a data-ch="scheduler-batching">batching contínuo</a>; como o decode é limitado pela leitura dos pesos, 3 sequências no lote custam bem menos que 3× o tempo de uma. Com o histórico compartilhado <b>na mesma ordem para todos</b> e a instrução de cada agente no fim, o <a data-ch="prefix-caching">prefix caching</a> reaproveita o KV de quase todo o prompt. E nunca rode a assembleia a \(T = 0\): cópias determinísticas dão respostas idênticas, e o debate vira uma conversa de espelhos. Use a <span class="la-term" data-term="temperatura">temperatura</span> padrão de GLM e Qwen (\(T = 1{,}0\), <code>top_p</code> 0,95, do <code>generation_config</code>); na receita DeepSeek (<code>--generation-config vllm</code>), passe esses valores explicitamente na requisição. O esboço abaixo junta tudo contra o laboratório:</p>
+  <pre data-lang="python"><code># debate_mad.py — esboço: debate multiagente (Du et al.) contra uma receita do Módulo 1
+import re
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+from openai import OpenAI
+
+cli = OpenAI(base_url="http://SPARK_HEAD:8888/v1", api_key="x")
+MODELO = "qwen3.8-flash-next"     # ou GLM-5.3-Flash-EXL3 / deepseek-v4-flash-vision-exp
+N, R = 3, 2
+FIM = "Termine com uma linha 'Resposta: &lt;número&gt;'."
+
+def pedir(msgs):
+    r = cli.chat.completions.create(model=MODELO, messages=msgs, max_tokens=800,
+                                    temperature=1.0, top_p=0.95)   # explícito: vale também na DeepSeek
+    return r.choices[0].message.content
+
+def debate(pergunta):
+    base = f"{pergunta}\n{FIM}"
+    with ThreadPoolExecutor(N) as pool:            # N requisições juntas -&gt; mesmo lote no vLLM
+        resp = list(pool.map(pedir, [[{"role": "user", "content": base}]] * N))
+        for r in range(2, R + 1):
+            # histórico compartilhado, NA MESMA ORDEM para todos -&gt; prefixo comum (prefix caching)
+            hist = "\n\n".join(f"Agente {j + 1}:\n{t}" for j, t in enumerate(resp))
+            comum = f"{base}\n\nRespostas da rodada {r - 1}:\n{hist}\n\n"
+            msgs = [[{"role": "user", "content": comum + f"Você é o agente {i + 1}. "
+                      f"Leia os outros e revise a sua resposta. {FIM}"}] for i in range(N)]
+            resp = list(pool.map(pedir, msgs))     # só o fim do prompt muda entre agentes
+    votos = [m.group(1) for t in resp if (m := re.search(r"Resposta:\s*(-?[\d.,]+)", t or ""))]
+    return (Counter(votos).most_common(1)[0][0] if votos else None), resp
+
+print(debate("Quanto é 12 × 4 + 5?")[0])</code></pre>
+</section>
+
+<section class="la-sec">
+  <h2>SPIN: jogar contra a versão de ontem</h2>
+  <p>A terceira família é a que treina, e o caso mais simples parte de uma situação comum. Você fez <a data-ch="sft">SFT</a> num dataset de demonstrações humanas, e o modelo ainda não escreve como os humanos do dataset. Rodar mais épocas de SFT nos mesmos dados costuma estagnar. O <span class="la-term" data-term="spin">SPIN</span> (<i>Self-Play fIne-tuNing</i>; Chen e colegas, UCLA, 2024) extrai mais sinal desses mesmos dados, sem nenhum rótulo novo.</p>
+  <p>Há dois jogadores. O <b>jogador principal</b>, a iteração \(t+1\), aprende a <b>distinguir</b> as respostas humanas \(y\) das respostas \(y'\) geradas pelo <b>oponente</b>, que é a própria iteração \(t\). Quando consegue distinguir, ele aprendeu algo sobre o que separa o seu texto do humano. Na rodada seguinte, ele mesmo vira o oponente. É como um GAN em que discriminador e gerador são a mesma rede: o “escore de humanidade” de uma resposta é o quanto o modelo novo a tornou mais provável do que o antigo.</p>
+  <div class="la-eq">
+    \[ \mathcal L_{\text{SPIN}}(\theta,\theta_t) = \mathbb E_{x\sim q,\; y\sim p_{\text{data}}(\cdot\mid x),\; y'\sim p_{\theta_t}(\cdot\mid x)}\Big[\ell\Big(\underbrace{\lambda\log\frac{p_\theta(y\mid x)}{p_{\theta_t}(y\mid x)} - \lambda\log\frac{p_\theta(y'\mid x)}{p_{\theta_t}(y'\mid x)}}_{t}\Big)\Big], \qquad \ell(t) = \log\big(1+e^{-t}\big) \]
+    <ul class="la-eq-legend">
+      <li>\(x\sim q\): um prompt do dataset de SFT; \(y\): a resposta humana desse prompt</li>
+      <li>\(y'\): a resposta que o oponente (iteração \(t\), pesos \(\theta_t\)) gera para o mesmo prompt</li>
+      <li>\(p_\theta\): o jogador principal sendo treinado, inicializado em \(\theta_t\)</li>
+      <li>\(\lambda\): escala do log-ratio, o papel do \(\beta\) do DPO. Com \(\lambda\) maior, \(t\) cresce mais rápido para a mesma diferença de log-ratios: \(\sigma(-t)\) satura antes e o modelo para de empurrar com pouca mudança, perto de \(\theta_t\) (como um \(\beta\) grande no DPO); com \(\lambda\) menor, o jogador se afasta mais da iteração anterior</li>
+      <li>\(\ell\): perda logística; qualquer função convexa e decrescente também serve, segundo o artigo</li>
+    </ul>
+  </div>
+  <p>Com \(\ell\) logística, essa perda é exatamente um <a data-ch="dpo">DPO</a>: “chosen” = a resposta do dataset de SFT, “rejected” = a resposta da iteração anterior, e a referência = a iteração anterior. A derivada mostra o freio embutido:</p>
+  <div class="la-eq">
+    \[ -\nabla_\theta\,\ell(t) = \lambda\,\sigma(-t)\,\Big[\nabla_\theta \log p_\theta(y\mid x) - \nabla_\theta \log p_\theta(y'\mid x)\Big] \]
+    <ul class="la-eq-legend">
+      <li>\(\sigma(-t) = 1/(1+e^{t})\): o peso do par; grande quando o modelo ainda confunde as duas respostas (\(t \le 0\)) e pequeno quando já as separa (\(t \gg 0\))</li>
+      <li>o colchete: sobe a probabilidade da resposta humana e desce a da própria</li>
+      <li>vem de \(\ell'(t) = -\sigma(-t)\) e da regra da cadeia (derivação nossa)</li>
+    </ul>
+  </div>
+  <p>Faça a conta de um par, com os números de brinquedo da pesquisa: \(\lambda = 0{,}1\), log-ratio da resposta humana \(+2{,}0\) e da própria \(-1{,}0\). Então \(t = 0{,}1\times(2{,}0 - (-1{,}0)) = 0{,}3\), a perda vale \(\ell = \log(1+e^{-0{,}3}) = 0{,}554\) e o peso do gradiente é \(\sigma(-0{,}3) \approx 0{,}43\). O treino empurra \(t\) para cima até o modelo não conseguir mais separar as duas distribuições.</p>
+  <p>O teorema central do artigo diz que o ótimo global da perda é atingido <b>só quando</b> \(p_\theta = p_{\text{data}}\). A intuição é que, se as respostas do oponente já seguem a distribuição das humanas, \(y\) e \(y'\) se tornam intercambiáveis, e nenhum ajuste de \(\theta\) separa um do outro na média: o jogo para num <span class="la-term" data-term="ponto-fixo">ponto fixo</span>.</p>
+  <figure class="la-fig" id="fig-spin" data-title="SPIN: o discriminador que se aposenta">
+    <div class="la-fig-stage" style="height:460px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Em cima, num “espaço de estilos” unidimensional e <b>ilustrativo</b>: a distribuição humana \(p_{\text{data}}\) (rosa, fixa) e a do modelo \(p_{\theta_t}\) (lilás), que muda a cada iteração. Setas para cima onde falta massa ao modelo (amostras humanas, “chosen”), setas para baixo onde ele exagera (amostras próprias, “rejected”). A <span class="la-term" data-term="distancia-tv">distância TV</span> (metade da soma das diferenças absolutas) entre as duas encolhe até o ponto fixo. Embaixo, a perda logística \(\ell(t)\) de um par, com \(t\) calculado pelos controles; a barra âmbar é o peso \(\sigma(-t)\) do gradiente.</figcaption>
+  </figure>
+  <p>O resultado publicado parte do zephyr-7b-sft-full (um Mistral-7B após SFT) e usa só <b>50 mil</b> prompts do Ultrachat200k. A média no Open LLM Leaderboard foi de <b>58,14</b> para <b>63,16</b> ao longo das iterações, enquanto continuar o SFT no mesmo dataset estagnava ou piorava.</p>
+  <div class="la-callout why"><b class="t">Por que SPIN ganha de mais SFT</b><p>Na lente do coeficiente de gradiente, o SFT empurra \(+1\) nos tokens humanos e nada mais. O SPIN acrescenta empurrões <b>negativos</b> nas respostas típicas do próprio modelo, ou seja, contraexemplos <i>on-policy</i>, exatamente onde o modelo erra. É como aprender uma língua gravando a própria voz e comparando com a de um nativo: o que você aprende é a reconhecer o seu sotaque. E o peso \(\sigma(-t)\) concentra o esforço nos pares que o modelo ainda confunde.</p></div>
+  <p>Em código, cada iteração é um gerador (vLLM) na frente de um <code>DPOTrainer</code> do TRL:</p>
+  <pre data-lang="python"><code># spin_loop.py — esboço: SPIN como DPO iterativo (TRL + vLLM), sem rótulo novo
+from datasets import Dataset, load_dataset
+from trl import DPOConfig, DPOTrainer
+from vllm import LLM, SamplingParams
+
+sft = load_dataset("HuggingFaceH4/ultrachat_200k", split="train_sft[:50000]")   # 50 mil prompts
+ckpt = "ckpt/sft"                                  # θ_0: o modelo depois do SFT
+for t in range(3):
+    # 1) o oponente π_t responde a cada prompt (o custo de inferência do laço)
+    prompts = [ex["messages"][:1] for ex in sft]   # só o 1º turno do usuário
+    llm = LLM(model=ckpt)
+    outs = llm.chat(prompts, SamplingParams(temperature=1.0, max_tokens=1024))
+    del llm                                        # devolve a memória para o treino
+    # 2) chosen = resposta humana do SFT; rejected = resposta de π_t
+    ds = Dataset.from_list([{"prompt": p, "chosen": ex["messages"][1:2],
+                             "rejected": [{"role": "assistant", "content": o.outputs[0].text}]}
+                            for p, ex, o in zip(prompts, sft, outs)])
+    # 3) referência = π_t: sem ref_model, o TRL congela uma cópia do modelo de partida (= ckpt)
+    out = f"ckpt/spin-{t + 1}"
+    tr = DPOTrainer(model=ckpt, args=DPOConfig(output_dir=out, loss_type=["sigmoid"], beta=0.1),
+                    train_dataset=ds)             # beta faz o papel de λ
+    tr.train(); tr.save_model(out)
+    ckpt = out                                     # π_{t+1} vira o próximo oponente</code></pre>
+  <div class="la-callout warn"><b class="t">Os limites do SPIN</b><p>O teto do SPIN é \(p_{\text{data}}\): ele não fica melhor do que os dados humanos, e se o SFT tem ruído, o SPIN aprende a imitar o ruído com mais fidelidade. Para passar do teto humano, alguém precisa dizer o que é <i>melhor</i> que o humano. É isso que as duas próximas seções fazem.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Self-Rewarding: o aluno que corrige a própria prova</h2>
+  <p>No RLHF clássico, quem diz o que é melhor é um <a data-ch="preferencias-reward-models">reward model</a> treinado uma vez e congelado. Yuan e colegas (Meta/NYU, 2024) perguntaram o que acontece se o próprio modelo for o juiz, e se o juiz melhorar junto com o jogador. Assim nasceram os <span class="la-term" data-term="self-rewarding">Self-Rewarding Language Models</span>. O laço tem um passo de partida e depois se repete:</p>
+  <ol class="la-steps">
+    <li><b>\(M_0 \to M_1\).</b> O modelo base recebe SFT em dois tipos de dado: IFT (exemplos de seguir instruções) e EFT (exemplos de <span class="la-term" data-term="llm-as-judge">LLM-as-a-judge</span>, isto é, respostas avaliadas com uma rubrica).</li>
+    <li><b>Gerar prompts.</b> \(M_t\) escreve prompts novos, a partir de exemplos few-shot tirados do IFT.</li>
+    <li><b>Gerar candidatos.</b> \(M_t\) gera \(N\) respostas para cada prompt novo.</li>
+    <li><b>Julgar.</b> O mesmo \(M_t\) dá uma nota a cada candidato com uma <span class="la-term" data-term="rubrica-aditiva">rubrica aditiva</span> de 5 pontos: relevância, cobertura, utilidade, clareza e expertise. A nota vai de 0 a 5.</li>
+    <li><b>Treinar.</b> O par (maior nota, menor nota) entra no conjunto AIFT(\(M_t\)), que alimenta um DPO. O resultado é \(M_{t+1}\), e o laço recomeça.</li>
+  </ol>
+  <div class="la-eq">
+    \[ \mathcal L(\theta) = -\,\mathbb E_{(x,y_w,y_l)\sim \mathrm{AIFT}(M_t)}\Big[\log\sigma\Big(\beta\log\frac{\pi_\theta(y_w\mid x)}{\pi_{M_t}(y_w\mid x)} - \beta\log\frac{\pi_\theta(y_l\mid x)}{\pi_{M_t}(y_l\mid x)}\Big)\Big], \qquad s(y) = \sum_{k=1}^{5}\mathbb 1\big[y \text{ cumpre o critério } k\big] \]
+    <ul class="la-eq-legend">
+      <li>\(y_w, y_l\): a resposta de maior e a de menor nota \(s(y)\) entre os \(N\) candidatos de um prompt</li>
+      <li>\(\pi_{M_t}\): a referência, o modelo do início da iteração (como no DPO iterativo)</li>
+      <li>\(\beta = 0{,}1\) no artigo; learning rate de \(10^{-6}\) decaindo a \(10^{-7}\), batch 16</li>
+      <li>\(s(y)\): a nota aditiva; cada critério cumprido vale 1 ponto</li>
+    </ul>
+  </div>
+  <figure class="la-fig" id="fig-selfreward" data-title="Uma iteração de Self-Rewarding">
+    <div class="la-fig-stage" style="height:430px"><canvas></canvas></div>
+    <figcaption>Siga o laço: o modelo inventa um prompt, gera 4 candidatos, veste a toga de juiz e preenche a matriz da rubrica (1 = critério cumprido). As notas \([4, 2, 5, 3]\) formam o par (5, 2), o DPO aumenta a margem entre C e B e nasce \(M_{t+1}\). O prompt e a matriz da rubrica são <b>ilustrativos</b>; as notas seguem o exemplo da pesquisa, e os win rates do último passo são os publicados.</figcaption>
+  </figure>
+  <p>Com o Llama 2 70B e três modelos treinados (\(M_1\) a \(M_3\)), o win rate contra o GPT-4 Turbo no AlpacaEval 2.0 foi de <b>9,94 %</b> (\(M_1\)) para <b>15,38 %</b> (\(M_2\)) e <b>20,44 %</b> (\(M_3\)). O \(M_3\) ficou acima de Claude 2 (17,19 %), Gemini Pro (16,85 %) e GPT-4 0613 (15,76 %) no leaderboard da época. No confronto direto, \(M_2\) venceu \(M_1\) em 55,5 % dos casos e perdeu em 11,7 %; \(M_3\) venceu \(M_2\) em 47,7 % e perdeu em 12,5 %. A habilidade de <b>julgar</b> também melhorou entre as iterações, não só a de seguir instruções.</p>
+  <p>O <span class="la-term" data-term="meta-rewarding">Meta-Rewarding</span> (Wu et al., 2024) acrescenta um terceiro papel: o modelo também julga os <b>próprios julgamentos</b>, para que a habilidade de juiz não sature. Com o Llama-3-8B-Instruct, o AlpacaEval 2 foi de 22,9 % para 39,4 % e o Arena-Hard de 20,6 % para 29,1 %.</p>
+  <h3>O perigo de jogar e apitar</h3>
+  <p>Três riscos vêm junto com o ganho. O primeiro é a <span class="la-term" data-term="autopreferencia">autopreferência</span>. Panickssery, Bowman e Feng (2024) mostraram que o avaliador “dá notas maiores às próprias saídas” enquanto anotadores humanos as consideram equivalentes, e que a força desse viés cresce linearmente com a capacidade do modelo de se reconhecer. O segundo: o juiz vira alvo. A política otimiza contra um juiz que é ela mesma, e a sobre-otimização de reward model do <a data-ch="preferencias-reward-models">capítulo de RMs</a> agora tem um RM que se move junto. O terceiro é a saturação: se todos os candidatos tiram 5, não há par e o sinal some; o Meta-Rewarding ataca esse ponto.</p>
+  <div class="la-callout recipe" data-recipe="ds"><b class="t"><span class="la-rb ds"></span> Na família da receita</b><p>No DeepSeek-V4, linhagem do V4-Flash que a receita serve, o <b>ator é o próprio juiz generativo</b> (GRM) e o RL otimiza também a capacidade de julgar: é este laço, com os três riscos acima, em produção. Os votos do V3 como feedback estão no <a data-ch="constitutional-ai">capítulo de Constitutional AI</a>.</p></div>
+  <p>O Self-Rewarding é o caso do DPO online em que o anotador é o próprio modelo. A versão com anotador <b>externo</b> (OAIF, ou Online DPO) gera dois candidatos com a política atual e pede a um LLM juiz que escolha, nas duas ordens, para cancelar o viés de posição: a vacina mais simples contra a autopreferência é trocar quem apita.</p>
+</section>
+
+<section class="la-sec">
+  <h2>SPPO: quando a preferência é um jogo</h2>
+  <p>O <a data-ch="preferencias-reward-models">modelo de Bradley–Terry</a> supõe que cada resposta tem uma nota escalar \(r(y)\) e que \(\mathbb P(y\succ y') = \sigma(r(y) - r(y'))\). Isso implica <b>transitividade</b>: se A vence B e B vence C, A vence C. Preferências reais nem sempre obedecem. Imagine três juízes com ordens diferentes: A &gt; B &gt; C, B &gt; C &gt; A e C &gt; A &gt; B. Na maioria, A vence B (2 de 3), B vence C (2 de 3) e C vence A (2 de 3). É o paradoxo de Condorcet, uma <span class="la-term" data-term="preferencia-intransitiva">preferência intransitiva</span>, e nenhuma nota escalar consegue representá-lo.</p>
+  <p>O <span class="la-term" data-term="sppo">SPPO</span> (<i>Self-Play Preference Optimization</i>; Wu et al., UCLA/CMU, 2024) larga a nota e trata o alinhamento como um <b>jogo de soma constante entre duas políticas</b>. O alvo é o <span class="la-term" data-term="equilibrio-de-nash">equilíbrio de Nash</span>: a política que, em média, é preferida contra qualquer outra.</p>
+  <div class="la-eq">
+    \[ \mathbb P(\pi \succ \pi' \mid x) = \mathbb E_{y\sim\pi(\cdot\mid x),\; y'\sim\pi'(\cdot\mid x)}\big[\mathbb P(y\succ y'\mid x)\big], \qquad \pi^\star = \arg\max_{\pi}\,\min_{\pi'}\;\mathbb P(\pi \succ \pi') \]
+    <ul class="la-eq-legend">
+      <li>\(\mathbb P(y\succ y'\mid x)\): probabilidade de \(y\) ser preferida a \(y'\), dada por um <span class="la-term" data-term="modelo-de-preferencia-pareado">modelo de preferência</span> (no artigo, o PairRM, com 0,4B)</li>
+      <li>\(\mathbb P(\pi\succ\pi')\): taxa de vitória esperada de uma política contra outra; é um jogo de soma constante, porque \(\mathbb P(\pi\succ\pi') + \mathbb P(\pi'\succ\pi) = 1\)</li>
+      <li>\(\pi^\star\): o equilíbrio de Nash, que vence pelo menos metade dos confrontos contra qualquer \(\pi'\)</li>
+    </ul>
+  </div>
+  <p>A atualização é um passo de <span class="la-term" data-term="pesos-multiplicativos">pesos multiplicativos</span>: cada resposta ganha massa em proporção exponencial à sua taxa de vitória contra a política atual. Como a constante de normalização \(Z\) é intratável, o SPPO a aproxima por \(\log Z \approx \eta/2\) e transforma a atualização numa regressão:</p>
+  <div class="la-eq">
+    \[ \pi_{t+1}(y\mid x) = \frac{\pi_t(y\mid x)\,e^{\eta\,\mathbb P(y\succ\pi_t\mid x)}}{Z_{\pi_t}(x)} \;\;\Longrightarrow\;\; \pi_{t+1} = \arg\min_{\pi}\; \mathbb E_{x,\;y\sim\pi_t}\Big[\Big(\log\frac{\pi(y\mid x)}{\pi_t(y\mid x)} - \eta\big(\mathbb P(y\succ\pi_t\mid x) - \tfrac12\big)\Big)^2\Big] \]
+    <ul class="la-eq-legend">
+      <li>\(\mathbb P(y\succ\pi_t\mid x)\): taxa de vitória de \(y\) contra amostras da política atual, estimada pelo modelo de preferência</li>
+      <li>\(\eta\): o “passo” do jogo; \(10^{3}\) no artigo</li>
+      <li>\(Z_{\pi_t}(x)\): normalização; com \(\log Z \approx \eta/2\), o alvo do log-ratio vira \(\eta(\mathbb P - \tfrac12)\)</li>
+      <li>por que \(\eta/2\): como \(\pi_t\) joga contra si mesma, \(\mathbb E_{y\sim\pi_t}[\mathbb P(y\succ\pi_t)] = \tfrac12\); pela desigualdade de Jensen, \(\log Z \ge \eta/2\), com igualdade quando toda resposta tem taxa de vitória ½. É a aproximação de primeira ordem em torno do empate</li>
+      <li>a forma exponencial à esquerda é a atualização clássica de pesos multiplicativos (Hedge); a perda à direita é a regressão que o SPPO de fato minimiza</li>
+    </ul>
+  </div>
+  <p>Em palavras: o log-ratio de cada resposta é <b>regredido</b> para \(\eta\times(\text{taxa de vitória} - 0{,}5)\). Quem vence mais da metade dos confrontos sobe; quem perde, desce. O valor alto de \(\eta\) faz sentido porque o log-ratio é da <b>sequência inteira</b>. Com taxa de vitória 0,8, o alvo é \(1000\times 0{,}3 = 300\) nats, cerca de 1 nat por token numa resposta de 300 tokens (interpretação da pesquisa). A configuração publicada usa 3 iterações, 20 mil prompts do UltraFeedback por iteração (60 mil no total, sem as respostas), batch global de 64 e 8×A100.</p>
+  <figure class="la-fig" id="fig-sppo" data-title="Pedra, papel, tesoura e Nash">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>À esquerda, a matriz \(\mathbb P(\text{linha}\succ\text{coluna})\) entre três respostas A, B e C. À direita, o triângulo de todas as políticas possíveis (cada ponto é uma mistura de A, B e C). As setinhas mostram para onde a atualização multiplicativa empurra cada política; a trilha lilás são os iterados \(\pi_t\), e a estrela âmbar é a média deles. Com preferências cíclicas, os iterados giram em espiral, afastando-se do centro (o Nash) com passo constante, e a média converge para ele. Com preferências transitivas, tudo escorre para o vértice A. Valores <b>ilustrativos</b>.</figcaption>
+  </figure>
+  <p>A figura mostra um fato clássico de teoria dos jogos, que não é um número do artigo: em jogos de soma zero, o último iterado do Hedge gira e, com passo constante, até se afasta do equilíbrio, enquanto a <b>média</b> dos iterados converge para ele. O SPPO roda poucas iterações (3 no artigo) e não tenta chegar ao centro de um ciclo perfeito: o ganho vem de usar como sinal a taxa de vitória contra a política <i>atual</i>, que continua informativa mesmo quando nenhuma nota escalar existe.</p>
+  <div class="la-callout deep"><b class="t">Por que o Bradley–Terry achata o ciclo</b><p>Com o ciclo simétrico da figura (A vence B, B vence C e C vence A, todos com a mesma probabilidade \(c\)), o ajuste de máxima verossimilhança do Bradley–Terry dá, por simetria, \(r_A = r_B = r_C\). Para o DPO, que herda essa hipótese, as três respostas empatam e não há o que aprender. O SPPO, ao contrário, mede a vitória contra a <b>mistura atual</b>. Se \(\pi_t\) tem A demais, então C, que vence A, tem taxa de vitória acima de 0,5 e sobe. É o mesmo raciocínio de quem joga pedra-papel-tesoura contra alguém que só joga pedra.</p></div>
+  <p>Os resultados usam o PairRM (0,4B) como modelo de preferência e só os <b>prompts</b> do UltraFeedback, sem as respostas nem as preferências do GPT-4. A partir do Mistral-7B-Instruct-v0.2, o SPPO chega a <b>28,53 %</b> de win rate com controle de comprimento (LC) contra o GPT-4-Turbo no AlpacaEval 2.0; a partir do Llama-3-8B-Instruct, a <b>38,77 %</b>. Ele supera DPO e IPO iterativos. Na prática, o TRL expõe a perda como <code>DPOConfig(loss_type=["sppo_hard"], beta=0.001, learning_rate=5e-7)</code>, a configuração do artigo; repare que \(\beta = 1/\eta\). O sufixo <i>hard</i> troca a taxa de vitória estimada por rótulos duros: a resposta vencedora do par recebe \(\mathbb P = 1\) e a perdedora \(\mathbb P = 0\). Os alvos do log-ratio viram \(+\eta/2\) e \(-\eta/2\), isto é, \(\pm 1/(2\beta)\). O laço do self-play (amostrar de \(\pi_t\), rotular com o PairRM, retreinar e repetir) fica por sua conta; o verl tem uma receita de SPPO. Sobre o laço do SPIN, mudam só o rotulador e a perda:</p>
+  <pre data-lang="python"><code># sppo_loop.py — esboço: o laço do SPIN com outro rotulador e outra perda
+K = 4                                                     # amostras de π_t por prompt (ilustrativo)
+outs = llm.chat(prompts, SamplingParams(n=K, temperature=1.0, max_tokens=1024))
+
+def par_sppo(prompt, ys):
+    # taxa de vitória de cada amostra contra as irmãs; prefere(x, a, b) = P(a ≻ b | x)
+    # vem do seu modelo de preferência (o PairRM, com 0,4B, no artigo)
+    w = [sum(prefere(prompt, a, b) for b in ys if b is not a) / (len(ys) - 1) for a in ys]
+    return ys[w.index(max(w))], ys[w.index(min(w))]      # chosen, rejected
+
+linhas = []
+for p, o in zip(prompts, outs):
+    y_w, y_l = par_sppo(p, [c.text for c in o.outputs])
+    linhas.append({"prompt": p, "chosen": [{"role": "assistant", "content": y_w}],
+                   "rejected": [{"role": "assistant", "content": y_l}]})
+ds = Dataset.from_list(linhas)
+args = DPOConfig(output_dir=out, loss_type=["sppo_hard"], beta=0.001,   # β = 1/η, η = 10³
+                 learning_rate=5e-7)                                     # referência = π_t, de novo
+# ... DPOTrainer(model=ckpt, args=args, train_dataset=ds), salvar e regenerar a cada iteração</code></pre>
+</section>
+
+<section class="la-sec">
+  <h2>Self-play para raciocínio: inventar o exercício certo</h2>
+  <p>Os métodos anteriores ainda dependem de prompts escritos por alguém. A fronteira de 2025–2026 é o modelo propor também as <b>tarefas</b>. O exemplo mais limpo é o <span class="la-term" data-term="absolute-zero">Absolute Zero Reasoner</span> (AZR; Zhao et al., 2025): um único modelo com dois papéis e nenhum dado curado.</p>
+  <p>O AZR trabalha com triplas (programa, entrada, saída), verificadas por um executor de Python, e com três modos de raciocínio que escondem uma parte diferente da tripla:</p>
+  <dl class="la-kv">
+    <dt>dedução</dt><dd>dados o programa e a entrada, prever a saída (raciocínio passo a passo, como executar o código de cabeça)</dd>
+    <dt>abdução</dt><dd>dados o programa e a saída, achar uma entrada que a produza (busca e tentativa e erro)</dd>
+    <dt>indução</dt><dd>dados alguns pares de entrada e saída, sintetizar o programa (generalizar a partir de exemplos)</dd>
+  </dl>
+  <p>No papel de <b>propositor</b>, o modelo inventa uma tarefa; o executor confere se ela é válida (se o programa roda e é determinístico, por exemplo; conhecimento prévio). No papel de <b>resolvedor</b>, o mesmo modelo tenta resolvê-la, e o executor confere a resposta. O objetivo junta os dois papéis:</p>
+  <div class="la-eq">
+    \[ J(\theta) = \max_\theta\; \mathbb E_{z\sim p(z)}\Big[\mathbb E_{(x,y^\star)\sim f_e(\cdot\mid\tau),\;\tau\sim\pi^{\text{propose}}_\theta(\cdot\mid z)}\Big[\lambda\, r^{\text{propose}}_e(\tau,\pi_\theta) + \mathbb E_{y\sim\pi^{\text{solve}}_\theta(\cdot\mid x)}\, r^{\text{solve}}_e(y, y^\star)\Big]\Big] \]
+    <ul class="la-eq-legend">
+      <li>\(z\): o condicionamento do propositor (por exemplo, triplas anteriores usadas como referência)</li>
+      <li>\(\tau\): a tarefa proposta; \(f_e\): o ambiente (o executor) que a transforma no par (pergunta \(x\), resposta certa \(y^\star\))</li>
+      <li>\(\pi^{\text{propose}}_\theta\), \(\pi^{\text{solve}}_\theta\): o <b>mesmo</b> modelo nos dois papéis, com prompts diferentes</li>
+      <li>\(r^{\text{solve}}_e\): acerto do resolvedor, conferido pelo executor; \(\lambda\): peso da recompensa do propositor</li>
+    </ul>
+  </div>
+  <p>O coração do método é a recompensa do propositor. Com \(G\) tentativas do resolvedor na mesma tarefa:</p>
+  <div class="la-eq">
+    \[ \bar r_{\text{solve}} = \frac{1}{G}\sum_{i=1}^{G} r^{(i)}_{\text{solve}}, \qquad r_{\text{propose}} = \begin{cases} 0 & \text{se } \bar r_{\text{solve}} = 0 \text{ ou } \bar r_{\text{solve}} = 1\\ 1 - \bar r_{\text{solve}} & \text{caso contrário} \end{cases} \]
+    <ul class="la-eq-legend">
+      <li>\(\bar r_{\text{solve}}\): a taxa de acerto do resolvedor nas \(G\) tentativas</li>
+      <li>tarefa impossível (0 acertos) ou trivial (todos acertam) vale <b>zero</b> para quem a propôs</li>
+      <li>o máximo fica na tarefa mais difícil que ainda é resolvida às vezes: com \(G = 8\), 1 acerto em 8 vale 0,875</li>
+    </ul>
+  </div>
+  <p>É a <span class="la-term" data-term="recompensa-de-aprendibilidade">recompensa de aprendibilidade</span>. Ela empurra o propositor para a “zona de desenvolvimento proximal” do resolvedor: o exercício que ele ainda erra, mas às vezes acerta. Repare que isso conversa com o GRPO: um grupo em que todas as tentativas acertam ou todas erram tem vantagem zero e não ensina nada ao resolvedor. Tarefas que dão grupos mistos são as únicas que geram gradiente. As duas recompensas cabem em poucas linhas:</p>
+  <pre data-lang="python"><code># recompensas do Absolute Zero para uma tarefa proposta (esboço)
+def r_propose(acertos, G):
+    rbar = acertos / G                          # taxa de acerto do resolvedor
+    return 0.0 if rbar in (0, 1) else 1 - rbar  # impossível ou trivial: zero
+
+def recompensas(tarefa, tentativas, executar):
+    y_star = executar(tarefa)                   # o executor de Python dá a resposta certa
+    r_solve = [float(y == y_star) for y in tentativas]
+    return r_propose(sum(r_solve), len(tentativas)), r_solve
+
+print([r_propose(k, 8) for k in range(9)])
+# [0.0, 0.875, 0.75, 0.625, 0.5, 0.375, 0.25, 0.125, 0.0]</code></pre>
+  <figure class="la-fig" id="fig-azr" data-title="Absolute Zero: a zona de aprendibilidade">
+    <div class="la-fig-stage" style="height:450px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Em cima, o propositor monta uma tripla (programa, entrada, saída) e esconde a parte que o modo escolhido pede; o executor de Python valida; o resolvedor faz \(G = 8\) tentativas, marcadas com ✓ ou ✗. Embaixo à esquerda, a curva da recompensa do propositor em função da taxa de acerto; à direita, a grade 3 × 2 de linhas de base do TRR++ (tipo de tarefa × papel), com a célula em uso acesa. O programa de exemplo é <b>ilustrativo</b>; a regra da recompensa é a do artigo.</figcaption>
+  </figure>
+  <p>As vantagens são normalizadas separadamente por tipo de tarefa e por papel, num esquema chamado <span class="la-term" data-term="trr-plus-plus">TRR++</span> (<i>Task-Relative REINFORCE++</i>), com 6 linhas de base (3 tipos × 2 papéis):</p>
+  <div class="la-eq">
+    \[ A^{\text{norm}}_{\text{task},\text{role}} = \frac{r - \mu_{\text{task},\text{role}}}{\sigma_{\text{task},\text{role}}}, \qquad \text{task}\in\{\text{ind},\text{ded},\text{abd}\},\quad \text{role}\in\{\text{propose},\text{solve}\} \]
+    <ul class="la-eq-legend">
+      <li>\(\mu, \sigma\): média e desvio da recompensa dentro do mesmo (tipo de tarefa, papel) no batch</li>
+      <li>separar as linhas de base impede que a escala de um papel (propor tem recompensa contínua, resolver tem binária) contamine o outro (interpretação)</li>
+    </ul>
+  </div>
+  <p>Os números do artigo: com <b>zero</b> dados curados, o AZR supera modelos treinados com dezenas de milhares de exemplos rotulados no domínio, e os ganhos crescem com o tamanho (+5,7, +10,2 e +13,2 pontos nas versões coder de 3B, 7B e 14B). O treino usa batch 64×6, learning rate \(10^{-6}\) constante e AdamW, sobre o Qwen2.5-7B e o Qwen2.5-7B-Coder. Surgem comentários usados como planos intermediários (estilo ReAct), e a abdução é o modo que mais alonga as respostas, porque envolve tentativa e erro. Houve também um <b>“uh-oh moment”</b>: com o Llama3.1-8B apareceram, ocasionalmente, cadeias de pensamento preocupantes, e os autores pedem treino com consciência de segurança.</p>
+  <h3>A família cresce</h3>
+  <table>
+    <thead><tr><th>Trabalho</th><th>Mecanismo</th><th>Números publicados</th></tr></thead>
+    <tbody>
+      <tr><td><b>R-Zero</b> (Huang et al., 2025)</td><td>um Desafiante e um Resolvedor co-evoluem a partir de zero dados</td><td>Qwen3-4B-Base: +6,49 em matemática, +7,54 em raciocínio geral</td></tr>
+      <tr><td><b>R-Diverse</b> (2026)</td><td>diagnostica a <span class="la-term" data-term="ilusao-de-diversidade">ilusão de diversidade</span> do R-Zero e propõe memória persistente e medida de diversidade por habilidade</td><td>sustenta os ganhos por mais iterações em 10 benchmarks</td></tr>
+      <tr><td><b>SPIRAL</b> (2025)</td><td>self-play multiturno em jogos de soma zero (jogo da velha, Kuhn Poker, negociação simples) contra versões cada vez mais fortes de si; estimativa de vantagem condicionada ao papel</td><td>até +10 % em 8 benchmarks de raciocínio, em 4 modelos (Qwen e Llama); supera SFT em 25.000 trajetórias de especialistas</td></tr>
+      <tr><td><b>Self-play SWE-RL</b> (2025)</td><td>um único agente <b>injeta</b> bugs cada vez mais complexos em repositórios reais e depois os <b>conserta</b>; o bug é especificado por um patch de teste</td><td>SWE-bench Verified +10,4; SWE-Bench Pro +7,8</td></tr>
+      <tr><td><b>DeepSeek-V3.2</b> (agente geral)</td><td>o agente sintetiza ambiente, ferramentas, tarefa e função de verificação, aumentando a dificuldade aos poucos</td><td>1.827 ambientes e 4.417 tarefas retidas (pass@100 &gt; 0)</td></tr>
+      <tr><td><b>DeepSeekMath-V2</b> (2025)</td><td>gerador × verificador × meta-verificador no mesmo RL</td><td>nível ouro na IMO 2025 com test-time compute (fonte secundária)</td></tr>
+    </tbody>
+  </table>
+  <div class="la-callout analogy"><b class="t">Analogia: o personal trainer que é você</b><p>Um bom treinador não passa exercícios que você já domina, nem exercícios impossíveis: escolhe o peso que você levanta com esforço. O propositor do AZR é esse treinador, e é pago exatamente por acertar a dificuldade. O perigo é ele variar só a cor dos halteres, mudando a superfície da tarefa sem mudar a habilidade: a ilusão de diversidade, que volta na última seção.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Jogos prover-verifier: correto e verificável</h2>
+  <p>A última peça junta debate e self-play. Nos <span class="la-term" data-term="jogo-prover-verifier">jogos prover-verifier</span> (Anil et al., 2021), um <b>provador</b> poderoso conversa com um <b>verificador</b> limitado, e o jogo é desenhado para que o equilíbrio force respostas <b>checáveis</b>. É o debate com um papel a menos: o provador quer convencer, o verificador quer não ser enganado.</p>
+  <p>Kirchner et al. (OpenAI, 2024) levaram a ideia para cadeias de pensamento e acharam um problema concreto: otimizar o CoT <b>só por correção</b> pode deixá-lo <b>menos legível</b>. O modelo acerta mais, mas por caminhos que um humano com pouco tempo não consegue conferir. A proposta é treinar, em rodadas alternadas, três personagens:</p>
+  <ol class="la-steps">
+    <li><b>Verificadores pequenos</b>, que preveem se uma solução está correta.</li>
+    <li><b>Provadores úteis</b>, recompensados por soluções <i>corretas</i> que o verificador aceita.</li>
+    <li><b>Provadores sorrateiros</b>, recompensados por soluções <i>erradas</i> que enganam o verificador.</li>
+  </ol>
+  <p>Ao longo das rodadas, a acurácia do provador útil e a robustez do verificador sobem. E a legibilidade <b>transfere para humanos com tempo limitado</b>: eles acertam mais ao julgar as soluções do provador útil e menos ao julgar as do sorrateiro.</p>
+  <figure class="la-fig" id="fig-pvg" data-title="Provador útil, provador sorrateiro e verificador">
+    <div class="la-fig-stage" style="height:420px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>As folhas de solução saem do provador útil (menta, certas) e do sorrateiro (rosa, erradas e caprichadas). O verificador carimba “aceito” ou “rejeitado”. Avance as rodadas de treino: o sorrateiro passa cada vez menos, o útil continua passando. À direita, as tendências reportadas por Kirchner et al. As <b>formas são qualitativas e os números são ilustrativos</b>, porque a pesquisa registra o sentido das curvas, não os valores.</figcaption>
+  </figure>
+  <p>O provador sorrateiro é o mentiroso do debate, e o verificador é o juiz. O verificador melhora porque vê ataques de verdade, como em treino adversarial. Em 2026, esse jogo tem versões práticas, e as associações a seguir são interpretação da pesquisa:</p>
+  <ul>
+    <li>o <b>hack agent</b> do MiMo-V2.6 é um adversário contra o ambiente e o verificador: sonda os ambientes de RL até não achar mais exploits (e achou rotas nunca vistas no treino);</li>
+    <li>o <b>grader agêntico</b> do MiMo, que entra no ambiente de cada rollout e compara soluções do mesmo grupo, é um verificador forte;</li>
+    <li>o <b>monitor de CoT</b> (Baker et al., 2025) é um verificador fraco supervisionando um forte: um GPT-4o lendo o raciocínio do o3-mini detecta reward hacking muito melhor do que olhando só as ações.</li>
+  </ul>
+  <div class="la-callout danger"><b class="t">Não otimize o CoT diretamente</b><p>Baker et al. também mostraram o lado perigoso. Pôr o monitor <b>dentro da recompensa</b> ajuda com pouca otimização, mas, com muita, o agente aprende <b>reward hacking ofuscado</b>: continua hackeando e esconde a intenção do raciocínio. A proposta é pagar um “imposto de monitorabilidade”, isto é, não aplicar pressão forte diretamente no CoT. É o problema dos argumentos ofuscados da seção de debate, agora dentro do próprio modelo.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Riscos, avaliação e prática</h2>
+  <p>Juntando tudo, cada família tem um uso e um modo de falhar característicos:</p>
+  <table class="la-params">
+    <thead><tr><th>Método</th><th>Útil para</th><th>Risco ou limitação</th><th>Evidência</th></tr></thead>
+    <tbody>
+      <tr><td>Debate (segurança)</td><td>supervisionar especialistas não confiáveis quando há assimetria de informação</td><td>argumentos ofuscados; persuasão ≠ verdade; ganhos menores sem assimetria</td><td>Michael; Khan; Kenton; Brown-Cohen</td></tr>
+      <tr><td>Debate multiagente</td><td>acurácia e factualidade sem treino</td><td>custo de \(N\times R\); nem sempre bate a self-consistency no mesmo orçamento</td><td>Du; Smit</td></tr>
+      <tr><td>SPIN, Self-Rewarding, Meta-Rewarding</td><td>melhorar além do SFT sem rótulos novos</td><td>juiz = modelo: autopreferência, hacking do próprio juiz, saturação</td><td>Yuan; Wu; viés (interpretação)</td></tr>
+      <tr><td>SPPO</td><td>preferências não transitivas; alvo de Nash</td><td>depende da qualidade do modelo de preferência (PairRM)</td><td>Wu et al.</td></tr>
+      <tr><td>Tarefas autopropostas (AZR, R-Zero, SSR)</td><td>currículo infinito, sem dados humanos</td><td>ilusão de diversidade e ciclos; “uh-oh moments”; exige verificador executável</td><td>Zhao; R-Diverse</td></tr>
+      <tr><td>Jogos prover-verifier</td><td>legibilidade, checabilidade</td><td>provadores sorrateiros mostram que o verificador pode ser enganado</td><td>Kirchner</td></tr>
+    </tbody>
+  </table>
+  <p>O risco que atravessa a tabela é a <b>recompensa autorreferente</b>. Quando quem apita é parente de quem joga, a política encontra o que o juiz gosta, e isso pode não ser o que você queria. É a <span class="la-term" data-term="lei-de-goodhart">lei de Goodhart</span> com um agravante: o juiz se move junto. A sobre-otimização de reward models (Gao, Schulman e Hilton), que você viu com o RM congelado, tem a forma de uma corcova:</p>
+  <div class="la-eq">
+    \[ R_{\text{RL}}(d) = d\,\big(\alpha_{\text{RL}} - \beta_{\text{RL}}\log d\big), \qquad d = \sqrt{D_{\mathrm{KL}}(\pi\,\Vert\,\pi_{\text{init}})} \]
+    <ul class="la-eq-legend">
+      <li>\(R_{\text{RL}}\): a recompensa medida pelo juiz <b>ouro</b> (o que você realmente quer)</li>
+      <li>\(d\): o quanto a política se afastou da inicial, na raiz da divergência KL</li>
+      <li>\(\alpha, \beta\): coeficientes que dependem do tamanho do RM proxy e dos dados</li>
+      <li>a recompensa do proxy sobe sem parar; a do ouro sobe, atinge um pico e <b>cai</b></li>
+    </ul>
+  </div>
+  <p>A figura simula essa dinâmica num laço de Self-Rewarding de brinquedo. Cada resposta tem um “estilo” que o juiz adora (verbosidade, o sotaque do próprio modelo) e uma qualidade real que melhora com um pouco de estilo e piora com estilo demais. O juiz soma à qualidade um viés \(b\) a favor do estilo. A cada iteração, as respostas que o juiz prefere viram o alvo do treino.</p>
+  <figure class="la-fig" id="fig-colapso" data-title="Quando o juiz é você mesmo">
+    <div class="la-fig-stage" style="height:450px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>À esquerda, a população de respostas (bolinhas) sobre a curva de qualidade real (menta) e a curva da nota do próprio juiz (âmbar tracejado); a bandeira marca onde o juiz é máximo e a estrela, onde a qualidade real é máxima. À direita, as três séries ao longo das iterações: nota do juiz, qualidade ouro e diversidade. Ligue a “âncora externa” (juiz de outra família, referência fixa, regularização). No brinquedo, ela faz três coisas: o viés \(b\) cai para 25 %, a exploração aumenta e há um puxão para o estilo das respostas humanas de referência (que aqui coincide com o ótimo real). Modelo de <b>brinquedo</b>, só para intuição.</figcaption>
+  </figure>
+  <p>Três sintomas aparecem juntos: a nota do próprio juiz sobe sem parar, a qualidade real sobe e depois cai, e a diversidade desaba. Zere \(b\) e repare: a diversidade cai mesmo assim (qualquer seleção estreita a população), mas a qualidade ouro deixa de fazer corcova. O que o viés autorreferente acrescenta é a corcova. Na prática, é a combinação que a pesquisa registra como saturação, autopreferência e ilusão de diversidade.</p>
+  <h3>Como avaliar um laço de self-play</h3>
+  <ol class="la-steps">
+    <li><b>Âncora fixa e externa.</b> Meça em benchmarks verificáveis que o laço nunca vê, com um juiz de <b>outra família</b> (a autopreferência cresce com a capacidade de se reconhecer) e com uma amostra lida por humanos. O <a data-ch="avaliacao-pos-treino">próximo capítulo</a> detalha win rate com intervalo de confiança e o controle de comprimento.</li>
+    <li><b>Meça o juiz também.</b> Se o modelo é juiz, acompanhe a concordância dele com rótulos ouro a cada iteração, como fizeram os autores do Self-Rewarding. Um juiz que fica mais generoso sem ficar mais certo é sinal de hacking.</li>
+    <li><b>Diversidade por habilidade, não só por batch.</b> A lição do R-Diverse é que diversidade dentro do batch pode esconder ciclos entre iterações e variedade só superficial. Conte habilidades distintas exercitadas.</li>
+    <li><b>Mesmo orçamento.</b> Debate contra self-consistency com os mesmos tokens; SPIN contra mais SFT; SPPO contra DPO iterativo com o mesmo modelo de preferência.</li>
+    <li><b>Mais de uma família de modelos.</b> No RLVR, recompensas espúrias melhoraram o Qwen2.5-Math e não transferiram para Llama3 ou OLMo2. Valide em mais de uma base antes de acreditar num ganho.</li>
+    <li><b>Deriva e comportamento.</b> Acompanhe o KL da referência, o comprimento médio e métricas de comportamento (repetição, recusas), e leia cadeias de pensamento: os “uh-oh moments” do AZR só foram vistos porque alguém leu.</li>
+  </ol>
+  <h3>Na prática: bibliotecas e motores</h3>
+  <table>
+    <thead><tr><th>Método</th><th>Onde rodar (versões verificadas na pesquisa)</th></tr></thead>
+    <tbody>
+      <tr><td>SPPO</td><td>TRL <code>DPOConfig(loss_type=["sppo_hard"], beta=0.001, learning_rate=5e-7)</code> ou a receita SPPO do verl</td></tr>
+      <tr><td>Self-Rewarding / Online DPO</td><td>TRL <code>trl.experimental.online_dpo.OnlineDPOTrainer</code> (geração com vLLM, juiz ou RM configurável); MLX (<code>mlx_lm_lora.train --train-mode online_dpo --judge</code>)</td></tr>
+      <tr><td>SPIN</td><td>DPO iterativo do TRL com vLLM gerando os “rejected” a cada iteração (esboço na seção do SPIN)</td></tr>
+      <tr><td>Tarefas autopropostas</td><td>GRPO (TRL <code>GRPOTrainer</code>, verl) com um executor ou testes como função de recompensa</td></tr>
+      <tr><td>Debate</td><td>sem trainer pronto; implementável como RL multiagente com juiz (ambientes no <code>GRPOTrainer</code> do TRL ou <code>--train.agent_func_path</code> no OpenRLHF)</td></tr>
+    </tbody>
+  </table>
+  <p>Todos esses métodos são <b>online</b>: cada iteração gera milhares de respostas novas, por isso o pós-treino moderno tem um motor de inferência dentro do laço, e o Módulo 1 (batching, prefix caching, especulação, quantização) volta a valer dinheiro.</p>
+  <div class="la-inrecipe" data-recipe="all"><div class="la-inrecipe-h"><span class="la-rb all"></span><span class="k">Laboratório</span><code>http://SPARK_HEAD:8888/v1</code></div><div class="la-inrecipe-b"><p>As três receitas expõem uma API OpenAI na porta 8888, com os nomes <code>GLM-5.3-Flash-EXL3</code>, <code>qwen3.8-flash-next</code> e <code>deepseek-v4-flash-vision-exp</code>. Isso dá debatedores e juízes de <b>três famílias diferentes</b>, mas cada receita ocupa os dois nós, então rode uma de cada vez. Um debate homogêneo usa uma receita só (o esboço da seção multiagente). Para um debate entre famílias, ou para julgar um laço de Self-Rewarding, rode cada rodada (ou o julgamento) em lote para todas as perguntas, troque de receita e continue. Regra de ouro herdada da avaliação: o juiz <b>não</b> pode ser da família do modelo treinado nem da família que gerou os dados.</p></div></div>
+  <div class="la-inrecipe" data-recipe="glm"><div class="la-inrecipe-h"><span class="la-rb glm"></span><span class="k">Pós-treino da família</span><code>General RL do GLM-5</code></div><div class="la-inrecipe-b"><p>O relatório do GLM-5 descreve um sistema de recompensa <b>híbrido</b> para tarefas gerais: regras (precisas, de escopo limitado), ORMs (baixa variância, mas hackeáveis) e juízes generativos (robustos, de alta variância). E acrescenta respostas humanas de alta qualidade como <b>âncoras de estilo</b>, para evitar o “jeito de modelo” prolixo. É a âncora externa da figura, aplicada em produção: quando o sinal vem de modelos, um pedaço fixo de realidade humana impede o estilo de derivar.</p></div></div>
+  <div class="la-callout info"><b class="t">Fontes primárias deste capítulo</b><p>Debate: arXiv 1805.00899 (Irving et al.), 2311.08702 (Michael et al.), 2402.06782 (Khan et al.), 2407.04622 (Kenton et al.), 2506.13609 (prover-estimator debate). Multiagente: 2305.14325 (Du et al.), 2311.17371 (Smit et al.). Self-play como treino: 2401.01335 (SPIN), 2401.10020 (Self-Rewarding), 2407.19594 (Meta-Rewarding), 2405.00675 (SPPO), 2505.03335 (Absolute Zero), 2407.13692 (Kirchner et al.). Riscos: 2404.13076 (autopreferência), 2503.11926 (monitor de CoT), 2210.10760 (sobre-otimização de RMs).</p></div>
+  <p>Self-play e debate trocam rótulos por interação, mas o preço é que a verdade passa a depender de quem apita. Daí a pergunta do próximo capítulo: como <a data-ch="avaliacao-pos-treino">avaliar um modelo pós-treinado</a> sem cair nas mesmas armadilhas, com win rates que tenham intervalo de confiança, juízes com os vieses controlados e benchmarks que o laço de treino nunca viu.</p>
+</section>

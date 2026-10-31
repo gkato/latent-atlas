@@ -1,0 +1,335 @@
+<p class="la-lead">In the DeepSeek recipe, a 131,072-token prompt took <b>78.75 seconds</b> to produce the first token of the answer: the model read the text at about <b>1,665 tokens per second</b>. Right after that, on the same two machines, it wrote the answer at <b>65.2 tokens per second</b>, 25 times slower than it had read. That is not a bug, it is physics. Reading a prompt and writing an answer are two phases with different bottlenecks, <span class="la-term" data-term="prefill">prefill</span> and <span class="la-term" data-term="decode">decode</span>. Between them lives a data structure that decides how much context and how many users fit in memory: the <span class="la-term" data-term="kv-cache">KV cache</span>. In this chapter you will learn to predict, with pencil and paper, why prefill runs into compute and decode into memory bandwidth (the <i>roofline</i> model), how many bytes each context token costs in each model, how long context and concurrency compete for the same pool, and what TTFT, TPOT and the two kinds of “tokens per second” that show up in every benchmark table actually mean.</p>
+
+<section class="la-sec">
+  <h2>Two phases, two rhythms</h2>
+  <p>In the previous chapter (<a data-ch="geracao-amostragem">Generating text</a>) we saw the <span class="la-term" data-term="autoregressivo">autoregressive</span> loop: each new token requires a full forward pass through the layers, and the chosen token becomes the input of the next step. That loop hides an asymmetry. The <b>prompt</b> tokens are known before anything starts, so there is no need to wait for one before processing the next: they go through the model all together, in a single forward pass. That is <b>prefill</b>, the “filling up”. The <b>response</b> tokens do not exist until they are sampled, because token 2 depends on token 1. That is the <b>decode</b> phase: one token per sequence per step.</p>
+  <p>In the language of <a data-ch="tensores-algebra">tensors</a>, the difference lies in the number of rows of the activation matrix that enters each layer. In the prefill of a \(P\)-token prompt, each projection receives \(X \in \mathbb R^{P\times d}\), with \(P\) stacked rows. In decode it receives \(X \in \mathbb R^{B\times d}\), where \(B\) is the number of sequences the engine processes together in that step, often just one. Let us call this number of rows \(M\), which is the name used by the kernels and by the recipes' patches:</p>
+  <div class="la-eq">
+    \[ M_{\text{prefill}} = \min(P,\; C) \qquad\qquad M_{\text{decode}} = B \times (1 + k) \]
+    <ul class="la-eq-legend">
+      <li>\(P\): prompt tokens not yet processed</li>
+      <li>\(C\): size of the prefill chunk per step, the <code>--max-num-batched-tokens</code></li>
+      <li>\(B\): sequences in decode in the same step</li>
+      <li>\(k\): speculative tokens verified per sequence (0 without speculation)</li>
+    </ul>
+  </div>
+  <div class="la-callout analogy"><b class="t">Analogy: reading a book vs. dictating a letter</b><p>A speed reader sweeps their eyes over the whole page at once. Someone dictating a letter only says the next word after settling on the previous one and, for every word, goes back through the whole vocabulary and all the notes on what they have read so far. Prefill is the reading: the entire input text is known and processed as a block. Decode is the dictation, and every word costs a full lookup.</p></div>
+  <p>In the figure below, each character is a token. Follow the steps: the prompt goes through the factory of layers in one go, each layer stores on its shelf what it will need later (the KV cache), and then the answer comes out one token at a time.</p>
+  <figure class="la-fig wide" id="fig-duas-fases" data-title="The two-phase factory">
+    <div class="la-fig-stage" style="height:400px"><canvas></canvas></div>
+    <figcaption>Illustrative miniature: 6 prompt tokens, 5 layers. Each layer has a shelf (below it) where each little square is the K and V of one token. In prefill, the 6 rows pass together (\(M = 6\)); in decode, one at a time (\(M = 1\)). The pulse rising from the memory bank represents reading each layer's weights, and it happens once per step in both phases.</figcaption>
+  </figure>
+  <p>Notice three things. In prefill the factory runs once for six tokens; in decode, once for each token. In both phases, every step fetches the weights of all layers from memory, but in prefill that fetch is shared among many tokens. And each layer's shelf only grows: prefill fills it in one go, and every decode step adds a row and rereads all the previous ones.</p>
+  <p>The interval until the first token appears is the <span class="la-term" data-term="ttft">TTFT</span> (<i>time to first token</i>): queue, prefill and the first sampling. After it, the speed the user perceives is the decode speed. Sections 8 and 9 formalize these metrics. For now the intuition is enough: a long prompt is paid for in TTFT, and a long answer is paid for in decode.</p>
+  <div class="la-callout why"><b class="t">Why this matters</b><p>The recipes optimize the two phases separately, sometimes with opposite choices. In GLM, the “fat” expert kernels (E3) and the BF16 copy of the KDA only kick in during prefill, while dense FP8, the cooperative MoE and speculation target decode. The DeepSeek audit sums up the same contrast: with one user, decode is “~80% weight streaming”, and long prefill is dominated by the indexer. Finding out which phase the time is being spent in is the first question of any optimization.</p></div>
+  <p>A practical detail: a 100-thousand-token prompt does not go in all at once. The engine slices prefill into chunks of up to <span class="la-term" data-term="max-num-batched-tokens"><code>--max-num-batched-tokens</code></span> tokens per step (7,168 in GLM, 8,192 in Qwen and DeepSeek), which is <span class="la-term" data-term="chunked-prefill">chunked prefill</span>, and it can mix those chunks with decode steps from other conversations. The mechanics are left for the <a data-ch="scheduler-batching">Scheduler and batching</a> chapter. What matters here is that the \(M\) of prefill is the chunk size, in the thousands, while the \(M\) of decode stays between 1 and a few dozen.</p>
+</section>
+
+<section class="la-sec">
+  <h2>How many times each weight works: GEMM and GEMV</h2>
+  <p>Almost all the work of an LLM is matrix multiplication: the Q, K and V projections, the attention output, the three matrices of each expert, the <span class="la-term" data-term="lm-head">lm_head</span>. They all have the same shape, and two simple calculations tell how much each one costs in compute and in memory:</p>
+  <div class="la-eq">
+    \[ Y = X\,W,\quad X\in\mathbb R^{M\times K},\; W\in\mathbb R^{K\times N} \qquad \text{FLOPs} = 2\,M K N \qquad \text{Bytes} \approx b_w\,K N + b_a\,M\,(K+N) \]
+    \[ I \;=\; \frac{\text{FLOPs}}{\text{Bytes}} \;\approx\; \frac{2M}{b_w} \quad (\text{when } M \ll K, N) \]
+    <ul class="la-eq-legend">
+      <li>\(M\): rows (tokens) going through the matrix in this step</li>
+      <li>\(K, N\): input and output dimensions of the projection</li>
+      <li>\(b_w\): bytes per weight (2 in BF16, 1 in FP8, 0.5 at 4 bits)</li>
+      <li>\(b_a\): bytes per activation (2 in BF16)</li>
+      <li>2: each multiply-accumulate counts as two <span class="la-term" data-term="flops">FLOPs</span></li>
+      <li>\(I\): <span class="la-term" data-term="intensidade-aritmetica">arithmetic intensity</span>, FLOPs per byte brought from memory</li>
+    </ul>
+  </div>
+  <p>With \(M = 1\), the multiplication is a <span class="la-term" data-term="gemv">GEMV</span> (matrix × vector): each weight leaves memory, takes part in a single multiplication and is discarded. With large \(M\), it is a <span class="la-term" data-term="gemm">GEMM</span> (matrix × matrix): each weight read serves \(M\) rows. Compute grows with \(M\); weight bytes do not.</p>
+  <p>A worked example by hand (illustrative): a 4096 × 4096 projection in BF16 has 16.8 million weights, or 33.5 MB. With \(M = 1\), that is 33.5 million FLOPs over 33.5 MB, 1 FLOP per byte. With \(M = 1{,}024\), a prefill chunk, it is 34.4 billion FLOPs over the same 33.5 MB of weights plus 16.8 MB of activations, about 680 FLOPs per byte. It is the same matrix doing 680 times more work per byte that arrives from memory. Note that the approximation \(2M/b_w\) would give 1,024: with a thousand rows, the activations already weigh in.</p>
+  <p>It is worth remembering the condition behind the approximation. \(2M/b_w\) only works while the activation bytes, \(b_a M (K+N)\), are small compared with the weight bytes, \(b_w K N\), that is, while \(M \ll \frac{b_w}{b_a}\cdot\frac{KN}{K+N}\). With 4-bit weights and BF16 activations, \(b_w/b_a = 1/4\): the condition becomes four times tighter than in BF16. Keep this in mind for the next section, because it is exactly what happens with the experts of an MoE.</p>
+  <p>In the figure, the weight matrix \(W\) sits at the top and the rows of \(X\) (the tokens) on the left. Each column of \(W\) is brought from memory only once and then used by all \(M\) rows. Increase \(M\), change the weight format and watch the counters.</p>
+  <figure class="la-fig" id="fig-gemv-gemm" data-title="One read, M uses">
+    <div class="la-fig-stage" style="height:420px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Multiplication \(Y = XW\) with \(K = 4\) and \(N = 6\) (illustrative integers in the cells, so you can check the arithmetic). The packet traveling from the memory bank is the read of one column of \(W\); the flashes in \(Y\) are the multiplications that reuse it. The faded rows are slots for more tokens. The intensity at the bottom uses the approximation \(2M/b_w\), which only counts weight bytes (here, with \(M \le 8\), it holds). The balance scale (to the side, or below on narrow screens) compares, on the GB10, the time to read the weights with the time to do the math: it only balances at the ridge, at \(I \approx 458\).</figcaption>
+  </figure>
+  <p>With \(M = 1\), the read, the traveling packet, is the dominant event. With \(M = 8\), the same read feeds eight products. On real hardware, the \(M\) of decode stays between 1 and a few dozen (in Qwen, the decode GEMMs have \(K = 2560\), the <code>hidden_size</code>, and \(M\) between 1 and 64), and the \(M\) of prefill reaches the thousands.</p>
+  <div class="la-callout recipe" data-recipe="all"><b class="t"><span class="la-rb all"></span> In the recipes: the kernel changes with M</b><p>Because the regime changes with \(M\), the recipes choose different kernels depending on the number of rows, which is <span class="la-term" data-term="dispatch-por-m">dispatch by M</span>. In the dense EXL3 profile, GLM keeps BF16 copies of the projections for \(M &gt; 144\), and switches the KDA kernel at \(M = 512\). An experimental plugin in the DeepSeek repository (off by default, only for ModelOpt NVFP4 checkpoints) alternates between <span class="la-term" data-term="marlin">Marlin</span> W4A16 for \(M &lt; 128\) and CUTLASS W4A4 for \(M \ge 128\); the served path, with MXFP4 experts, uses b12x W4A16 for every \(M\). Marlin unpacks 4- or 8-bit weights inside the kernel and shines on skinny GEMMs; at large \(M\) it loses to dense GEMMs. The <a data-ch="kernels">Kernels</a> chapter opens up each one.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>The roofline: memory or compute?</h2>
+  <p>A GPU has two limits: the speed at which it does arithmetic, the peak compute \(P_{\text{peak}}\) (FLOPs per second), and the speed at which memory delivers bytes, the <span class="la-term" data-term="banda-de-memoria">bandwidth</span> \(\beta\). A kernel that needs \(F\) FLOPs and moves \(Q\) bytes cannot finish before \(F/P_{\text{peak}}\), nor before \(Q/\beta\):</p>
+  <div class="la-eq">
+    \[ t \;\ge\; \max\!\Big(\frac{F}{P_{\text{peak}}},\; \frac{Q}{\beta}\Big) \quad\Longrightarrow\quad \frac{F}{t} \;\le\; \min\big(P_{\text{peak}},\; I\cdot\beta\big), \qquad I^{*} = \frac{P_{\text{peak}}}{\beta} \]
+    <ul class="la-eq-legend">
+      <li>\(F\): the kernel's FLOPs; \(Q\): bytes read from and written to main memory</li>
+      <li>\(P_{\text{peak}}\): the GPU's peak compute in the format being used</li>
+      <li>\(\beta\): memory bandwidth (bytes per second)</li>
+      <li>\(I = F/Q\): the kernel's arithmetic intensity</li>
+      <li>\(I^{*}\): <span class="la-term" data-term="ridge-point">ridge point</span>, the intensity at which the two limits tie</li>
+    </ul>
+  </div>
+  <p>The plot of \(\min(P_{\text{peak}}, I\beta)\) on a log-log scale is the <span class="la-term" data-term="roofline">roofline</span> (Williams, Waterman and Patterson, 2009): a slanted ramp, the <span class="la-term" data-term="memory-bound">memory-bound</span> region, that meets a flat ceiling, the <span class="la-term" data-term="compute-bound">compute-bound</span> region, at the ridge \(I^*\). Left of the ridge the GPU waits for data; to the right, the data waits for the GPU.</p>
+  <p>On the DGX Spark's GB10, the recipe reports work with ~125 TFLOPS of dense BF16 peak (an estimate, not a microbenchmark) and ~273 GB/s of theoretical LPDDR5X bandwidth, with 230 to 250 GB/s measured in practice. The ridge sits at \(125\times10^{12} / 273\times10^{9} \approx 458\) FLOPs per byte. Compare that with the decode GEMV: \(I \approx 1\) in BF16, \(\approx 4\) with 4-bit weights. That is two orders of magnitude to the left of the ridge, which is why decode is memory-bound by a wide margin.</p>
+  <div class="la-callout analogy"><b class="t">Analogy: the chef and the pantry</b><p>A chef (the tensor cores) cooks very fast, but the ingredients come from a pantry at the end of the hallway (memory), brought by a single cart (the bandwidth). If each ingredient that arrives turns into just one dish (GEMV), the chef spends the day waiting for the cart. If each ingredient serves a thousand dishes (the prefill GEMM), the one waiting is the cart. The ridge is the number of dishes per ingredient at which the two tie.</p></div>
+  <p>In the figure, move \(M\) and change the weight format. Then turn on MoE mode to see what happens when the \(M\) rows are split among 288 experts, as in GLM.</p>
+  <figure class="la-fig" id="fig-roofline" data-title="GB10 roofline">
+    <div class="la-fig-stage" style="height:450px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Roofline with the numbers the recipes use: ~125 TFLOPS BF16 (estimate) and 273 GB/s. The pulsing point is a 4096 × 4096 projection with \(M\) rows or, in MoE mode, one GLM expert at TP=2 (gate_up 4096 × 2048 and down 1024 × 4096). The intensity counts weights <b>and</b> BF16 activations, using the full formula; the box at the top also shows the weights-only approximation. In MoE mode, each expert receives \(r = Mk/D\) rows, with \(D\) = distinct experts lit (\(\approx Mk/E\) when all of them light up; \(E = 288\), \(k = 8\)). The fixed marks are cases from the recipes, computed the same way. The FP4×FP8 peak (~4× BF16) is the DeepSeek report's estimate.</figcaption>
+  </figure>
+  <p>MoE mode brings the surprise of the chapter. A 1,024-token prefill chunk looks big, but with top-8 among 288 experts each expert receives on average only ~28 rows:</p>
+  <div class="la-eq">
+    \[ r \;\approx\; \frac{M\,k}{E} = \frac{1024 \times 8}{288} \approx 28 \qquad\Longrightarrow\qquad I_{\text{expert}} \approx \frac{2r}{b_w} = \frac{2\times 28}{0.5} \approx 112\ \text{FLOP/B} \;<\; 458 \]
+    <ul class="la-eq-legend">
+      <li>\(r\): rows each expert processes in the step</li>
+      <li>\(k\): experts per token (<code>num_experts_per_tok</code>)</li>
+      <li>\(E\): routed experts per layer</li>
+      <li>\(b_w = 0.5\): 4-bit EXL3 weights, in bytes per weight</li>
+    </ul>
+  </div>
+  <p>Even in prefill, the experts stay bandwidth-bound (~100 FLOP/B when the activations are counted too). The prefill study in the GLM repository <b>estimates</b> ~75.6 GB read per GPU per chunk (all 288 experts of the 42 MoE layers), ~330 ms of streaming at ~230 GB/s. The <b>measured</b> chunk took ~1.08 s (Aug 29), three times that limit: the real bottleneck was the kernel. The profiler put 63% of the step in the MoE layer, which still fell back to a Python loop, with a CPU sync, whenever any expert received more than 128 rows.</p>
+  <p>The recipe attacked on both fronts: 7,168-token chunks and new kernels. With ~199 rows per expert, \(2r/b_w\) would give ~800 FLOP/B, almost twice the ridge, but the approximation no longer holds: with 4-bit weights, \(r \approx 200\) is not small compared with \(\tfrac14 \cdot KN/(K+N)\), and the BF16 activations weigh almost as much as the weights. The full calculation, with the local shapes of a GLM expert at TP=2:</p>
+  <div class="la-eq">
+    \[ \text{FLOPs} = 2 \times 199 \times 12.6\,\text{M} \approx 5.0\ \text{GFLOP} \qquad \text{Bytes} \approx \underbrace{6.3\ \text{MB}}_{\text{weights, 4 bits}} + \underbrace{3.7\text{–}4.5\ \text{MB}}_{\text{BF16 activations}} \qquad I \approx 460\text{–}500\ \text{FLOP/B} \;\approx\; I^{*} \]
+    <ul class="la-eq-legend">
+      <li>12.6 M: weights of one expert per rank, \(4096 \times 2048\) (gate_up) \(+\ 1024 \times 4096\) (down)</li>
+      <li>activations: \(b_a\, r\,(K+N)\) summed over the two projections; the lower value applies when the kernel fuses the intermediate and it does not go back to memory in full</li>
+      <li>\(I^{*} \approx 458\): the GB10 ridge in BF16</li>
+    </ul>
+  </div>
+  <p>The MoE <b>reaches</b> the ridge and stops being clearly bandwidth-bound, without crossing it by a wide margin. The measurement confirms it: the E3 kernels for “fat” experts took a 7,168-token MoE layer from 77–91 ms (E2 kernels) to 31 ms, ~46 TFLOPS per rank, while reading the layer's ~3 GB of weights and activations would take ~13 ms (our calculation). The limit became compute and kernel efficiency. Cold prefill went from 947 tok/s (100k, 1,024-token chunks, Aug 29) to 1,428–1,587 tok/s (from 8k to 256k, Sep 7), and there is still headroom: the 947 tok/s were ~34 TFLOPS summed across the two GB10s, about 14% of peak.</p>
+  <p>And the <span class="la-term" data-term="lm-head">lm_head</span>? In GLM it is a 154,880 × 4,096 BF16 matrix that, in decode, receives only the verified positions: \(M = 8\) in a DFlash2 step (7 drafts + 1), \(I \approx 2 \times 8/2 = 8\) FLOP/B, the “lm_head ×8” mark. Big matrix, few rows: that is why it shows up in the byte tank of the next section.</p>
+  <div class="la-callout deep"><b class="t">Deep dive: what the roofline does not see</b><p>The roofline is an upper bound, not a prediction. It ignores kernel launches, CPU syncs, low occupancy and imperfect data reuse in the on-chip cache, and with large \(M\) the activations also enter \(Q\) (that is why \(I\) saturates). With quantized weights there is one more catch: if the kernel dequantizes to BF16 before the multiplication (W4A16), the compute ceiling is the BF16 one. The DeepSeek report estimates that FP4×FP8 tensor cores would have ~4× that peak, and that is why b12x's W4A16 path serves decode well (bandwidth) and prefill poorly (compute). Switch the peak in the figure and watch the ridge move to ~1,830 FLOP/B.</p></div>
+  <div class="la-inrecipe" data-recipe="glm"><div class="la-inrecipe-h"><span class="la-rb glm"></span><span class="k">Parameters</span><code>GLM53_KDA_BF16_LARGE_M=1 · KDA_BF16_LARGE_M_MIN_M = 512</code></div><div class="la-inrecipe-b"><p>The KDA input projection (<code>in_proj_qkvbfg_a</code>) runs as FP8 weight-only through Marlin, which is great with few rows. In prefill, with \(M = 7{,}168\), Marlin takes 27.21 ms; a cuBLAS BF16 GEMM, 7.36 ms. The recipe keeps a BF16 copy of the <b>same logical weight</b> (e4m3 × scale, exact in fp32 and rounded once to BF16) and dispatches by the number of rows: above 512, cuBLAS BF16; up to 512, Marlin. The threshold is fixed (not configurable), so that CUDA graph capture and replay agree, and it falls in the gap between the phases: in the measured steps decode never went beyond \(M = 220\), and prefill always stayed at \(M \ge 768\). Result: cold TTFT −11.4% (16k) and −12.3% (100k), at a cost of +3.29 GiB per rank. The <code>.env.example</code> turns it on (<code>1</code>); without a <code>.env</code>, <code>start.sh</code> defaults to <code>0</code>, and the TP3 launcher also turns it off.</p></div></div>
+</section>
+
+<section class="la-sec">
+  <h2>Decode: reading the whole model at every step</h2>
+  <p>If decode is bandwidth-bound, the time of a step is, to a first approximation, the number of bytes it reads divided by the effective bandwidth:</p>
+  <div class="la-eq">
+    \[ t_{\text{step}} \;\approx\; \frac{Q_{\text{step}}}{\beta_{\text{eff}}} + t_{\text{fixed}} \qquad\qquad \text{tok/s per sequence} \;\approx\; \frac{\tau}{t_{\text{step}}} \]
+    <ul class="la-eq-legend">
+      <li>\(Q_{\text{step}}\): bytes read per GPU in the step (active weights, <code>lm_head</code>, KV and state, drafter)</li>
+      <li>\(\beta_{\text{eff}}\): effective bandwidth (230–250 GB/s on the GB10)</li>
+      <li>\(t_{\text{fixed}}\): launches, network collectives, serial drafter passes, sampling</li>
+      <li>\(\tau\): tokens delivered per step (1 without speculation; accepted + 1 with speculation, because verification always delivers a <span class="la-term" data-term="token-bonus">bonus token</span>)</li>
+    </ul>
+  </div>
+  <p>This is the back-of-the-envelope calculation from the <a data-ch="mapa-da-jornada">Journey map</a>, now with the real contents of \(Q\). In MoE models, “active weights” means the full dense layers plus the <i>distinct</i> experts chosen by the tokens of the step. In this continuous read of weights, <span class="la-term" data-term="streaming-de-pesos">weight streaming</span>, every byte costs time.</p>
+  <p>In the figure, pick a recipe. The tank is what each GPU reads in a decode step with one user, and it drains through the bandwidth pipe. Adjust the bandwidth, the tokens per step and the fixed costs, and compare three numbers: the streaming-only ceiling, the prediction with \(t_{\text{fixed}}\), and the measured value.</p>
+  <figure class="la-fig" id="fig-bytes-passo" data-title="The decode byte tank">
+    <div class="la-fig-stage" style="height:420px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Breakdown of the bytes read per GPU in a decode step with one user. Qwen: review report (≈9.2 GiB, MTP=3 step, full vocabulary), \(\tau \approx 3.2\) (2.2 accepted + 1 bonus), measured 52.1 tok/s with MTP=3 and BF16 KV. DeepSeek: audit report (≈16.5–17 GB per rank), median of 56 tok/s on Sep 2 (range 51 to 67). GLM: didactic estimate from the inventory (≈23 GB, DFlash2 step with 8 positions), measured 65.1 tok/s on structured text (Aug 30). The initial \(t_{\text{fixed}}\) is the report's value for DeepSeek (10–15 ms) and, for Qwen and GLM, what is left of the measured step after streaming (inferred). Changing “tokens per step” only changes the numerator (a simplification: verifying more positions also lights up more experts). The context control adds the KV read of a <b>hypothetical</b> dense GQA-8 BF16 attention.</figcaption>
+  </figure>
+  <p>In Qwen, the review report adds up to ≈9.2 GiB (9.9 GB) per GPU per step, and the <code>lm_head</code> read 4 times (the 4-position MTP verification plus the drafts) already accounts for 26% of that. At 273 GB/s that would be 36 ms; at the real 235–245 GB/s, 40–42 ms, or 24–25 steps per second. And how many tokens does each step deliver? With MTP=3, the measured per-position acceptance was 89%, 74.5% and 60%, or ≈2.2 accepted drafts; with the verification's bonus token, \(\tau \approx 3.2\). The streaming-only ceiling sits at ~75–80 tok/s, but the measured value with MTP=3, one user and greedy sampling was <b>52.1 tok/s</b> (BF16 KV and full vocabulary, the configuration of the byte model). The difference is \(t_{\text{fixed}}\): the README measured steps of ~60 ms with one stream (59.9 ms on prose, 61.2 ms on code, 2.9 to 3.8 tokens per step). Streaming explains about two thirds of the step; the rest is the drafter's three serial passes, ~106 network collectives (2–3 ms) and sampling. The report concluded that single-user decode “is already at the bandwidth roofline”, but it compared the byte model against an old measurement (55.8 tok/s, without MTP and with different weights) and used the 2.2 accepted drafts without the bonus. A lesson in method: before signing off on the math, check which configuration the measured number comes from.</p>
+  <p>In DeepSeek, ≈16.5–17 GB per rank take 68–74 ms at 230–250 GB/s, in a step that also pays ~10–15 ms of fixed costs (≈108 collectives, 3–5 ms, plus launches and the drafter's serial loop): by the audit's count, ~80% of the step is weight streaming. With \(\tau \approx 4.15\) (3.15 accepted + 1 bonus: the sum of the per-position acceptance measured in the audit), streaming alone would limit decode to 56–61 tok/s. The audit attributed the published 62–83 tok/s to an effective bandwidth “a bit better than assumed”, but those numbers come from prompts with higher acceptance: on code, 73.3% acceptance gives \(1 + 6 \times 0.733 \approx 5.4\) tokens per step (interpretation, detailed in <a data-ch="benchmarking">Measuring performance</a>). The Sep 2 median was 56 tok/s (51 to 67).</p>
+  <p>This equation explains, in one stroke, the four big decode levers that keep coming back throughout the platform:</p>
+  <ol class="la-steps">
+    <li><b>Fewer bits per weight</b> (<a data-ch="quantizacao-fundamentos">quantization</a>). \(Q\) drops almost linearly with the bits. All three recipes store the experts at ~4 bits.</li>
+    <li><b>Fewer active weights</b> (<a data-ch="mixture-of-experts">MoE</a>). Only the chosen experts enter \(Q\): 8 of 288 per token in GLM, 10 of 512 in Qwen, 6 of 256 in DeepSeek, in each case plus 1 always-active shared expert.</li>
+    <li><b>More tokens per read</b> (<a data-ch="especulacao-fundamentos">speculation</a>). \(\tau\) goes up without \(Q\) going up in the same proportion: in Qwen, MTP=3 took decode from 24.5 to 52.1 tok/s (2.13×). Verifying too many positions also has a cost, because each position lights up experts: GLM's <span class="la-term" data-term="adaptive-k">adaptive-k</span> verifies only 2, 4 or 7 of the 7 drafts, depending on recent acceptance, and delivered +13–21% on prose.</li>
+    <li><b>Fewer bytes outside the experts.</b> GLM converts the KDA and the dense projections to FP8 weight-only (~2.6 GB and ~11 ms less per step); Qwen shrinks the drafter's vocabulary to lighten the <code>lm_head</code>.</li>
+  </ol>
+  <p>And then there is \(t_{\text{fixed}}\), which the figure lets you play with. Qwen does ~106 network collectives per step (2–3 ms), DeepSeek ≈108 (3–5 ms). They are small and latency-bound, and they do not shrink when the bytes drop, a topic for the <a data-ch="nccl-rdma">Communication</a> chapter. Part of what remains is kernel efficiency, and there the lever is different: GLM's <i>thin-decode</i> (<code>GLM53_EXL3_MOE_FAST=1</code>, K4/N256 MoE kernels that eliminate register spills) improved single-stream decode by +7.7% to +14.6% without changing a single byte read.</p>
+  <div class="la-callout warn"><b class="t">Pitfall: long context with dense attention</b><p>In dense attention, every step rereads the sequence's entire KV, and \(Q\) grows with the context. With a typical 43-layer GQA-8 BF16 (176 KB per token), a 128-thousand-token conversation would mean ~23 GB of KV reread at every step, ~11.5 GB per GPU with TP=2, the equivalent of 70% of everything DeepSeek reads per rank (illustrative calculation; use the figure's context control). All three recipes escape this through architecture: <a data-ch="atencao-esparsa">sparse attention</a> or <a data-ch="atencao-linear">hybrid</a> attention reads only a fraction of the context. In Qwen, going from 1 thousand to 600 thousand tokens of context costs only 2–8% of decode.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>KV cache: not recomputing the past</h2>
+  <p>Recall <a data-ch="atencao">attention</a> as seen from token \(t\), in one layer and one head:</p>
+  <div class="la-eq">
+    \[ q_t = W_Q\,h_t,\quad k_j = W_K\,h_j,\quad v_j = W_V\,h_j \qquad s_{tj} = \frac{q_t\cdot k_j}{\sqrt{d_h}} \qquad \alpha_{t\cdot} = \operatorname{softmax}(s_{t\cdot}) \qquad o_t = \sum_{j\le t} \alpha_{tj}\, v_j \]
+    <ul class="la-eq-legend">
+      <li>\(h_j\): state of token \(j\) at the layer's input</li>
+      <li>\(q_t\): the current token's query; \(k_j, v_j\): key and value of token \(j\)</li>
+      <li>\(d_h\): head dimension</li>
+      <li>\(s_{tj}\): affinity score; \(\alpha_{tj}\): weight after the softmax</li>
+      <li>\(o_t\): the head's output for token \(t\)</li>
+    </ul>
+  </div>
+  <p>Look at what token \(t\) needs: its own query and the keys and values of all tokens \(j \le t\). Because of the <span class="la-term" data-term="mascara-causal">causal mask</span>, no token sees the future, so \(h_j\) depends only on tokens \(1,\dots,j\). It is the same at step \(t\) and at step \(t + 1000\), and therefore so are \(k_j\) and \(v_j\). Recomputing them at every step would be wasted work. The engine computes them once, stores them and from then on only reads them. That archive, per layer and per head, is the KV cache.</p>
+  <p>Hence the name <i>prefill</i>: the first phase fills the cache with the K and V of every prompt token in one go. Each decode step computes \(q\), \(k\) and \(v\) for a single new token, files away \(k\) and \(v\) and reads all the previous rows. In the figure, a toy example with a 4-dimensional head and 4 tokens already in the cache. Follow the steps with the numbers in the cells; then turn on “no KV cache” and compare how many projections each step would have to redo.</p>
+  <figure class="la-fig wide" id="fig-kv-mecanismo" data-title="A decode step, with and without the cache">
+    <div class="la-fig-stage" style="height:450px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Illustrative head with \(d_h = 4\) and synthetic values. Grayed-out rows in the cache were computed in previous steps; the bright row belongs to the new token. With the cache turned off, the projections of every row are repeated at every step (counter at the bottom), even though the result is identical. And the figure shows only one layer: since each row's \(h_j\) comes from the layers below, without a cache those would have to be redone too.</figcaption>
+  </figure>
+  <p>With the cache, each step does one new K and V projection per layer and per head and reads \(t\) rows. Without it, the cost is much higher than redoing \(t\) K and V projections. The \(h_j\) that enters a layer is the output of the layers below, so to get \(k_j\) and \(v_j\) again you have to redo the full forward pass of the \(t\) tokens through every layer, with MLP, experts and attention: an entire prefill per generated token. Counting in token-forwards (one token going through the whole model):</p>
+  <div class="la-eq">
+    \[ \underbrace{\sum_{t=1}^{n} t \;=\; \frac{n(n+1)}{2}}_{\text{token-forwards without cache}} \qquad\text{versus}\qquad \underbrace{n}_{\text{with cache}} \]
+    <ul class="la-eq-legend">
+      <li>\(n\): tokens processed in the sequence (prompt + response)</li>
+      <li>with \(n = 100{,}000\): 100 thousand token-forwards versus 5 billion</li>
+    </ul>
+  </div>
+  <p>The cache trades compute for memory. It is what makes decode viable and, at the same time, the largest consumer of dynamic memory at long context. And since each step rereads the stored rows, it also weighs on bandwidth whenever the attention is dense.</p>
+  <div class="la-callout deep"><b class="t">Deep dive: what exactly gets stored</b><p>K and V are stored after the projection, per layer, per KV head and per token. In models with <a data-ch="posicao-rope">RoPE</a>, the key is stored with the rotation already applied. The query is not stored, because it only serves its own token, and neither is the state \(h\). In linear attention layers, instead of one row per token you store a <span class="la-term" data-term="estado-fixo">fixed-size state</span> (<a data-ch="atencao-linear">Linear attention</a>); in <span class="la-term" data-term="mla">MLA</span>, a compressed latent vector from which K and V are reconstructed (<a data-ch="mla">Shrinking the KV</a>). Both ideas go after the size of the cache, which is the subject of the next section.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>How much a context token weighs</h2>
+  <p>In classic attention, each layer stores, per token, one key and one value for each KV head. The byte count per context token is a product of four factors, and that of a whole sequence adds a fixed cost:</p>
+  <div class="la-eq">
+    \[ b_{\text{tok}} \;=\; L_{kv} \times n_{kv} \times (d_k + d_v) \times b \qquad\qquad \text{KV}_{\text{seq}}(c) \;=\; c\cdot b_{\text{tok}} + S_{\text{fixed}} \]
+    <ul class="la-eq-legend">
+      <li>\(b_{\text{tok}}\): <span class="la-term" data-term="bytes-por-token">bytes per token</span> of context (same family as \(b_w\) and \(b_a\): bytes per something)</li>
+      <li>\(L_{kv}\): layers that store KV per token</li>
+      <li>\(n_{kv}\): K/V heads per layer (<code>num_key_value_heads</code>)</li>
+      <li>\(d_k, d_v\): key and value dimensions (with \(d_k = d_v = d_h\), the factor becomes \(2\,d_h\))</li>
+      <li>\(b\): bytes per number (2 in BF16, 1 in FP8)</li>
+      <li>\(c\): tokens in the sequence's context</li>
+      <li>\(S_{\text{fixed}}\): state that does not grow with \(c\) (linear layers, sliding windows)</li>
+    </ul>
+  </div>
+  <p>The factor \(n_{kv}\) deserves a full introduction, because it is where architecture tinkers the most. In classic multi-head attention, <span class="la-term" data-term="mha">MHA</span>, each query head has its own K/V pair, and \(n_{kv}\) equals the number of heads. In <span class="la-term" data-term="gqa">GQA</span> (<i>grouped-query attention</i>), groups of query heads share the same pair: each head still asks its own question \(q\), but all the heads in the group consult the same keys and values. In <span class="la-term" data-term="mqa">MQA</span> (<i>multi-query attention</i>), a single pair serves all heads. Since queries do not go into the cache, only \(n_{kv}\) enters the calculation: GQA and MQA shrink the KV without reducing the heads that ask, at the price of heads that share K/V seeing the past through the same lens (the <a data-ch="mla">MLA</a> chapter shows how to get around this).</p>
+  <p><b>Qwen3.8-Flash-Next.</b> Only 13 layers store KV per token: the 12 QSA attention layers (1 in every 4 of the 48) and the MTP layer. Each one has \(n_{kv} = 2\) KV heads shared by the 24 query heads (a GQA with 12 queries per K/V pair) and <code>head_dim</code> = 256. In BF16: \(13 \times 2 \times (256 + 256) \times 2 = 26{,}624\) bytes per token; in FP8, 13,312. With TP=2, each GPU keeps one of the two heads, and the cost per GPU is halved (6,656 B in FP8). The measured pool gives 9,418 B per token per GPU in FP8, 41% above the pure calculation: the excess comes from the indexer and the compressor in BF16, the state of the GDN layers and the PLE, and page rounding.</p>
+  <p><b>A hypothetical GLM with MHA.</b> If the 45 layers of GLM-5.3-Flash were classic multi-head attention in BF16 (64 heads, K and V of 256), that would be \(45 \times 64 \times 512 \times 2 = 2{,}949{,}120\) bytes, ~2.95 MB per token and ~2.95 TB for a million tokens. No recipe would survive.</p>
+  <p><b>GLM as served</b> stores KV in only 11 of its 45 layers, and in a compressed format (MLA): 656 bytes per layer in the <code>fp8_ds_mla</code> record plus 33 for the indexer cache, or \(11 \times (656 + 33) = 7{,}579\) bytes per token per rank, 7.06 GiB per million tokens. The 34 KDA layers store a fixed state (\(32\) heads × \(128 \times 128\) in FP32 per rank, plus the convolution state), ~76 MiB per request per rank. <b>DeepSeek-V4-Flash</b> compresses the KV itself (1 entry every 4 or every 128 tokens, depending on the layer) and gets to ≈3,850 bytes per token, plus ≈3.44 MB fixed per sequence for the sliding windows. The <a data-ch="mla">MLA</a>, <a data-ch="atencao-esparsa">Sparse attention</a> and <a data-ch="kv-cache-quantizado">Quantized KV</a> chapters take each of these numbers apart.</p>
+  <p>In the figure, a sequence's KV cache appears as a 3D tensor: each slab is a layer, each row a token, each column a slice of the heads. Below, a strip shows who queries what: each model's query heads pointing at the K/V they share. Change the model and the number of tokens, and turn on the TP split.</p>
+  <figure class="la-fig" id="fig-kv-tensor" data-title="The KV cache as a tensor">
+    <div class="la-fig-stage pad" style="min-height:340px"></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Illustrative tensor with 4 layers × 12 positions × 8 columns. In “MHA”, all layers grow. In Qwen and GLM the hybrids' 3:1 pattern applies: only 1 layer in every 4 stores rows per token (the front slab); the others store a block of state (striped) that does not grow. In the bottom strip, each dot is a query head and each box a stored K/V pair: in MHA, one box per head; in Qwen's GQA, 24 queries for 2 boxes; in GLM's MLA, all heads read a single latent. With TP=2, the heads of a GQA are split between the GPUs, but the MLA latent (a single head) is <b>replicated</b>: the two-tone cells are copies on both GPUs. The bytes on the readouts are each model's real values.</figcaption>
+  </figure>
+  <p>The effect of TP is the detail that most often trips up someone building a recipe for the first time. In a GQA with \(n_{kv}\) divisible by the TP degree, each GPU stores only its own heads, and the KV per GPU drops in the same proportion. In MLA and MQA there is a single KV “head”, which cannot be sliced: each rank stores the whole latent. That is why the per-GPU KV of GLM and DeepSeek does <b>not</b> shrink with TP=2. The two ranks store identical copies, and the TP gain comes from somewhere else: fewer weights per GPU leave more memory free for the pool.</p>
+  <div class="la-table-wrap"><table>
+    <thead><tr><th>Configuration</th><th>What grows per token</th><th>Bytes per token</th><th>10⁶ tokens</th><th>Fixed cost per sequence</th></tr></thead>
+    <tbody>
+      <tr><td>MHA BF16 (hypothetical GLM)</td><td>45 layers × 64 heads × (256 + 256)</td><td>2,949,120</td><td>~2.95 TB</td><td>—</td></tr>
+      <tr><td>Typical GQA-8 BF16 (43 layers)</td><td>43 × 8 × (128 + 128)</td><td>176,128</td><td>~176 GB</td><td>—</td></tr>
+      <tr><td><span class="la-rb qwen"></span> Qwen, BF16 KV</td><td>13 × 2 × (256 + 256)</td><td>26,624 (13,312/GPU)</td><td>~26.6 GB</td><td>GDN state: 54 MiB/GPU in fp32 (27 in bf16)</td></tr>
+      <tr><td><span class="la-rb qwen"></span> Qwen, FP8 KV</td><td>same, 1 byte</td><td>13,312 (6,656/GPU)</td><td>~13.3 GB</td><td>same</td></tr>
+      <tr><td><span class="la-rb glm"></span> GLM as served</td><td>11 × (656 MLA + 33 indexer)</td><td>7,579 per rank (replicated)</td><td>7.58 GB (7.06 GiB)/rank</td><td>KDA: ~76 MiB/rank</td></tr>
+      <tr><td><span class="la-rb ds"></span> DeepSeek as served</td><td>21 C4A + 20 C128A + indexer</td><td>≈3,850 per rank (replicated)</td><td>≈3.85 GB/rank</td><td>SWA windows: ≈3.44 MB</td></tr>
+      <tr><td>MiMo-V2.6-Flash (tutorial)</td><td>9 global layers × 2 heads/rank × (192 + 128)</td><td>5,760/rank in FP8</td><td>~5.76 GB/rank</td><td>SWA windows: ≈10–13 MB/rank</td></tr>
+    </tbody>
+  </table></div>
+  <div class="la-inrecipe" data-recipe="qwen"><div class="la-inrecipe-h"><span class="la-rb qwen"></span><span class="k">Parameter</span><code>KV_BYTES_PER_TOKEN=29482</code></div><div class="la-inrecipe-b"><p>The single-Spark launcher (<code>tp1/start.sh</code>) computes the memory budget before bringing up vLLM. With TP=1, both KV heads live on the same GPU, and the theoretical BF16 calculation (26,624 B) plus indexer, state and rounding gives the 29,482 B per token <b>measured</b> (28.8 KiB) that the script uses: <code>kv_need = MAX_MODEL_LEN × KV_BYTES_PER_TOKEN × KV_MULT / 2³⁰</code>, with <code>KV_MULT = 0.5</code> for FP8 KV. With the default <code>MAX_MODEL_LEN=65536</code> in BF16: \(65{,}536 \times 29{,}482 / 2^{30} \approx 1.80\) GiB per full conversation. The budget uses the larger of that value and <code>KV_TARGET_GIB</code> (8 GiB by default; 20 GiB in the example, “~686 thousand tokens”, and the boot logged 685,825). Using the measured number, not the theoretical one, is what keeps the launcher from promising a context that does not fit.</p></div></div>
+  <div class="la-callout why"><b class="t">Why this matters</b><p>The formula has five levers, and each recipe pulled a different combination. \(L_{kv}\) shrinks in hybrid models (Qwen and GLM store KV in 1 out of every 4 layers). \(n_{kv}\) and \(d\) shrink with GQA, MQA and MLA. \(b\) shrinks with quantized KV. And reading only part of the context (sparse attention) cuts bandwidth without changing capacity. Faced with a new <code>config.json</code>, this calculation, done before downloading the weights, tells you whether the context you want will fit.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Long context vs. concurrency: the same memory</h2>
+  <p>The memory vLLM can use on each node is divided into slices: the weights; the activation peak (measured in a <span class="la-term" data-term="profile-run">profile run</span> with the largest batch); the CUDA graph buffers and the allocations outside PyTorch; and whatever is left, the <span class="la-term" data-term="pool-de-kv">KV pool</span>. On the GB10 this budget also competes for space with the operating system, because the memory is <a data-ch="memoria-unificada">unified</a>. Qwen's boot with <code>--gpu-memory-utilization 0.835</code> shows the real slices of one GPU:</p>
+  <dl class="la-kv">
+    <dt>121.69 GiB</dt><dd>total memory visible to CUDA on the GB10</dd>
+    <dt>101.61 GiB</dt><dd>vLLM budget (0.835 × total); the rest is left to the host</dd>
+    <dt>64.46 GiB</dt><dd>weights (68.52 GiB counting the allocations outside PyTorch)</dd>
+    <dt>1.07 GiB</dt><dd>activation peak; 0.54 GiB of CUDA graphs</dd>
+    <dt>32.02 GiB</dt><dd>KV pool: 3,652,200 tokens in FP8</dd>
+  </dl>
+  <p>There is a single pool for all conversations. The rule that governs what fits is an inequality:</p>
+  <div class="la-eq">
+    \[ N_{\text{tok}} = \frac{\text{Pool}}{b_{\text{tok}}} \qquad\qquad \sum_{i=1}^{n_{\text{seq}}} c_i \;\le\; N_{\text{tok}} \qquad\qquad \text{max concurrency}(L) = \frac{N_{\text{tok}}}{L} \]
+    <ul class="la-eq-legend">
+      <li>\(N_{\text{tok}}\): tokens the pool can hold, summed over all conversations</li>
+      <li>\(c_i\): live tokens of conversation \(i\) (prompt + generated)</li>
+      <li>\(n_{\text{seq}}\): active conversations in the engine</li>
+      <li>\(L\): length per conversation used in the boot calculation (the <code>max_model_len</code>)</li>
+    </ul>
+  </div>
+  <p>In Qwen, 3,652,200 tokens at 262,144 per conversation give 13.93 full conversations at the same time. With BF16 KV, the same boot had 2,131,159 tokens, only 8.13 conversations: switching the KV dtype bought +71% capacity (not 2×, because the indexer, the compressor and the GDN state stay in BF16). The capacity was not free: −5.3% average throughput (−1.4% on prose, −9.2% on code), because with FP8 keys the QSA indexer picks different blocks and the tokens per step drop; and an upstream warning reports a long-reasoning benchmark falling from 6/6 to 2/6 in the reference implementation. Capacity versus speed and fidelity. In DeepSeek, 17.04 GiB become 2,331,430 tokens and “2.22×” at 1M, by the allocator's accounting, which counts ≈7.8 KB per token (the physical cost is ≈3.85 KB, because the four KV groups share pages of the same size). In GLM, the weights total 163.6 GiB (79.65 GiB loaded per rank, 82.94 with the KDA's BF16 copy), and the KV is pinned at 11 GiB per GPU (<code>--kv-cache-memory-bytes 11811160064</code>), which gives 1,233,779 tokens and 1.45× at 850 thousand.</p>
+  <p>Two flags show up here and are often misread. <span class="la-term" data-term="max-model-len"><code>--max-model-len</code></span> (GLM 850,000; Qwen 262,144; DeepSeek 1,048,576) and <span class="la-term" data-term="max-num-seqs"><code>--max-num-seqs</code></span> (GLM 4; Qwen 8; DeepSeek 6) are <b>ceilings, not reservations</b>. The first limits the length of one conversation; the second, how many the scheduler admits in a step. Neither sets aside any memory. The real limit is the sum of live tokens against the pool. In the figure, with Qwen's measured numbers, try to fit long conversations and many conversations at the same time.</p>
+  <figure class="la-fig" id="fig-pool" data-title="There is only one KV pool">
+    <div class="la-fig-stage" style="height:362px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>At the top, the measured budget of one Qwen GPU (TP2, GMU 0.835). Below, the KV pool with the conversations (colors) taking up space proportional to their tokens. Anything beyond <code>max_num_seqs = 8</code> waits in the queue; anything that does not fit in the pool is also left out (or causes preemption). Simplifications: every conversation has the same length, and the per-token cost used (9,418 B per GPU in FP8) already spreads each conversation's fixed state (GDN, ~54 MiB per GPU) over the boot's 262-thousand-token context. At shorter contexts that state weighs more per token, so fewer conversations fit than the division suggests.</figcaption>
+  </figure>
+  <p>Context and concurrency compete for the same resource. A single 1-million-token conversation in DeepSeek takes up almost half the pool by the allocator's accounting; in Qwen, eight 262-thousand-token conversations use 57% of the FP8 pool, but would not fit in the BF16 version (98%, with no room to grow). That is why whoever designs the architecture compresses the KV, and whoever builds the recipe chooses the KV dtype and the memory slice reserved for it before any other fine-tuning.</p>
+  <div class="la-callout warn"><b class="t">Pitfall: “GPU KV cache size” in hybrid models</b><p>In models with different KV groups (attention, linear state, windows, drafter), the number printed at boot as <code>GPU KV cache size: N tokens</code> is computed as max concurrency × <code>max_model_len</code>, and it is neither the size of the prefix cache nor the physical sum of rows. The GLM recipe gained an overlay just to print the per-group breakdown. The <a data-ch="paged-attention-kv">PagedAttention</a> chapter shows how the pool is measured, paged and divided.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Measuring the two phases: TTFT, TPOT and tokens per second</h2>
+  <p>The tables of all three recipes always use the same metrics. Let \(t_0\) be the moment the request is sent, \(t_1\) the arrival of the first token, \(t_N\) that of the last one, \(P\) the prompt tokens and \(N\) the generated ones:</p>
+  <div class="la-eq">
+    \[ \text{TTFT} = t_1 - t_0 \qquad \text{prefill tok/s} = \frac{P}{\text{TTFT}} \qquad \text{TPOT} = \frac{t_N - t_1}{N - 1} \qquad \text{tok/s per stream} = \frac{1}{\text{TPOT}} \]
+    \[ \text{aggregate tok/s} = \frac{\sum_i N_i}{\text{burst duration}} \qquad\qquad \text{E2EL} = t_N - t_0 = \text{TTFT} + (N-1)\,\text{TPOT} \]
+    <ul class="la-eq-legend">
+      <li><span class="la-term" data-term="ttft">TTFT</span>: queue + prefill + first sampling</li>
+      <li><span class="la-term" data-term="prefill-tok-s">prefill tok/s</span>: only valid with an idle server and a cold prefix cache</li>
+      <li><span class="la-term" data-term="tpot">TPOT</span>: average time per output token, excluding the first</li>
+      <li><span class="la-term" data-term="itl">ITL</span>: interval between two stream events (with speculation, one event carries several tokens)</li>
+      <li><span class="la-term" data-term="tok-s-por-stream">tok/s per stream</span>: one user's experience</li>
+      <li><span class="la-term" data-term="tok-s-agregado">aggregate tok/s</span>: the machine's capacity</li>
+      <li><span class="la-term" data-term="e2el">E2EL</span>: end-to-end latency</li>
+    </ul>
+  </div>
+  <p>In the figure, pick a measured scenario and the response length. The timeline shows where each phase spends the clock, and the cursor moves in compressed time.</p>
+  <figure class="la-fig" id="fig-relogio" data-title="The clock of a request">
+    <div class="la-fig-stage" style="height:370px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>TTFT and decode rate measured in the recipes (one user at a time): DeepSeek, 0731 sweep of Aug 1, with five prompt sizes (compare the prefill tok/s at 2,048 with that at 8,192 and at 32,768); GLM, sparkDash of Aug 28 (structured); Qwen, day-0 lane (prose). The decode duration is extrapolated to \(N\) tokens using the measured rate. Amber = TTFT, mint = decode. “Wall-clock tok/s” (\(N\)/E2EL) mixes the two phases.</figcaption>
+  </figure>
+  <p>DeepSeek's 0731 sweep sums up the chapter in three lines. Prefill tok/s is not a constant of the model: it rises from 447 (256 tokens) to 2,563 (2,048 tokens) as the fixed per-request costs (tokenizing, building the template, the ramp-up of the first chunk) get diluted, and then drops to 1,713 (8,192) and 1,428 (32,768), as attention and the indexer, which grow with the context, start to weigh on each chunk (and it sits at 1,665 at 131,072). The same initial rise shows up in GLM: 772 tok/s at 8k and 947 at 100k on Aug 29. Decode barely changes with context (75.4 tok/s with 256 tokens, 65.2 with 131,072), because sparse attention reads little of the cache. And the 78.75 s TTFT of a 131k prompt dominates the experience of any short answer: with 512 output tokens, more than 90% of the clock is prefill. With speculation, decode also depends on the <i>content</i>. On the same day and with the same configuration (lab bench, Aug 30), GLM delivered 65.1 tok/s on structured text, with an acceptance of 0.959 (6.71 of the 7 drafts accepted per step), and 27.1 tok/s on prose, with 0.341 (2.39 accepted per step). The weights read are the same; what changes is how many drafts hit, and that depends on how predictable the text is.</p>
+  <div class="la-callout warn"><b class="t">Measurement pitfalls</b><p>With reasoning on, the first <i>content</i> token only comes out after the entire <code>&lt;think&gt;</code>, and “TTFT” ends up measuring the thinking, which is why the recipes' benchmarks turn thinking off. With speculation, each stream event carries several tokens: counting events underestimates the output (DeepSeek's evaluation methodology, in <code>scripts/EVAL.md</code>, measured ~4.5×), so use <code>usage.completion_tokens</code>. And a repeated prompt hits the prefix cache and “speeds up” prefill without anything having changed. The full methodology is in <a data-ch="benchmarking">Measuring performance</a>.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Batching in decode: the weights give everyone a ride</h2>
+  <p>If a decode step spends almost all its time reading weights, and the weights are the same for every conversation, processing \(B\) conversations in the same step splits that bill. That is decode <span class="la-term" data-term="amortizacao-de-pesos">batching</span>, and with it \(M\) becomes \(B\). A two-term cost model is enough to predict the shape of the curves:</p>
+  <div class="la-eq">
+    \[ t_{\text{step}}(B) \approx T_0 + B\,T_1 \qquad s(B) = \frac{\tau}{T_0 + B\,T_1} \qquad A(B) = B\cdot s(B) \;\xrightarrow{\;B\to\infty\;}\; \frac{\tau}{T_1} \]
+    <ul class="la-eq-legend">
+      <li>\(T_0\): the part of the step shared by everyone (dense weights, <code>lm_head</code>, launches)</li>
+      <li>\(T_1\): marginal cost per sequence (its own KV and state, extra experts, sampling; with speculation, also each sequence's drafts and verification, which compete for the step, a part the recipes did not measure per concurrency level)</li>
+      <li>\(s(B)\): tok/s per stream</li>
+      <li>\(A(B)\): aggregate tok/s</li>
+      <li>\(\tau\): tokens per step per sequence</li>
+    </ul>
+  </div>
+  <p>While \(B\,T_1 \ll T_0\), the aggregate grows almost linearly and each user loses little. When \(B\,T_1\) approaches \(T_0\), the step gets slower for everyone and the aggregate flattens out. In Qwen (day-0 lane, prose), the aggregate went from 54.4 tok/s with 1 stream to 86.5, 128.1, 169.7 and 207.0 with 2, 4, 6 and 8: 3.8× more capacity, while each stream dropped from 54.4 to 26.7 tok/s (49%). The README warns that speculation usually contributes to this per-stream drop, but that acceptance was not measured per concurrency level, so the split remains unattributed. In GLM (structured, Aug 28): 62.9 tok/s with 1 stream; 51.7 per stream and 103.3 aggregate with 2; 37.1 and 146.5 with 4. In DeepSeek (0731, 256-token prompt): 75.4 tok/s of decode with 1 stream, 36.9 per stream and 191.2 aggregate with 6.</p>
+  <p>In an MoE, the ride is less generous than in a dense model. Each token picks its own \(k\) experts, and more tokens in the step light up more <i>distinct</i> experts, which also have to be read. If routing were uniform and independent (an approximation; in practice tokens are correlated), the expected number of <span class="la-term" data-term="experts-distintos">distinct experts</span> per layer would be:</p>
+  <div class="la-eq">
+    \[ \mathbb E[D] = E\left(1 - \Big(1 - \frac{k}{E}\Big)^{T}\right) \]
+    <ul class="la-eq-legend">
+      <li>\(E\): routed experts (512 in Qwen, 288 in GLM, 256 in DeepSeek)</li>
+      <li>\(k\): experts per token (10, 8 and 6)</li>
+      <li>\(T\): tokens in the step, \(B \times (1 + k_{\text{spec}})\)</li>
+      <li>\(D\): distinct experts read in the layer</li>
+    </ul>
+  </div>
+  <p>The reports confirm the order of magnitude: ~32 unique experts per layer in a single-user MTP=3 step in Qwen; at most 42 of 256 in DeepSeek; ~57 of 288 expected in an 8-position DFlash2 step in GLM (inventory calculation). In the figure, each little square is one of the 512 experts of a Qwen layer. Increase \(B\) and watch the grid light up, then compare the cost model with the measurements.</p>
+  <figure class="la-fig wide" id="fig-carona" data-title="The weights give everyone a ride">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>On the left (or on top), the experts of one Qwen layer lit by the admitted streams × 4 positions (MTP=3), with an illustrative uniform draw; above 8 streams, the extra ones wait in the queue (faded) and light nothing up. On the right, the model \(t(B) = t(1)\,[1 + \varphi(B-1)]\), where \(\varphi\) is the fraction of the step that scales per sequence, against Qwen's real measurements (day-0 lane, prose, <code>max_num_seqs = 8</code>). Above 8 the slots are full and the curves go flat; the dashed line is what the model would give with no slot ceiling (hypothetical). The model is illustrative and has 2 parameters.</figcaption>
+  </figure>
+  <p>With \(\varphi \approx 0.15\text{–}0.2\), the model tracks the measurements: each extra stream makes the step ~15–20% more expensive, and the aggregate keeps climbing up to the slot ceiling. Past <code>max_num_seqs</code>, the engine does not process more sequences per step, and the excess waits in the queue. In Qwen's v0.30 lane, with 16 streams against 8 slots, the average TTFT jumped to 6.5–9.7 s, versus 0.1–0.4 s, and the aggregate on prose fell from 216.4 (×8) to 194.9 tok/s (×16) instead of rising. The same logic explains why bytes-per-step optimizations pay off more with few users. In Qwen, the drafter's reduced vocabulary gave +15.3% on code with 1 stream and only +4.0% with 8: with a larger batch, the step is less dominated by reading the <code>lm_head</code>.</p>
+  <div class="la-callout tip"><b class="t">Rule of thumb</b><p>Optimize bytes per step (quantization, dense FP8, drafter vocabulary) for <b>per-user latency</b>; optimize slots and KV memory (<code>max_num_seqs</code>, KV dtype, the pool's memory slice) for <b>aggregate capacity</b>. The <a data-ch="scheduler-batching">scheduler</a> decides, at every step, how to split the budget between the two.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>In the recipes: each phase, its own optimization</h2>
+  <p>Putting the pieces together: every recipe modification that involves performance acts on one of three lines, the prefill line (large \(M\), compute), the decode line (small \(M\), bandwidth) or the KV memory line (capacity). The map below places each optimization from the three recipes on its line. Click a station to read the numbers.</p>
+  <figure class="la-fig wide" id="fig-metro" data-title="Subway map of the optimizations">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Three lines, three bottlenecks. The dot's color indicates the recipe (GLM, Qwen, DeepSeek; amber = all three). The transfer station is dispatch by \(M\), which connects the prefill and decode lines through the number of rows in the step. Click a station or let the automatic tour run.</figcaption>
+  </figure>
+  <div class="la-table-wrap"><table class="la-params">
+    <thead><tr><th>Parameter</th><th>Value</th><th>Recipe</th><th>What it does</th><th>Why it matters</th></tr></thead>
+    <tbody>
+      <tr><td><code>--max-num-batched-tokens</code></td><td>7168 · 8192 · 8192</td><td><span class="la-rb glm"></span> <span class="la-rb qwen"></span> <span class="la-rb ds"></span></td><td>Tokens per step, the prefill <i>M</i></td><td>GLM: 7,168 puts ~199 rows per expert, I ≈ 460–500 FLOP/B counting activations (at the ridge; 2r/b<sub>w</sub> would give ~800); 8,192 overflows the indexer's shared memory</td></tr>
+      <tr><td><code>--max-num-seqs</code></td><td>4 · 8 · 6</td><td><span class="la-rb glm"></span> <span class="la-rb qwen"></span> <span class="la-rb ds"></span></td><td>Decode slots, the <i>B</i></td><td>More slots = more aggregate and fewer tok/s per stream; the excess goes to the queue</td></tr>
+      <tr><td><code>--max-model-len</code></td><td>850000 · 262144 · 1048576</td><td><span class="la-rb glm"></span> <span class="la-rb qwen"></span> <span class="la-rb ds"></span></td><td>Context ceiling per request</td><td>A ceiling, not a reservation: the real limit is the sum of live tokens against the pool</td></tr>
+      <tr><td><code>--kv-cache-dtype</code></td><td><code>fp8</code> (→ <code>fp8_ds_mla</code>) · <code>fp8</code> · <code>nvfp4_ds_mla</code></td><td><span class="la-rb glm"></span> <span class="la-rb qwen"></span> <span class="la-rb ds"></span></td><td>KV format (<i>b</i> in the formula)</td><td>Qwen: +71% tokens in the pool at a cost of −5.3% average throughput (the QSA indexer picks different blocks with FP8 keys), capacity versus speed. GLM: 656 B per token per MLA layer; DS: 584 B per compressed entry (1 every 4 or 128 tokens)</td></tr>
+      <tr><td><code>--kv-cache-memory-bytes</code></td><td><code>11811160064</code> (11 GiB)</td><td><span class="la-rb glm"></span></td><td>Pins the pool per GPU</td><td>1,233,779 tokens (1.45× at 850k), regardless of what the profile run measured</td></tr>
+      <tr><td><code>GLM53_KDA_BF16_LARGE_M</code></td><td><code>1</code> in <code>.env.example</code></td><td><span class="la-rb glm"></span></td><td>BF16 copy of the KDA's <code>in_proj</code> for <i>M</i> &gt; 512</td><td>TTFT −11.4% to −12.3%; +3.29 GiB per rank</td></tr>
+      <tr><td><code>KDA_BF16_LARGE_M_MIN_M</code></td><td><code>512</code> (fixed)</td><td><span class="la-rb glm"></span></td><td>Dispatch boundary</td><td>Decode measured up to <i>M</i> = 220; prefill from 768 up</td></tr>
+      <tr><td><code>KV_BYTES_PER_TOKEN</code></td><td><code>29482</code></td><td><span class="la-rb qwen"></span> (TP1)</td><td>Measured bytes per token (BF16) in the budget</td><td>Converts <code>MAX_MODEL_LEN</code> into GiB of KV with the real cost, not the theoretical one</td></tr>
+      <tr><td>speculation</td><td>MTP=3 · DFlash2 k=7 · DSpark</td><td><span class="la-rb qwen"></span> <span class="la-rb glm"></span> <span class="la-rb ds"></span></td><td>Several tokens per read of the weights</td><td>τ ≈ 3.2 (2.2 accepted + 1 bonus) · ~7.7 (6.71 + 1, structured) · ~4.15 (3.15 + 1)</td></tr>
+      <tr><td><code>GLM53_ADAPTIVE_K</code></td><td><code>off</code> (opt-in <code>ema</code>, set 2,4,7)</td><td><span class="la-rb glm"></span></td><td>Verifies only 2, 4 or 7 of the 7 drafts, based on the moving average of acceptance</td><td>Fewer verified positions light up fewer experts and shorten the step: prose +13–21%. The k is the batch minimum, because FULL CUDA graphs require a uniform shape</td></tr>
+      <tr><td><code>GLM53_EXL3_MOE_FAST</code></td><td><code>0</code> (opt-in <code>1</code>)</td><td><span class="la-rb glm"></span></td><td>“Thin-decode” K4/N256 MoE decode kernels (1 register stage, 8 shared-memory stages)</td><td>Same bytes, no register spills: +7.7% to +14.6% single-stream decode; TP2 only, formal numerical validation inconclusive</td></tr>
+    </tbody>
+  </table></div>
+  <h3>A checklist for your recipe</h3>
+  <ol class="la-steps">
+    <li><b>Add up the bytes of a decode step.</b> Dense weights per GPU + expected distinct experts + <code>lm_head</code> (× verified positions) + drafter. Divide by ~240 GB/s and multiply by the tokens per step (accepted + 1): that is the per-user ceiling. Add a \(t_{\text{fixed}}\) of 10–20 ms for collectives, launches and serial drafts. Expect 50–65% of the ceiling in practice before speculation, as in the <a data-ch="receita-do-zero">new model</a> tutorial.</li>
+    <li><b>Compute the bytes per context token</b> with \(L_{kv} \times n_{kv} \times (d_k + d_v) \times b\), check whether the KV splits under TP (GQA) or is replicated (MLA/MQA), and add the fixed state per sequence.</li>
+    <li><b>Estimate the pool</b>: GMU × visible memory − weights − activations − graphs/non-torch. Divide by the bytes per token and check against the boot's <code>Available KV cache memory</code> line.</li>
+    <li><b>Choose the ceilings</b>: <code>--max-model-len</code> by the context the pool can hold with room to spare, <code>--max-num-seqs</code> by the concurrency you want to serve.</li>
+    <li><b>Check the prefill intensity</b>: with MoE, compute the rows per expert of your <code>--max-num-batched-tokens</code> (\(r = Mk/D\)) and the intensity with both terms, weights and activations, before comparing with the ridge. \(2r/b_w\) only works while \(r \ll \tfrac{b_w}{b_a}\cdot\tfrac{KN}{K+N}\).</li>
+    <li><b>Measure</b> TTFT and prefill tok/s with cold prompts, tok/s per stream and aggregate on a concurrency ladder, and compare with your predictions. If the numbers do not add up, some byte or some wait was left out of the calculation.</li>
+  </ol>
+  <p>One box is still unopened: what exactly are the “distinct experts” that weigh on all these calculations, and how does a router choose, token by token, 8 of 288 experts? The next chapter, <a data-ch="mixture-of-experts">Mixture-of-Experts</a>, opens Part III with that architecture. After it, <a data-ch="mla">MLA</a>, <a data-ch="atencao-esparsa">sparse attention</a> and <a data-ch="atencao-linear">linear attention</a> show the three ways to shrink the KV that you have just learned to measure.</p>
+</section>

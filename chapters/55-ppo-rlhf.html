@@ -1,0 +1,426 @@
+<p class="la-lead">Em 2022, avaliadores humanos preferiram as respostas de um modelo de 1,3 bilhão de parâmetros às do GPT-3 de 175 bilhões, 100× maior. A diferença não estava no tamanho, e sim em três etapas de pós-treino que ficaram conhecidas como <span class="la-term" data-term="rlhf">RLHF</span>: SFT, um modelo de recompensa e, no fim, um algoritmo de aprendizado por reforço chamado <span class="la-term" data-term="ppo">PPO</span>. E saiu barato: o PPO-ptx do modelo de 175B custou 60 petaflop/s-dias, contra 3.640 do pré-treino do GPT-3. Este capítulo abre o PPO por dentro (a razão de probabilidades, o clip, o crítico, a entropia, as épocas) e depois monta o sistema em volta dele: a recompensa presa por uma coleira de KL, os quatro modelos na memória, o motor de inferência gerando respostas dentro do laço de treino e os truques que separam um treino estável de um colapso. No fim, você vai conseguir ler e escrever a configuração de uma corrida de PPO-RLHF, estimar se ela cabe na sua máquina e diagnosticar o que deu errado quando a curva de recompensa mente.</p>
+
+<section class="la-sec">
+  <h2>Por que o PPO existe: reaproveitar o lote sem cair do penhasco</h2>
+  <p>Comece pelo que você já tem do <a data-ch="rl-fundamentos">capítulo 54</a>. Um LLM gerando uma resposta é uma <span class="la-term" data-term="politica">política</span> \(\pi_\theta\). O estado é o prompt mais o prefixo já gerado, a ação é o próximo token, e a recompensa chega quase toda no fim. O gradiente de política diz como mexer nos pesos para aumentar a recompensa esperada:</p>
+  <div class="la-eq">
+    \[ \begin{gathered} \nabla_\theta J = \mathbb E_{x\sim\mathcal D,\ y\sim\pi_\theta(\cdot\mid x)}\Big[\sum_{t=1}^{T}\hat A_t \\ \cdot\,\nabla_\theta\log\pi_\theta(y_t\mid x, y_{&lt;t})\Big] \end{gathered} \]
+    <ul class="la-eq-legend">
+      <li>\(x\): prompt sorteado do conjunto \(\mathcal D\); \(y = (y_1,\dots,y_T)\): resposta amostrada da <i>própria</i> política</li>
+      <li>\(\hat A_t\): <span class="la-term" data-term="vantagem">vantagem</span> estimada do token \(t\), isto é, quanto ele foi melhor (positiva) ou pior (negativa) que o esperado naquele ponto</li>
+      <li>\(\nabla_\theta\log\pi_\theta(y_t\mid\cdot)\): o mesmo gradiente de <span class="la-term" data-term="logprob">log-probabilidade</span> do SFT (<a data-ch="sft">capítulo 52</a>)</li>
+    </ul>
+  </div>
+  <p>Uma leitura útil (é uma intuição, não um teorema): a fórmula é o SFT com pesos. Tokens com vantagem positiva ficam mais prováveis; com vantagem negativa, menos. O detalhe que vai mudar tudo está no subscrito da esperança: \(y\sim\pi_\theta\). O gradiente só vale para respostas amostradas da política <i>atual</i>. E gerar respostas é a parte cara do RLHF (a seção sobre o motor de inferência mede o quanto). Jogar fora um lote de 512 respostas depois de um único passo de gradiente seria um desperdício enorme. Queremos dar vários passos com o mesmo lote.</p>
+  <p>Só que, depois do primeiro passo, os pesos já não são os que geraram o lote. Chame de \(\pi_{\theta_{\text{old}}}\) a política que gerou as respostas. Para usar amostras de uma distribuição como se viessem de outra existe a <span class="la-term" data-term="amostragem-por-importancia">amostragem por importância</span>, e o peso de cada token é a <span class="la-term" data-term="razao-de-probabilidades">razão de probabilidades</span>:</p>
+  <div class="la-eq">
+    \[ \begin{aligned} \rho_t(\theta) &amp;= \frac{\pi_\theta(a_t\mid s_t)}{\pi_{\theta_{\text{old}}}(a_t\mid s_t)} \\ L^{CPI}(\theta) &amp;= \hat{\mathbb E}_t\big[\rho_t(\theta)\,\hat A_t\big] \end{aligned} \]
+    <ul class="la-eq-legend">
+      <li>\(s_t = (x, y_{&lt;t})\) e \(a_t = y_t\): estado e ação do token \(t\)</li>
+      <li>\(\rho_t\): quanto a política atual gosta do token amostrado, relativo à política que o amostrou; vale exatamente 1 antes do primeiro passo</li>
+      <li>\(L^{CPI}\): o <span class="la-term" data-term="objetivo-substituto">objetivo substituto</span> herdado do TRPO (<i>conservative policy iteration</i>); \(\hat{\mathbb E}_t\) é a média sobre os tokens do lote</li>
+    </ul>
+  </div>
+  <p>Em \(\theta = \theta_{\text{old}}\), o gradiente de \(L^{CPI}\) é exatamente o gradiente de política, porque \(\nabla\rho = \rho\,\nabla\log\pi\) e \(\rho = 1\). Longe dali, a aproximação apodrece. As vantagens foram medidas sob \(\pi_{\theta_{\text{old}}}\), e a razão por token ignora que a nova política também visitaria <i>outros prefixos</i>. O paper do PPO resume: sem restrição, maximizar \(L^{CPI}\) leva a atualizações excessivas. E por que a razão é por token, e não por sequência? Porque o produto de centenas de razões explode. Com quatro tokens de razões 1,20, 0,96, 5,00 e 0,99, o produto já vale 5,70, dominado pelo único token raro em que as duas políticas discordam (exemplo ilustrativo).</p>
+  <p>O <span class="la-term" data-term="trpo">TRPO</span> (Schulman e colegas, 2015) resolveu isso com uma <span class="la-term" data-term="regiao-de-confianca">região de confiança</span>: maximizar \(L^{CPI}\) sujeito a \(\hat{\mathbb E}_t[D_{KL}(\pi_{\theta_{\text{old}}}\,\|\,\pi_\theta)]\le\delta\), com \(\delta = 0{,}01\) em todos os experimentos do paper. Funciona, mas cada atualização exige produtos com a matriz de Fisher, um gradiente conjugado e uma busca em linha, sobre bilhões de parâmetros, e o método combina mal com minibatches, dropout e parâmetros compartilhados. O PPO (Schulman, Wolski, Dhariwal, Radford e Klimov, 2017) quer o mesmo efeito com um <span class="la-term" data-term="otimizador">otimizador</span> comum de primeira ordem, como o <span class="la-term" data-term="adam">Adam</span>. A figura mostra o problema e a solução numa política de três tokens.</p>
+  <figure class="la-fig" id="fig-penhasco" data-title="Massa de probabilidade sob passos repetidos">
+    <div class="la-fig-stage" style="height:420px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>A mesma política de brinquedo do capítulo 54 (tokens “20”, “14” e “Vou”), agora levando vários passos com o mesmo lote. Os parâmetros são os próprios <span class="la-term" data-term="logits">logits</span> \(z = (2{,}0;\ 1{,}0;\ 0{,}1)\), portanto \(\pi_{\text{old}} = (0{,}659;\ 0{,}242;\ 0{,}099)\). O “14” foi sorteado e recebeu vantagem \(\hat A = \pm 1{,}5\). Cada passo é uma subida de gradiente do objetivo substituto sobre o <b>mesmo</b> lote, como fazem as épocas e os minibatches do PPO. À esquerda, o vetor de logits e as barras de \(\pi\) (contorno tracejado = \(\pi_{\text{old}}\)). À direita, a razão \(\rho\) do token amostrado a cada passo, com a faixa \([1-\varepsilon,\,1+\varepsilon]\) em verde e, tracejado, o que o outro modo faria com o mesmo lote. Números <b>ilustrativos</b>. Com \(\eta = 1\) (arraste o slider até o fim), o primeiro passo leva \(\rho\) a 2,87, exatamente o exemplo do capítulo 54 (\(\pi(\text{14})\) de 0,242 a 0,696); com clip, os passos seguintes ficam bloqueados.</figcaption>
+  </figure>
+  <p>Rode os dois modos com a vantagem positiva. Sem clip, dez passos levam a razão do token amostrado de 1 para perto de 2 (com o passo padrão) e a massa continua migrando para ele, tudo com base num único lote e numa única estimativa ruidosa de vantagem. Com clip, os passos seguem até \(\rho\) passar de \(1+\varepsilon\); daí em diante o gradiente daquele token vale zero e as barras congelam. Repare que elas congelam um pouco <i>acima</i> de \(1+\varepsilon\): o último passo começou dentro da faixa e terminou fora dela. O clip não é uma parede, é um corte de incentivo. Numa rede de verdade os pesos ainda são compartilhados, e o gradiente de outros tokens continua mexendo na probabilidade de um token já clipado. Por isso, na prática, ainda se vigia a KL entre as políticas e se dão poucos passos por lote.</p>
+  <div class="la-callout analogy"><b class="t">Analogia: o limitador de velocidade</b><p>O \(L^{CPI}\) é um carro sem limitador: o gradiente diz “acelere”, e ele acelera até sair da estrada, que aqui é a região onde o lote ainda descreve a política. O TRPO é um engenheiro que, a cada curva, calcula a velocidade máxima segura resolvendo um sistema linear (o gradiente conjugado) e ainda testa a frenagem (a busca em linha). O PPO é o limitador eletrônico: passou de \(1+\varepsilon\), o pedal simplesmente para de responder. É grosseiro, mas é barato e funciona com qualquer otimizador.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>O objetivo clipado, caso a caso</h2>
+  <p>Eis o objetivo que deu nome ao algoritmo (eq. 7 do paper do PPO):</p>
+  <div class="la-eq">
+    \[ \begin{aligned} &amp;L^{CLIP}(\theta) = \hat{\mathbb E}_t\Big[\min\big(\rho_t(\theta)\,\hat A_t, \\ &amp;\qquad\operatorname{clip}(\rho_t(\theta),\,1-\varepsilon,\,1+\varepsilon)\,\hat A_t\big)\Big] \end{aligned} \]
+    <ul class="la-eq-legend">
+      <li>\(\operatorname{clip}(\rho, 1-\varepsilon, 1+\varepsilon)\): prende \(\rho\) dentro do intervalo \([1-\varepsilon,\,1+\varepsilon]\)</li>
+      <li>\(\varepsilon\): raio do clip; o paper sugere “digamos 0,2”, que é o valor usado por InstructGPT, Bai e Llama 2</li>
+      <li>\(\min\): escolhe o menor dos dois termos, o que faz do <span class="la-term" data-term="objetivo-clipado">objetivo clipado</span> um limite inferior <i>pessimista</i> de \(L^{CPI}\); perto de \(\rho = 1\) os dois coincidem em primeira ordem</li>
+    </ul>
+  </div>
+  <p>O \(\min\) parece um detalhe, mas é ele que decide quando o gradiente morre. Faça a análise por casos, olhando a derivada em relação a \(\rho\):</p>
+  <ol class="la-steps">
+    <li><b>Ação boa (\(\hat A &gt; 0\)), razão subindo.</b> O objetivo cresce com \(\rho\) até \(1+\varepsilon\) e depois fica plano. Não há incentivo para tornar a ação boa ainda mais provável <i>neste lote</i>.</li>
+    <li><b>Ação boa, razão caindo abaixo de \(1-\varepsilon\).</b> O termo não clipado é o menor, então o gradiente continua: o PPO corrige uma ação boa que ficou improvável.</li>
+    <li><b>Ação ruim (\(\hat A &lt; 0\)), razão caindo.</b> Abaixo de \(1-\varepsilon\), plano: a ação ruim já foi rebaixada o bastante.</li>
+    <li><b>Ação ruim, razão subindo acima de \(1+\varepsilon\).</b> O \(\min\) escolhe o termo não clipado e a penalidade continua: a ação ruim ficou <i>mais</i> provável, e o PPO não deixa passar.</li>
+  </ol>
+  <p>A regra, nas palavras dos autores: a mudança na razão é ignorada só quando melhoraria o objetivo, e é incluída quando o piora. A tabela faz as contas com \(\varepsilon = 0{,}2\) para uma ação boa (\(\hat A = +2\)) e uma ruim (\(\hat A = -1\)).</p>
+  <table>
+    <thead><tr><th>\(\rho\)</th><th>\(\hat A=+2\): \(L\)</th><th>\(\partial L/\partial\rho\)</th><th>\(\hat A=-1\): \(L\)</th><th>\(\partial L/\partial\rho\)</th></tr></thead>
+    <tbody>
+      <tr><td>0,7</td><td>1,40</td><td>2</td><td>−0,80</td><td><b>0</b></td></tr>
+      <tr><td>0,8</td><td>1,60</td><td>2</td><td>−0,80</td><td>−1</td></tr>
+      <tr><td>1,0</td><td>2,00</td><td>2</td><td>−1,00</td><td>−1</td></tr>
+      <tr><td>1,2</td><td>2,40</td><td>2</td><td>−1,20</td><td>−1</td></tr>
+      <tr><td>1,3</td><td>2,40</td><td><b>0</b></td><td>−1,30</td><td>−1</td></tr>
+    </tbody>
+  </table>
+  <figure class="la-fig" id="fig-clip" data-title="A função clip do PPO">
+    <div class="la-fig-stage" style="height:400px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>O objetivo de um token em função da razão \(\rho\). Tracejado: \(\rho\hat A\) (sem clip). Pontilhado: \(\operatorname{clip}(\rho)\hat A\). Linha grossa: o \(\min\) dos dois, que é o \(L^{CLIP}\). As zonas hachuradas são onde o gradiente vale zero. Arraste no gráfico (ou use o controle de \(\rho\)) e ligue a “subida de gradiente”: a bolinha sobe a ladeira e para quando entra numa zona plana. Com \(\hat A = +2\) e \(\hat A = -1\), os valores batem com a tabela acima, que reproduz a Fig. 1 do paper.</figcaption>
+  </figure>
+  <p>Brinque com o sinal da vantagem. Com \(\hat A &gt; 0\), a bolinha sobe até \(1+\varepsilon\) e para. Com \(\hat A &lt; 0\), ela desce até \(1-\varepsilon\) e para. Agora coloque a bolinha à direita de \(1+\varepsilon\) com vantagem negativa: ela é empurrada de volta, porque ali o \(\min\) escolheu o termo sem clip. É a assimetria do item 4 da lista.</p>
+  <p>Funciona? No MuJoCo, o paper compara variantes num escore normalizado (7 ambientes, 21 corridas por variante). Sem clip nem penalidade, o escore fica em −0,39: o substituto puro diverge. Depois de uma iteração no Hopper, a KL da política atualizada fica em torno de 0,02, ponto em que \(L^{CLIP}\) é máximo (Fig. 2 do paper).</p>
+  <table>
+    <thead><tr><th>Variante (MuJoCo)</th><th>Escore normalizado</th></tr></thead>
+    <tbody>
+      <tr><td>sem clip nem penalidade</td><td>−0,39</td></tr>
+      <tr><td>clip \(\varepsilon\) = 0,1 / <b>0,2</b> / 0,3</td><td>0,76 / <b>0,82</b> / 0,70</td></tr>
+      <tr><td>KL adaptativa, \(d_{\text{targ}}\) = 0,003 / 0,01 / 0,03</td><td>0,68 / 0,74 / 0,71</td></tr>
+      <tr><td>KL fixa, \(\beta\) = 0,3 / 1 / 3 / 10</td><td>0,62 / 0,71 / 0,72 / 0,69</td></tr>
+    </tbody>
+  </table>
+  <p>As linhas de KL são a alternativa que o próprio paper testou, \(L^{KLPEN} = \hat{\mathbb E}_t[\rho_t\hat A_t - \beta\,D_{KL}(\pi_{\theta_{\text{old}}}\|\pi_\theta)]\). Depois de cada atualização mede-se \(d = \hat{\mathbb E}_t[D_{KL}]\): se \(d &lt; d_{\text{targ}}/1{,}5\), \(\beta\) cai à metade; se \(d &gt; 1{,}5\,d_{\text{targ}}\), \(\beta\) dobra. Funcionou pior que o clip nesses benchmarks, e o clip virou o padrão.</p>
+  <div class="la-callout warn"><b class="t">Duas KLs que não são a mesma</b><p>Neste capítulo aparecem duas divergências de KL com papéis diferentes. A do PPO, \(D_{KL}(\pi_{\theta_{\text{old}}}\|\pi_\theta)\), mede o quanto a política andou <b>dentro de uma iteração</b>; é a região de confiança, e vale centésimos de nat (cerca de 0,02 no Hopper). A do RLHF, \(D_{KL}(\pi_\theta\|\pi_{\text{ref}})\), mede o quanto a política se afastou do <b>modelo SFT</b> ao longo de todo o treino; é a coleira, e chega a vários nats (de 14 a 18 nats nos modelos finais de Stiennon; 19 numa das corridas da varredura de \(\beta\)). Confundir as duas é um erro comum ao ler configurações: <code>clip_range</code> e <code>kl_coef</code> controlam coisas diferentes.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>A perda completa: crítico, entropia, épocas e minibatches</h2>
+  <p>O clip cuida da política. Mas o PPO é um método <span class="la-term" data-term="ator-critico">ator-crítico</span>: precisa de um <span class="la-term" data-term="critico">crítico</span> \(V\) para estimar as vantagens. O paper combina tudo num objetivo só (eq. 9):</p>
+  <div class="la-eq">
+    \[ \begin{aligned} &amp;L^{CLIP+VF+S}_t(\theta) = \hat{\mathbb E}_t\Big[L^{CLIP}_t(\theta) \\ &amp;\qquad - c_1\,L^{VF}_t(\theta) + c_2\,S[\pi_\theta](s_t)\Big] \\ &amp;L^{VF}_t = \big(V_\theta(s_t) - V^{\text{targ}}_t\big)^2 \end{aligned} \]
+    <ul class="la-eq-legend">
+      <li>\(L^{VF}\): perda de valor, regressão do crítico até o alvo \(V^{\text{targ}}\)</li>
+      <li>\(c_1\): peso da perda de valor, necessário quando política e crítico compartilham parâmetros (no Atari, \(c_1 = 1\))</li>
+      <li>\(S[\pi_\theta](s_t) = -\sum_a \pi_\theta(a\mid s_t)\log\pi_\theta(a\mid s_t)\): a <span class="la-term" data-term="entropia">entropia</span> da política, somada como <span class="la-term" data-term="bonus-de-entropia">bônus de entropia</span> com peso \(c_2\) (0,01 no Atari) para manter a exploração</li>
+    </ul>
+  </div>
+  <h3>O crítico de um LLM</h3>
+  <p>Em RLHF o crítico é um LM inteiro com uma cabeça escalar que emite um valor <b>em cada posição</b>: \(V(s_t)\) responde “que nota final eu espero se continuar amostrando a partir deste prefixo?”. É diferente do modelo de recompensa, que só é lido no token final. Stiennon e colegas (2020) usaram um Transformer com parâmetros “completamente separados” da política, porque isso evita que as atualizações da função valor destruam parcialmente a política pré-treinada no início do treino. E inicializaram o crítico com os pesos do RM, prática que o InstructGPT repetiu. Com parâmetros separados, \(c_1\) perde o papel de arbitrar pesos compartilhados. Quando as duas redes ficam num mesmo otimizador (como na reprodução N+, \(c_1 = 0{,}1\)), ele só reescala o gradiente do crítico. Com Adam, que normaliza cada parâmetro, isso pesa pouco, exceto pelo clip de norma global, que é conjunto.</p>
+  <p>O alvo do crítico vem do <span class="la-term" data-term="gae">GAE</span> que você viu no <a data-ch="rl-fundamentos">capítulo 54</a>: \(\hat A_t = \sum_l(\gamma\lambda)^l\delta_{t+l}\), com resíduo \(\delta_t = r_t + \gamma V(s_{t+1}) - V(s_t)\), e alvo \(\hat R_t = \hat A_t + V_{\text{old}}(s_t)\), que é o λ-retorno. Em RLHF quase todos usam \(\gamma = 1\): Stiennon e a reprodução “N+ implementation details” (Huang e colegas, 2024) usam \(\lambda = 0{,}95\); o InstructGPT diz apenas que não usou desconto. Há um preço em respostas longas. Com recompensa só no último token, a contribuição direta dela para \(\hat A_t\) pesa \(\lambda^{T-t}\): com \(\lambda = 0{,}95\), \(0{,}95^{50}\approx 0{,}077\) e \(0{,}95^{500}\approx 7\times 10^{-12}\). Em cadeias de raciocínio de milhares de tokens, os primeiros tokens dependem quase só do que o crítico chuta. O VC-PPO (2025) atacou exatamente isso, segundo o resumo do paper: pré-treina o crítico e desacopla o GAE (\(\lambda = 1\) no crítico, \(0{,}95\) no ator). O VAPO, também segundo o resumo, levou o Qwen 32B base a 60,4 no AIME 2024 em 5.000 passos com PPO e crítico.</p>
+  <h3>Clipping do valor</h3>
+  <p>Assim como a política, o crítico também pode dar um salto grande demais num lote só. O detalhe de implementação herdado das OpenAI Baselines, e adotado no RLHF, é clipar o valor:</p>
+  <div class="la-eq">
+    \[ \begin{aligned} V^{\text{clip}}_t &amp;= V_{\text{old}} + \operatorname{clip}\big(V_\psi - V_{\text{old}},\,-\hat\varepsilon,\,\hat\varepsilon\big) \\ L^{VF,\text{clip}}_t &amp;= \max\Big(\big(V_\psi - \hat R_t\big)^2,\ \big(V^{\text{clip}}_t - \hat R_t\big)^2\Big) \end{aligned} \]
+    <ul class="la-eq-legend">
+      <li>\(V_\psi\): crítico atual; \(V_{\text{old}}\): o valor que ele previa quando o lote foi gerado (os dois avaliados em \(s_t\))</li>
+      <li>\(V^{\text{clip}}_t\): a previsão nova presa na faixa \(V_{\text{old}}\pm\hat\varepsilon\)</li>
+      <li>\(\hat R_t\): alvo (λ-retorno); \(\hat\varepsilon\): raio do <span class="la-term" data-term="clipping-do-valor">clipping do valor</span> (0,2 no N+)</li>
+      <li>\(\max\): a versão pessimista de uma perda (no PPO da política era um \(\min\) de um objetivo a maximizar)</li>
+    </ul>
+  </div>
+  <p>A lógica espelha o \(L^{CLIP}\). Se o valor novo já saiu da faixa \(V_{\text{old}}\pm\hat\varepsilon\) <i>na direção que reduz o erro</i>, o termo clipado, que agora é constante, fica maior, o \(\max\) o escolhe e o gradiente zera. Se saiu na direção errada, o termo sem clip domina e puxa de volta. A figura mostra três casos (exemplo ilustrativo, contas exatas).</p>
+  <figure class="la-fig" id="fig-valor" data-title="Clipping da perda de valor">
+    <div class="la-fig-stage" style="height:380px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Eixo horizontal: a previsão do crítico \(V\) para um token. Parábola tracejada: \((V-\hat R)^2\). Curva pontilhada: o termo clipado, plano fora da faixa \(V_{\text{old}}\pm\hat\varepsilon\) (faixa verde). Linha grossa: o \(\max\), que é a perda usada; hachurado onde ele escolhe o termo clipado e o gradiente vale zero. A bolinha é o crítico ao longo das épocas: parte de \(V_{\text{old}} = 1{,}0\) e desce o gradiente; com o alvo longe, ela para na borda da faixa. O losango é o \(V_{\text{novo}}\) de cada caso (exemplo ilustrativo, contas exatas, \(\hat\varepsilon = 0{,}2\)): \(V\) = 1,6 com alvo 1,1 (perda 0,25, puxa de volta); \(V\) = 0,7 com alvo 1,1 (perda 0,16, puxa de volta); \(V\) = 1,3 com alvo 2,0 (perda 0,64, gradiente <b>zero</b>: já andou +0,3 na direção certa).</figcaption>
+  </figure>
+  <h3>Entropia: o bônus que o RLHF dispensa</h3>
+  <p>No A3C (Mnih e colegas, 2016), o bônus de entropia com peso 0,01 desencorajava a convergência prematura para políticas determinísticas. Em RLHF de LLMs ele quase sempre fica desligado: Bai e colegas (2022) não usam bônus de entropia, e a penalidade de KL até o modelo de referência já faz esse papel, como a seção sobre a coleira de KL mostra com uma identidade de duas linhas.</p>
+  <h3>Épocas e minibatches</h3>
+  <p>O algoritmo do paper é simples: a cada iteração, \(N\) atores coletam \(T\) passos com \(\pi_{\theta_{\text{old}}}\); calculam-se as vantagens; otimiza-se o substituto por <b>\(K\) épocas</b> em minibatches de tamanho \(M\le NT\) com Adam; e faz-se \(\theta_{\text{old}}\leftarrow\theta\). No MuJoCo, \(K = 10\) épocas, minibatch de 64 e horizonte de 2.048; no Atari, \(K = 3\). Em LLMs os números caem: o InstructGPT usa batch de 512 e minibatch de 64 (8 minibatches) com <b>1 época</b>; Stiennon e o N+ usam 4 épocas; Bai varia entre 1, 2 e 4 e observa que \(K\) maior tipicamente dá resultados mais estáveis; o Llama 2 dá um passo de gradiente por minibatch. Interpretação: cada época empurra a política para mais longe de quem gerou o lote, e num modelo de bilhões de parâmetros poucos passos já movem muito a distribuição.</p>
+</section>
+
+<section class="la-sec">
+  <h2>O pipeline RLHF: SFT → modelo de recompensa → PPO</h2>
+  <p>O PPO é só a terceira peça. O pipeline que o cerca foi montado em cinco anos, trabalho a trabalho:</p>
+  <div class="la-cards">
+    <div class="la-card"><span class="ic">🦿</span><h4>Christiano et al. 2017</h4><p>RL a partir de comparações humanas de clipes de 1 a 2 s, em Atari (A2C) e MuJoCo (TRPO), com a recompensa do ambiente escondida. Com 900 consultas, em menos de uma hora, o Hopper aprendeu um mortal para trás.</p></div>
+    <div class="la-card"><span class="ic">✍️</span><h4>Ziegler et al. 2019</h4><p>Primeiro RLHF num LM (GPT-2 774M). Levou a recompensa moldada por KL para LMs e introduziu o controlador adaptativo de \(\beta\). Os sumarizadores viraram “copiadores espertos”, que copiavam frases inteiras do texto.</p></div>
+    <div class="la-card"><span class="ic">📰</span><h4>Stiennon et al. 2020</h4><p>O pipeline canônico SFT → RM → PPO em sumarização. \(\beta = 0{,}05\), crítico separado iniciado do RM, 1M episódios, cerca de 320 GPU-dias para o RL do 6,7B.</p></div>
+    <div class="la-card"><span class="ic">🧭</span><h4>InstructGPT 2022</h4><p>O mesmo pipeline aplicado a instruções gerais, com <span class="la-term" data-term="ppo-ptx">PPO-ptx</span> para não perder capacidades. Virou o padrão industrial.</p></div>
+    <div class="la-card"><span class="ic">🤝</span><h4>Bai et al. 2022</h4><p>Utilidade e inofensividade, RLHF online com RMs e políticas atualizados toda semana, \(\lambda_{KL} = 0{,}001\), e recompensa que cresce linearmente com \(\sqrt{\text{KL}}\).</p></div>
+    <div class="la-card"><span class="ic">🦙</span><h4>Llama 2 2023</h4><p>Dois RMs (utilidade e segurança), amostragem por rejeição e, nas últimas versões, PPO por cima do checkpoint de rejection sampling, recompensa transformada por <code>whiten(logit(·))</code>, cerca de 330 s por iteração de PPO no 70B.</p></div>
+  </div>
+  <p>O <span class="la-term" data-term="instructgpt">InstructGPT</span> (Ouyang e colegas, 2022) é o caso de referência porque o paper publica quase tudo. São três conjuntos de dados, um por etapa:</p>
+  <table>
+    <thead><tr><th>Etapa</th><th>Treino</th><th>Validação</th><th>O que contém</th></tr></thead>
+    <tbody>
+      <tr><td>SFT</td><td>12.725 prompts (11.295 de rotuladores + 1.430 de clientes)</td><td>1.653</td><td>demonstrações escritas por rotuladores</td></tr>
+      <tr><td>RM</td><td>33.207 prompts (6.623 + 26.584)</td><td>17.887</td><td>rankings de \(K = 4\) a \(9\) respostas</td></tr>
+      <tr><td>PPO</td><td>31.144 prompts (só da API)</td><td>16.185</td><td>prompts sem rótulo humano</td></tr>
+    </tbody>
+  </table>
+  <p>Siga a linha de montagem na figura. Repare que a etapa do PPO não usa <i>nenhum</i> rótulo humano novo: todo o julgamento humano já foi comprimido no <span class="la-term" data-term="modelo-de-recompensa">modelo de recompensa</span> (<a data-ch="preferencias-reward-models">capítulo 53</a>).</p>
+  <figure class="la-fig wide" id="fig-pipeline" data-title="A linha de montagem do InstructGPT">
+    <div class="la-fig-stage" style="height:400px"><canvas></canvas></div>
+    <figcaption>Três estações: SFT em demonstrações, RM treinado em pares tirados dos rankings, PPO contra o RM com a KL até o SFT. Depois, o PPO-ptx e o resultado. Contagens e hiperparâmetros do paper do InstructGPT (Tab. 6 e Ap. C). Use os passos ou deixe no automático.</figcaption>
+  </figure>
+  <p>Os hiperparâmetros do PPO do InstructGPT (Ap. C.4) viraram um ponto de partida para muita gente:</p>
+  <table class="la-params">
+    <thead><tr><th>Parâmetro</th><th>Valor</th><th>O que faz</th><th>Por que importa</th></tr></thead>
+    <tbody>
+      <tr><td>\(\beta\) (KL até o SFT)</td><td>0,02</td><td>peso da penalidade por token</td><td>nas ablações, o ótimo ficou entre 0,01 e 0,02; 0 e 2 eram ruins</td></tr>
+      <tr><td>episódios</td><td>256k (~31k prompts únicos)</td><td>respostas geradas e pontuadas</td><td>512k fizeram DROP e SQuADv2 caírem abaixo do GPT-3</td></tr>
+      <tr><td>batch / minibatch</td><td>512 / 64</td><td>8 minibatches por lote, 1 época</td><td>512 foi o melhor entre 64 e 1.024 na avaliação humana</td></tr>
+      <tr><td>clip \(\varepsilon\)</td><td>0,2</td><td>raio do \(L^{CLIP}\)</td><td>o valor do paper do PPO</td></tr>
+      <tr><td>GAE</td><td>sem desconto</td><td>\(\gamma = 1\)</td><td>a resposta inteira é um episódio curto</td></tr>
+      <tr><td>temperatura de amostragem</td><td>1</td><td>a política amostra sem distorção</td><td>a temperatura faz parte da política</td></tr>
+      <tr><td>RM e crítico</td><td>6B para todas as políticas</td><td>crítico iniciado do RM</td><td>um crítico de 6B atende uma política de 175B</td></tr>
+      <tr><td>EMA dos pesos</td><td>decaimento 0,992</td><td>média móvel dos pesos da política</td><td>suaviza o ruído entre iterações (interpretação)</td></tr>
+      <tr><td>precisão</td><td>fp16 + mestres fp32</td><td>pesos e ativações em fp16</td><td>a contabilidade de memória da seção prática</td></tr>
+    </tbody>
+  </table>
+  <p>Uma iteração tem 512 episódios, então 256k episódios são 500 iterações (cálculo). O SFT que serve de ponto de partida para a política também é especial: 2 épocas com 10% de dados de pré-treino misturados (entre 0%, 10% e 50%, só 10% se destacou). E o SFT principal foi treinado por 16 épocas, com o checkpoint escolhido pelo <b>escore do RM</b> na validação: a perda de validação sobreajusta depois de 1 época, mas mais épocas melhoram o escore do RM e a preferência humana.</p>
+</section>
+
+<section class="la-sec">
+  <h2>A coleira de KL: recompensa moldada, controle adaptativo e PPO-ptx</h2>
+  <p>Se o PPO maximizasse só a nota do RM, ele encontraria as respostas que <i>enganam</i> o RM: o <span class="la-term" data-term="reward-hacking">reward hacking</span> do <a data-ch="preferencias-reward-models">capítulo 53</a>. A defesa clássica é amarrar a política ao modelo SFT com uma <span class="la-term" data-term="penalidade-kl">penalidade de KL</span> embutida na própria recompensa:</p>
+  <div class="la-eq">
+    \[ \begin{aligned} R(x,y) &amp;= r_\phi(x,y) - \beta\log\frac{\pi_\theta(y\mid x)}{\pi_{\text{ref}}(y\mid x)} \\ \mathbb E_{y\sim\pi_\theta}[R] &amp;= \mathbb E[r_\phi] - \beta\,D_{KL}\big(\pi_\theta\,\|\,\pi_{\text{ref}}\big) \end{aligned} \]
+    <ul class="la-eq-legend">
+      <li>\(r_\phi\): nota do RM, já normalizada; \(\pi_{\text{ref}}\): a <span class="la-term" data-term="politica-de-referencia">política de referência</span>, cópia congelada do SFT</li>
+      <li>\(\beta\): coeficiente da KL (0,05 em Stiennon, 0,02 no InstructGPT)</li>
+      <li>\(\log\pi(y\mid x) = \sum_t\log\pi(y_t\mid s_t)\); a segunda linha vale porque \(\mathbb E_{y\sim\pi}[\log\pi/\pi_{\text{ref}}]\) é a definição de KL, com as duas distribuições condicionadas ao mesmo prompt: \(D_{KL}\big(\pi_\theta(\cdot\mid x)\,\|\,\pi_{\text{ref}}(\cdot\mid x)\big)\)</li>
+    </ul>
+  </div>
+  <p>No PPO, essa recompensa é espalhada pelos tokens. O RM só fala no último; todos os tokens recebem a sua parcela da KL:</p>
+  <div class="la-eq">
+    \[ \begin{aligned} r_t = &amp;-\beta\big(\log\pi_{\theta_{\text{old}}}(y_t\mid s_t) - \log\pi_{\text{ref}}(y_t\mid s_t)\big) \\ &amp;+ \mathbb 1[t = T]\;r_\phi(x,y) \end{aligned} \]
+    <ul class="la-eq-legend">
+      <li>\(\mathbb 1[t=T]\): vale 1 só no último token (o <span class="la-term" data-term="token-eos">EOS</span>), onde a nota do RM é somada</li>
+      <li>com \(\gamma = 1\), \(\sum_t r_t = R(x,y)\); o N+ mostra um exemplo real: 4,5 no EOS e os demais números são a penalidade de KL por token</li>
+    </ul>
+  </div>
+  <p>Por que essa coleira? As fontes dão três leituras. <b>Primeira</b>, ela é um bônus de entropia disfarçado: \(D_{KL}(\pi\|\pi_{\text{ref}}) = -H(\pi) - \mathbb E_\pi[\log\pi_{\text{ref}}]\), então \(-\beta D_{KL} = \beta H(\pi) + \beta\,\mathbb E_\pi[\log\pi_{\text{ref}}]\), e a política é premiada por manter entropia. É por isso que o RLHF dispensa o \(c_2\). <b>Segunda</b>, ela mantém o RM válido: impede a política de produzir saídas muito diferentes das que o RM viu no treino. <b>Terceira</b>, em tarefas de estilo ela é parte da própria definição da tarefa (Ziegler): coerência e tópico vêm do SFT. Há contrapontos: Gao e colegas (2022) acharam a KL equivalente a parar cedo no seu setup, e Bai usou uma KL quase nula.</p>
+  <h3>A política ótima: o SFT repesado pela recompensa</h3>
+  <p>O objetivo com KL tem solução fechada. É a base do DPO (<a data-ch="dpo">capítulo 57</a>) e a melhor forma de entender o que \(\beta\) faz:</p>
+  <div class="la-eq">
+    \[ \begin{aligned} \pi^*(y\mid x) &amp;= \frac{1}{Z(x)}\,\pi_{\text{ref}}(y\mid x)\,\exp\big(r(x,y)/\beta\big) \\ Z(x) &amp;= \sum_y \pi_{\text{ref}}(y\mid x)\,e^{r(x,y)/\beta} \end{aligned} \]
+    <ul class="la-eq-legend">
+      <li>\(\pi^*\): a política que maximiza \(\mathbb E_\pi[r] - \beta D_{KL}(\pi\|\pi_{\text{ref}})\)</li>
+      <li>\(Z(x)\): a constante de normalização (a função de partição)</li>
+      <li>\(\beta\): a temperatura; \(\beta\to0\) só a recompensa importa, \(\beta\to\infty\) a política fica em \(\pi_{\text{ref}}\)</li>
+    </ul>
+  </div>
+  <div class="la-callout deep"><b class="t">Aprofundamento: a derivação em duas linhas</b><p>Reescreva o objetivo como \(\mathbb E_{y\sim\pi}\big[r - \beta\log\pi + \beta\log\pi_{\text{ref}}\big] = -\beta\,\mathbb E_{y\sim\pi}\big[\log\pi - \log(\pi_{\text{ref}}e^{r/\beta})\big]\). Some e subtraia \(\log Z\): o objetivo vira \(-\beta\,D_{KL}\big(\pi\,\|\,\tfrac1Z\pi_{\text{ref}}e^{r/\beta}\big) + \beta\log Z\). O segundo termo não depende de \(\pi\), e a KL é mínima (zero) quando as duas distribuições são iguais. Logo \(\pi^* = \tfrac1Z\pi_{\text{ref}}e^{r/\beta}\). O RLHF com KL não inventa respostas novas: ele <b>repondera</b> o que o SFT já fazia, exponencialmente pela recompensa.</p></div>
+  <p>A figura mostra essa repesagem num prompt com seis respostas possíveis. Uma delas é um “exploit”: o RM dá a ela a maior nota, mas a qualidade real é péssima, e o SFT quase nunca a escreveria. Desça \(\beta\) e veja a massa escorrer para ela.</p>
+  <figure class="la-fig" id="fig-otima" data-title="A política ótima e o preço de afrouxar a coleira">
+    <div class="la-fig-stage" style="height:430px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>À esquerda, \(\pi_{\text{ref}}\) (contorno) e \(\pi^* \propto \pi_{\text{ref}}e^{r/\beta}\) (barras) sobre seis respostas, com a nota do RM \(r\) e uma qualidade “real” hipotética \(g\). À direita, varrendo \(\beta\): no eixo horizontal, \(\sqrt{D_{KL}(\pi^*\|\pi_{\text{ref}})}\); a curva lavanda é a recompensa média do RM e a curva menta é a qualidade real média. O ponto marca o \(\beta\) atual. Rosa = o exploit. Âmbar = a resposta prolixa: o RM gosta dela (+1,2) mais do que ela vale (+0,5), o viés de comprimento do <a data-ch="preferencias-reward-models">capítulo 53</a>; repare que ela também ganha massa quando \(\beta\) cai. Todos os números são <b>ilustrativos</b>; a forma (proxy subindo, real subindo e depois caindo) é a da superotimização medida por Gao e colegas (2022).</figcaption>
+  </figure>
+  <p>Com \(\beta = 1\), a política ótima ainda se parece com o SFT, e a resposta útil e correta é a mais provável. Com \(\beta = 0{,}3\), o exploit já leva 68% da massa: a nota do RM sobe para 2,0, mas a qualidade real média despenca para −0,8. Esse é o retrato da <span class="la-term" data-term="superotimizacao">superotimização</span> (Goodhart) que o <a data-ch="preferencias-reward-models">capítulo 53</a> mediu, agora visto como uma <i>escolha</i> de \(\beta\).</p>
+  <h3>Medindo a KL com amostras</h3>
+  <p>A KL exata da sequência exigiria somar sobre todas as respostas possíveis. Por token, até daria para somar o vocabulário inteiro, mas isso exige guardar os logits completos de \(\pi\) e \(\pi_{\text{ref}}\) (\(B\times T\times 10^5\) números por iteração). A prática padrão é um estimador que usa só o token sorteado. Com \(y_t\sim\pi_\theta\) e \(r = \pi_{\text{ref}}(y_t)/\pi_\theta(y_t)\), o blog de Schulman (2020) compara três:</p>
+  <div class="la-eq">
+    \[ \begin{aligned} k_1 &amp;= -\log r \\ k_2 &amp;= \tfrac12(\log r)^2 \\ k_3 &amp;= (r-1) - \log r \end{aligned} \]
+    <ul class="la-eq-legend">
+      <li>\(k_1\): não enviesado, variância alta, <b>pode ser negativo</b>; é o termo da recompensa por token acima</li>
+      <li>\(k_2\): enviesado, variância baixa; coincide com a KL até segunda ordem</li>
+      <li>\(k_3\): não enviesado e <b>sempre ≥ 0</b>; é o que o GRPO usa dentro da perda (<a data-ch="grpo-rlvr">capítulo 56</a>)</li>
+    </ul>
+  </div>
+  <table>
+    <thead><tr><th>\(\log\pi_\theta\)</th><th>\(\log\pi_{\text{ref}}\)</th><th>\(k_1\)</th><th>\(k_2\)</th><th>\(k_3\)</th></tr></thead>
+    <tbody>
+      <tr><td>−1,0</td><td>−1,2</td><td>0,2000</td><td>0,0200</td><td>0,0187</td></tr>
+      <tr><td>−2,0</td><td>−1,0</td><td><b>−1,0000</b></td><td>0,5000</td><td>0,7183</td></tr>
+      <tr><td>−0,1</td><td>−0,1</td><td>0,0000</td><td>0,0000</td><td>0,0000</td></tr>
+      <tr><td>−0,5</td><td>−3,0</td><td>2,5000</td><td>3,1250</td><td>1,5821</td></tr>
+    </tbody>
+  </table>
+  <p>Na recompensa do PPO, um token com \(k_1\) negativo ganha um pequeno <i>prêmio</i>. Em média isso se cancela, porque a esperança de \(k_1\) é a KL verdadeira. Interpretação: pôr a KL na recompensa (InstructGPT) e pô-la na perda (GRPO) não dá o mesmo gradiente. Na recompensa, ela passa pela vantagem, pelo crítico e pelo GAE; na perda, é diferenciada diretamente. Em esperança, as duas puxam para \(\pi_{\text{ref}}\). E o valor de \(\beta\) muda muito entre trabalhos:</p>
+  <table>
+    <thead><tr><th>Trabalho</th><th>\(\beta\)</th><th>Observação</th></tr></thead>
+    <tbody>
+      <tr><td>Ziegler 2019</td><td>adaptativo, \(K_\beta = 0{,}1\)</td><td>alvos de 6 a 10 nats</td></tr>
+      <tr><td>Stiennon 2020</td><td>0,05</td><td>KL final de 14 a 18 nats (modelos finais)</td></tr>
+      <tr><td>InstructGPT 2022</td><td>0,02</td><td>ótimo entre 0,01 e 0,02</td></tr>
+      <tr><td>Bai 2022</td><td>0,001</td><td>“talvez desnecessário”</td></tr>
+      <tr><td>Llama 2 2023</td><td>0,01 (7B/13B) e 0,005 (34B/70B)</td><td>com recompensa <code>whiten(logit)</code></td></tr>
+      <tr><td>N+ 2024 (Pythia)</td><td>0,05</td><td>reprodução de Stiennon</td></tr>
+    </tbody>
+  </table>
+  <p>Um \(\beta\) só se compara com outro quando a escala da recompensa é a mesma: a perda do RM é invariante a deslocamento, mas não a escala, e a escala de \(r\) define quanto \(\beta\) “pesa”.</p>
+  <h3>Controle adaptativo: mirar uma KL, não um β</h3>
+  <p>Ziegler e colegas notaram um problema prático: corridas com o mesmo \(\beta\) e sementes diferentes terminavam com KLs muito diferentes, difíceis de comparar. A solução foi um <span class="la-term" data-term="controlador-adaptativo-kl">controlador adaptativo</span> proporcional no espaço log, que mira uma KL alvo:</p>
+  <div class="la-eq">
+    \[ \begin{aligned} e_t &amp;= \operatorname{clip}\Big(\frac{\text{KL}_t - \text{KL}_{\text{alvo}}}{\text{KL}_{\text{alvo}}},\ -0{,}2,\ 0{,}2\Big) \\ \beta_{t+1} &amp;= \beta_t\,(1 + K_\beta\,e_t), \quad K_\beta = 0{,}1 \end{aligned} \]
+    <ul class="la-eq-legend">
+      <li>\(e_t\): erro relativo da KL medida \(\text{KL}_t = \text{KL}(\pi_t,\pi_{\text{ref}})\), clipado em ±20%</li>
+      <li>\(K_\beta\): ganho do controlador; com 0,1, \(\beta\) muda no máximo ±2% por passo</li>
+      <li>\(\text{KL}_{\text{alvo}}\): alvos usados no paper, como 6, 8 e 10 nats</li>
+    </ul>
+  </div>
+  <p>Com alvo de 6 nats e \(\beta_0 = 0{,}1\), siga uma sequência de medições: KL de 12 dá \(e = +0{,}2\) e \(\beta\) vai a 0,1020; a seguinte, de 10, leva a 0,10404; uma de 6 não mexe; uma de 3 traz para 0,10196. O controlador é lento de propósito. A regra do paper do PPO, que dobra ou divide \(\beta\), é muito mais agressiva. A figura simula três sementes que “puxam” a KL com forças diferentes.</p>
+  <figure class="la-fig" id="fig-kl-ctrl" data-title="Controle da coleira: fixo, Ziegler ou dobra-divide">
+    <div class="la-fig-stage" style="height:400px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Em cima, a KL até a referência de três sementes ao longo de 300 iterações (tracejado = alvo). Embaixo, o \(\beta\) de cada uma. Com \(\beta\) fixo, as três terminam em KLs diferentes, que é o problema que motivou Ziegler. Com o controlador de Ziegler (\(K_\beta = 0{,}1\), clip ±0,2), as três convergem devagar para o alvo. A regra dobra-divide, que no paper do PPO controlava a KL até \(\pi_{\text{old}}\), aqui foi aplicada ao mesmo sinal só para comparar a agressividade: \(\beta\) salta em degraus de 2× e a KL pode parar em qualquer ponto da zona morta entre alvo/1,5 e 1,5·alvo (com \(\beta\) limitado ao intervalo 0,001–10 na simulação). A dinâmica da KL é um modelo <b>ilustrativo</b>; as regras de atualização de \(\beta\) são as dos papers.</figcaption>
+  </figure>
+  <h3>PPO-ptx: a terceira força</h3>
+  <p>Mesmo com a coleira, o RLHF do InstructGPT causava regressões em benchmarks públicos (SQuADv2, DROP, tradução), o que os autores chamaram de <span class="la-term" data-term="imposto-de-alinhamento">imposto de alinhamento</span>. A correção foi misturar gradientes de pré-treino ao PPO (eq. 2 do paper):</p>
+  <div class="la-eq">
+    \[ \begin{aligned} &amp;\text{objetivo}(\phi) = \mathbb E_{(x,y)\sim D_{\pi^{RL}_\phi}}\Big[r_\theta(x,y) \\ &amp;\qquad - \beta\log\frac{\pi^{RL}_\phi(y\mid x)}{\pi^{SFT}(y\mid x)}\Big] \\ &amp;\qquad + \gamma\,\mathbb E_{x\sim D_{\text{pretrain}}}\big[\log\pi^{RL}_\phi(x)\big] \end{aligned} \]
+    <ul class="la-eq-legend">
+      <li>\(\pi^{RL}_\phi\): a política (o paper chama os parâmetros dela de \(\phi\)); \(r_\theta\): o RM</li>
+      <li>\(\gamma\): coeficiente de pré-treino (não é o desconto!), igual a <b>27,8</b>; com \(\gamma = 0\) o modelo é o “PPO”, e o “InstructGPT” é o PPO-ptx</li>
+      <li>o segundo termo é a log-verossimilhança de texto de pré-treino, a mesma perda do pré-treino</li>
+    </ul>
+  </div>
+  <p>Na implementação, cada minibatch calcula o gradiente do PPO e o do pré-treino em passos consecutivos, acumulados no mesmo buffer, o segundo multiplicado por \(\gamma\), com 8× mais exemplos de pré-treino que episódios de RL. Isso <b>dobra</b> o tempo de treino em relação ao PPO puro. \(\gamma\ge20\) recuperou as regressões no 1,3B, e 27,8 funcionou de 1,3B a 175B. E o detalhe mais instrutivo: aumentar só o \(\beta\) da KL não resolve. Mesmo \(\beta = 2{,}0\), 100× o padrão, não consertou as regressões e ainda derrubou a recompensa de validação. Interpretação: a coleira prende a política perto do SFT na distribuição dos prompts de RL; a ptx a prende perto do pré-treino na distribuição de texto geral.</p>
+</section>
+
+<section class="la-sec">
+  <h2>Uma iteração por dentro: quatro modelos, nove passos</h2>
+  <p>Juntando as peças, uma corrida de PPO-RLHF mantém quatro redes vivas ao mesmo tempo. Vale dar um nome e um papel a cada uma:</p>
+  <table>
+    <thead><tr><th>Modelo</th><th>Papel</th><th>Inicialização</th><th>Treina?</th><th>Trabalho por iteração</th></tr></thead>
+    <tbody>
+      <tr><td><b>Política (ator)</b> \(\pi_\theta\)</td><td>gera respostas; recebe o gradiente do PPO</td><td>SFT</td><td>sim</td><td>geração no motor de inferência + forward de \(\log\pi_{\theta_{\text{old}}}\) + \(K\) épocas de forward e backward</td></tr>
+      <tr><td><b>Referência</b> \(\pi_{\text{ref}}\)</td><td>log-probs para a KL</td><td>cópia congelada do SFT</td><td>não</td><td>1 forward por resposta</td></tr>
+      <tr><td><b>Recompensa</b> \(r_\phi\)</td><td>nota no EOS</td><td>RM treinado</td><td>não</td><td>1 forward por resposta</td></tr>
+      <tr><td><b>Crítico</b> \(V_\psi\)</td><td>\(V(s_t)\) em cada token, para o GAE</td><td>o RM</td><td>sim</td><td>1 forward + \(K\) épocas de forward e backward</td></tr>
+    </tbody>
+  </table>
+  <p>E uma iteração, em pseudocódigo, como descrita pelas reproduções públicas:</p>
+  <pre data-lang="text"><code>para cada iteração:
+  1. prompts  ← amostra B prompts                         # InstructGPT e N+: B = 512
+  2. rollouts ← motor_inferência.gerar(prompts, π_θold)   # vLLM/SGLang; N+ gera até o máximo e trunca no EOS
+  3. nota     ← r_φ(x, y) lida no EOS; sem EOS → −1       # "EOS trick" do N+
+  4. logp_ref ← π_ref.forward(x, y)                       # por token
+     logp_old ← π_θold.forward(x, y)                      # recalculado no motor de TREINO
+     V_old    ← V_ψ.forward(x, y)                         # por token
+  5. r_t      ← −β (logp_old − logp_ref);  r_T += nota
+  6. Â_t, R̂_t ← GAE(r, V_old, γ, λ);  R̂_t = Â_t + V_old
+  7. Â_t      ← branquear(Â)                              # média 0, desvio 1 no lote
+  8. para época = 1..K; para minibatch em embaralhar(lote):
+        ρ_t = exp(log π_θ(y_t|s_t) − logp_old_t)
+        L_π = −média(min(ρ_t Â_t, clip(ρ_t, 1−ε, 1+ε) Â_t))
+        L_V = ½ média(max((V_ψ − R̂)², (V_old + clip(V_ψ − V_old, ±ε̂) − R̂)²))
+        passo do otimizador (clip da norma global do gradiente)
+  9. sincroniza π_θ → motor de inferência;  θ_old ← θ</code></pre>
+  <p>A figura percorre os nove passos com uma resposta de cinco tokens, e preenche a matriz do lote linha a linha com os números de um exemplo ilustrativo de contas exatas (\(\beta = 0{,}05\), nota do RM = 2,0), os mesmos do GAE passo a passo do <a data-ch="rl-fundamentos">capítulo 54</a>. Lá, o foco era a recursão; aqui, quem calcula cada linha e em que ordem.</p>
+  <figure class="la-fig wide" id="fig-iteracao" data-title="Uma iteração de PPO-RLHF, passo a passo">
+    <div class="la-fig-stage" style="height:540px"><canvas></canvas></div>
+    <figcaption>Em cima, os cinco personagens: o motor de inferência e as quatro redes. Os que trabalham no passo atual acendem. Embaixo, a matriz do lote para uma resposta (“O céu é azul” + EOS): log-probs, valores, KL por token \(k_1\), recompensas \(r_t\), resíduos \(\delta_t\), vantagens GAE com \(\lambda = 0{,}95\), alvos \(\hat R_t\) e vantagens branqueadas. Valores de entrada <b>ilustrativos</b>; o resto é calculado exatamente pelas fórmulas. No passo 8, a linha \(\rho_t\) mostra a razão saindo de 1,000 e parando nas bordas do clip (movimento ilustrativo).</figcaption>
+  </figure>
+  <p>Três detalhes da figura valem ouro. No passo 4, \(\log\pi_{\text{old}}\) é <b>recalculado no motor de treino</b>, e não copiado dos log-probs que o vLLM devolveu: a seção seguinte mostra que os dois não coincidem, mesmo com os mesmos pesos. No passo 5, o token 3 tem KL negativa (\(-0{,}50\)) e ganha um prêmio de +0,025, efeito do estimador \(k_1\). No passo 6, com \(\lambda = 0{,}95\), o crédito da nota final escorre para trás: o primeiro token recebe vantagem 0,98, embora sozinho o seu resíduo seja só 0,19. A reprodução N+ fecha a configuração completa de uma corrida que reproduz Stiennon:</p>
+  <table class="la-params">
+    <thead><tr><th>Parâmetro</th><th>Valor (N+, Pythia)</th><th>Comentário</th></tr></thead>
+    <tbody>
+      <tr><td>episódios</td><td>1M</td><td>≈ 8,56 épocas do conjunto SFT de 116.722 prompts, reamostrado sem reposição</td></tr>
+      <tr><td>otimizador</td><td>AdamW, eps 1e-5, lr 3e-6, linear</td><td>LR pequeno e decrescente</td></tr>
+      <tr><td>batch / minibatches / \(K\)</td><td>512 / 1 / 4</td><td>4 épocas sobre o lote inteiro</td></tr>
+      <tr><td>\(\beta\), \(\gamma\), \(\lambda\)</td><td>0,05 / 1 / 0,95</td><td>como Stiennon</td></tr>
+      <tr><td>\(\varepsilon\), \(\hat\varepsilon\), \(c_1\)</td><td>0,2 / 0,2 / 0,1</td><td>clipping da perda de valor ligado</td></tr>
+      <tr><td>temperatura de amostragem</td><td>0,7</td><td>diferente do InstructGPT (1)</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="la-sec">
+  <h2>O motor de inferência dentro do laço</h2>
+  <p>Aqui o Módulo 1 volta inteiro. Gerar 512 respostas é <span class="la-term" data-term="decode">decode</span> autorregressivo, a fase <span class="la-term" data-term="memory-bound">limitada por memória</span> do <a data-ch="prefill-decode-kv">capítulo 10</a>. E um motor de treino é péssimo nisso. O Llama 2 relata que gerar com FSDP ficou cerca de <b>20× mais lento</b>, mesmo com batch grande e <span class="la-term" data-term="kv-cache">KV cache</span>; a mitigação foi consolidar os pesos em cada nó antes da geração. O paper do OpenRLHF diz que a fase de inferência frequentemente responde por <b>mais de 90%</b> do tempo total de RLHF ou RLVR. Por isso todos os frameworks modernos geram os <span class="la-term" data-term="rollout">rollouts</span> com <span class="la-term" data-term="vllm">vLLM</span> ou SGLang, com <span class="la-term" data-term="pagedattention">PagedAttention</span>, <span class="la-term" data-term="continuous-batching">batching contínuo</span> e <span class="la-term" data-term="cuda-graph">CUDA graphs</span> (<a data-ch="vllm-arquitetura">capítulo 30</a>), e calculam gradientes com outro motor (DeepSpeed ZeRO, FSDP, Megatron). A documentação do vLLM lista, entre os frameworks que o usam para rollouts, OpenRLHF, verl, TRL, NeMo-RL, Open Instruct, SkyRL e Unsloth.</p>
+  <p>Uma conta de FLOPs ajuda a ver o paradoxo. Com a regra de ~\(2N\) FLOPs por token num forward e ~\(6N\) num forward+backward (Kaplan e colegas, 2020), quatro modelos de 7B, 512 prompts de 256 tokens e respostas de 256 tokens (262.144 tokens por iteração) e \(K = 1\):</p>
+  <table>
+    <thead><tr><th>Fase</th><th>FLOPs</th><th>Conta</th></tr></thead>
+    <tbody>
+      <tr><td>geração (prefill + decode)</td><td>3,67 PFLOP</td><td>\(2N\times262.144\)</td></tr>
+      <tr><td>forwards de pontuação (\(\pi_{\text{old}}\), \(\pi_{\text{ref}}\), RM, \(V_{\text{old}}\))</td><td>14,68 PFLOP</td><td>\(4\times2N\times262.144\)</td></tr>
+      <tr><td>treino de política + crítico (1 época)</td><td>22,02 PFLOP</td><td>\(2\times6N\times262.144\)</td></tr>
+      <tr><td><b>total</b></td><td><b>40,37 PFLOP</b></td><td>exemplo ilustrativo, sem atenção</td></tr>
+    </tbody>
+  </table>
+  <p>Em FLOPs, a geração é a <i>menor</i> parcela. Em tempo, ela pesa muito mais do que os FLOPs sugerem, porque cada passo de decode lê todos os pesos. No <span class="la-term" data-term="gb10">GB10</span>, os 14 GB de pesos bf16 de um 7B a 273 GB/s dão pelo menos 51 ms por passo, ou 13 s para 256 passos, e isso só se os 512 rollouts couberem num único batch de KV (cálculo). Os limites de computação, na mesma máquina, dão a outra metade da conta: a ~125 TFLOP/s bf16 densos, o treino de 22,02 PFLOP leva ≥ 176 s, os forwards de pontuação ≥ 117 s e a própria geração ≥ 29 s, ou seja, ≥ 323 s no total a 100% de utilização, contra os ≥ 13 s do decode limitado por banda (cálculo). Interpretação: nesse exemplo de respostas curtas, os limites inferiores ainda apontam para o treino; o domínio da geração que o OpenRLHF relata aparece com respostas longas (raciocínio de milhares de tokens) e com a cauda, em que a resposta mais longa do lote segura todo mundo.</p>
+  <h3>Colocado ou desagregado</h3>
+  <p>Há duas formas de juntar os dois motores:</p>
+  <table>
+    <thead><tr><th></th><th><span class="la-term" data-term="modo-colocado">Colocado</span> (<i>hybrid engine</i>)</th><th><span class="la-term" data-term="modo-desagregado">Desagregado</span></th></tr></thead>
+    <tbody>
+      <tr><td>GPUs</td><td>as mesmas GPUs alternam treino e geração</td><td>pools separados de treino e de rollout</td></tr>
+      <tr><td>sincronização de pesos</td><td>em memória: tensores compartilhados ou handles <span class="la-term" data-term="cuda-ipc">CUDA IPC</span></td><td>rede: broadcast <span class="la-term" data-term="nccl">NCCL</span> do treino para o rollout, ou checkpoint em disco</td></tr>
+      <tr><td>memória</td><td>precisa liberar KV e pesos do motor de inferência durante o treino, e o otimizador durante a geração</td><td>sem disputa; cada lado é dimensionado à parte</td></tr>
+      <tr><td>ociosidade</td><td>nenhuma GPU parada, mas as fases são em série</td><td>um lado espera o outro, a menos que se use RL assíncrono</td></tr>
+      <tr><td>exemplos</td><td>DeepSpeed-Chat; verl 3D-HybridEngine; OpenRLHF modo híbrido</td><td>OpenRLHF (Ray); slime desagregado; Noukhovitch et al.</td></tr>
+    </tbody>
+  </table>
+  <p>O verl (paper HybridFlow) refaz o particionamento do ator entre o paralelismo de treino e o de geração “com zero redundância de memória”, descarregando os pesos de geração para a CPU durante o treino, e relata de 1,53× a 20,57× de throughput sobre as bases comparadas. O OpenRLHF agenda com Ray papéis de <i>rollout engines</i> (vLLM) e <i>actor engines</i> (DeepSpeed ZeRO), suporta modo híbrido e fluxo assíncrono, e relata de 1,22× a 1,68× de aceleração.</p>
+  <p>Os motores ganharam APIs próprias para isso. No vLLM (documentação <code>latest</code> em 2026-10), o <span class="la-term" data-term="sleep-mode">sleep mode</span> (<code>--enable-sleep-mode</code>) tem dois níveis: <code>llm.sleep(level=1)</code> descarrega os pesos para a RAM da CPU e descarta o KV cache; <code>level=2</code> descarta pesos e KV, útil quando os pesos vão ser trocados de qualquer jeito. <code>llm.wake_up(tags=["weights"])</code> e depois <code>tags=["kv_cache"]</code> acordam em etapas para reduzir o pico de memória. A <span class="la-term" data-term="sincronizacao-de-pesos">sincronização de pesos</span> usa <code>WeightTransferConfig(backend=...)</code>, com backends <code>"nccl"</code>, <code>"ipc"</code>, <code>"sparse_nccl"</code>, <code>"sharded_rdt"</code> e <code>"nccl_m2n"</code>, num protocolo de quatro fases: <code>init_weight_transfer_engine</code> → <code>start_weight_update</code> → <code>update_weights</code> (repetível, em blocos) → <code>finish_weight_update</code>. No servidor HTTP, essas rotas (e <code>/sleep</code>, <code>/wake_up</code>) só existem com <code>VLLM_SERVER_DEV_MODE=1</code>. No SGLang, os equivalentes são <code>update_weights_from_tensor</code> (colocado), <code>update_weights_from_distributed</code> (NCCL/IB), <code>release_memory_occupation</code>/<code>resume_memory_occupation</code> e <code>pause_generation</code> nos modos <code>abort</code>, <code>retract</code> ou <code>in_place</code>.</p>
+  <p>Quanto custa mover os pesos? Os 14 GB de um 7B em bf16, pela ConnectX-7 do GB10 (≈ 15,7 GB/s por função PCIe, ≈ 25 GB/s com as duas), levam ≈ 0,9 s ou ≈ 0,56 s, sem overhead de protocolo (cálculo com os números do <a data-ch="nccl-rdma">capítulo 39</a>). Na memória unificada, o modo colocado pode reduzir a sincronização a uma troca de handles (interpretação). Atenção ao mesmo fato no sentido contrário: no GB10, “descarregar para a RAM da CPU” (sleep nível 1) não libera memória física, porque CPU e GPU dividem a mesma LPDDR5x (<a data-ch="memoria-unificada">capítulo 27</a>); só o nível 2, que descarta, libera. Interpretação nossa, pelo mesmo argumento do offload do Adam; não testada no hardware.</p>
+  <h3>RL assíncrono</h3>
+  <p>No modo desagregado síncrono, o pool de treino espera a geração e vice-versa. Noukhovitch e colegas (ICLR 2025) geram o lote \(i+1\) enquanto treinam no lote \(i\): o treino fica <span class="la-term" data-term="rl-assincrono">off-policy de 1 passo</span>. Eles perguntam quanta off-policyness dá para tolerar. O desempenho em geral degrada com mais defasagem, e entre as perdas testadas o Online DPO foi a mais robusta, com robustez crescente com o tamanho da política. Os ganhos medidos: o mesmo desempenho do síncrono cerca de 25% mais rápido num 2,8B, cerca de 40% num chatbot LLaMA 3.1 8B e cerca de 70% no Rho 1B em GSM8k. É a ideia do A3C (atores gerando experiência em paralelo, aprendiz central consumindo) com instâncias de vLLM no papel de atores.</p>
+  <figure class="la-fig wide" id="fig-motor" data-title="Três jeitos de pôr o motor no laço">
+    <div class="la-fig-stage" style="height:400px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Os três arranjos lado a lado, na mesma escala de tempo, por três iterações; o destacado mostra os números nos mostradores e a linha vertical é um relógio comum. Menta = geração no motor de inferência; lavanda = forwards de pontuação; rosa = treino (épocas do PPO); âmbar = sincronização de pesos; cinza = troca de contexto (sleep/wake, reparticionamento); hachurado = GPU ociosa. Os pontinhos que viajam são rollouts indo para o treino; a seta âmbar são os pesos voltando. Modelo de tempos <b>ilustrativo</b>, que supõe escala linear com o número de GPUs; os ganhos medidos de verdade (25% a 70% no RL assíncrono) estão no texto.</figcaption>
+  </figure>
+  <p>Mexa na fração de GPUs do pool de rollout. No desagregado síncrono, qualquer escolha deixa alguém ocioso. No assíncrono, existe um equilíbrio (perto de 70% no padrão da figura) em que os dois pools trabalham o tempo todo, ao preço de uma iteração de defasagem. O colocado não tem ociosidade, mas paga a troca de contexto a cada iteração e serializa as fases. Repare que, neste modelo de brinquedo, o assíncrono bem balanceado só empata com o colocado. Interpretação: a vantagem real da desagregação vem do que o modelo não captura. O decode não escala linearmente com o número de GPUs, a resposta mais longa do lote segura a fase de geração, e cada pool pode usar o paralelismo e a memória que mais lhe convêm, sem dividir a GPU com o otimizador.</p>
+  <h3>Mesmos pesos, outras probabilidades</h3>
+  <p>Há uma fonte de off-policyness ainda mais traiçoeira. Com geração em vLLM e treino em FSDP, \(\pi_{\text{vllm}}(a;\theta)\ne\pi_{\text{fsdp}}(a;\theta)\), apesar dos mesmos parâmetros: kernels, ordem de redução, precisão e batching diferentes (Yao e colegas, 2025). Isso transforma implicitamente o RL on-policy em off-policy, e piora com rollouts quantizados em INT8 ou FP8. As correções têm nome: <span class="la-term" data-term="tis">TIS</span> multiplica o gradiente por \(\min(\pi_{\text{fsdp}}/\pi_{\text{vllm}}, C)\); o MiniMax-M1 subiu a <span class="la-term" data-term="lm-head">LM head</span> para FP32 e levou a correlação entre as probabilidades de treino e de inferência de ~0,9 para ~0,99; em MoE, o R3 grava as escolhas do <span class="la-term" data-term="roteador">roteador</span> na inferência e as reaplica no treino, porque ~94% dos tokens escolhem experts diferentes em pelo menos uma camada entre as duas fases. O <a data-ch="grpo-rlvr">capítulo 56</a> aprofunda esse tema; aqui basta a ponte com as receitas.</p>
+  <div class="la-callout recipe" data-recipe="qwen"><b class="t"><span class="la-rb qwen"></span> As receitas já resolveram metade do problema</b><p>A receita Qwen tem um overlay de <span class="la-term" data-term="determinismo-bit-a-bit">determinismo</span> (<code>VLLM_QSA_DET_TOPK=1</code>, <code>VLLM_MOE_DET_FINALIZE=1</code> com <code>VLLM_FLASHINFER_MOE_FUSED_FINALIZE=0</code>) que levou o espalhamento de logprob de prompt de 0,25 / 6,07 nats para 0 / 0, com custo de ~4% de decode: é exatamente a classe de correção que um “on-policy de verdade” exige. A receita <span class="la-rb glm"></span> traz <code>logprob_capture.py</code>, que compara KL e argmax de logprobs entre dois servidores, a mesma métrica que se vigia entre amostrador e treinador. E o overlay <code>patch_cache_reset.py</code> do GLM expõe <b>só</b> as rotas de reset de cache, sem <code>/sleep</code> nem rotas de RPC que o <code>VLLM_SERVER_DEV_MODE=1</code> montaria. Interpretação: uma receita de <i>serving</i> fecha de propósito as portas que um sistema de RL precisa abrir. E como os três modelos do Módulo 1 são MoE com pesos quantizados, usá-los como geradores de rollout de uma política treinada em BF16 seria o pior caso de descompasso: quantização e roteamento ao mesmo tempo.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Instabilidades, truques e custo</h2>
+  <p>O PPO tem fama de instável, e a fama é merecida: Engstrom e colegas (2020) e o post “The 37 Implementation Details of PPO” mostraram que normalizações, inicializações e clippings explicam boa parte do desempenho. Para RLHF, as listas equivalentes são o “N+ implementation details” (Huang e colegas, 2024) e o “Secrets of RLHF” (Zheng e colegas, 2023). Os truques que mais aparecem:</p>
+  <table class="la-params">
+    <thead><tr><th>Truque</th><th>O que faz</th><th>Fonte</th></tr></thead>
+    <tbody>
+      <tr><td>desligar dropout</td><td>com dropout, os log-probs não se reproduzem, a KL fica não confiável e as razões já saem diferentes de 1 na 1ª época</td><td>N+, Ziegler</td></tr>
+      <tr><td>EOS ≠ PAD</td><td>se o PAD é o EOS, o EOS é mascarado no SFT, o modelo não aprende a parar e o viés de comprimento cresce</td><td>N+</td></tr>
+      <tr><td><span class="la-term" data-term="eos-trick">“EOS trick”</span></td><td>gerar até o comprimento máximo, truncar no EOS; resposta sem EOS recebe −1</td><td>N+</td></tr>
+      <tr><td>normalizar o RM</td><td>um bias faz as demonstrações (ou referências) terem nota média 0</td><td>Stiennon, InstructGPT, N+</td></tr>
+      <tr><td>branquear ou escalar a recompensa</td><td>Llama 2: <code>whiten(logit(R))</code>, desfaz a sigmoide e padroniza para equilibrar com a KL</td><td>Llama 2, N+</td></tr>
+      <tr><td>normalizar e clipar a recompensa</td><td>\(\tilde r = \operatorname{clip}\big((r-\bar r)/\sigma(r), -\delta, \delta\big)\) com estatísticas históricas</td><td>Secrets</td></tr>
+      <tr><td><span class="la-term" data-term="branqueamento">branquear a vantagem</span></td><td>\(\hat A\leftarrow(\hat A - \text{média})/\text{desvio}\) no lote</td><td>N+, Engstrom</td></tr>
+      <tr><td>clipping do valor</td><td>\(\hat\varepsilon = 0{,}2\)</td><td>N+, Secrets</td></tr>
+      <tr><td>crítico iniciado do RM, ou pré-treinado</td><td>gradientes iniciais da política melhores, menos deriva</td><td>Stiennon, InstructGPT, Secrets, VC-PPO</td></tr>
+      <tr><td>clip global do gradiente</td><td>norma 1,0</td><td>Llama 2, Secrets</td></tr>
+      <tr><td>LR pequeno</td><td>10⁻⁶ (Llama 2), 3×10⁻⁶ (N+), 9×10⁻⁶ no crítico (InstructGPT)</td><td>papers</td></tr>
+      <tr><td>poucas épocas, buffer pequeno</td><td>dados quase on-policy (1 época no InstructGPT)</td><td>InstructGPT, Secrets</td></tr>
+      <tr><td>EMA dos pesos</td><td>decaimento 0,992: média móvel dos pesos da política; suaviza o ruído entre iterações (interpretação)</td><td>InstructGPT</td></tr>
+      <tr><td>vigiar o “espaço de ação”</td><td>perplexidade, comprimento e KL até o SFT são mais informativos da estabilidade do que recompensa e perdas</td><td>Secrets §5</td></tr>
+      <tr><td>várias sementes e parada antecipada</td><td>N+ roda 4 sementes e relata falhas; Llama 2 para cedo em prompts reservados</td><td>N+, Llama 2</td></tr>
+    </tbody>
+  </table>
+  <p>O branqueamento merece uma frase a mais. A vantagem entra multiplicando o gradiente, então a escala dela é, na prática, uma taxa de aprendizado escondida. Uma recompensa que vai de −5 a +5 num lote e de −0,1 a +0,1 no seguinte faria o passo efetivo variar 50× (exemplo ilustrativo). Subtrair a média e dividir pelo desvio deixa só o sinal relativo: <i>neste lote</i>, quais tokens foram melhores que os outros. É a mesma ideia do baseline do REINFORCE, aplicada de novo depois do GAE.</p>
+  <p>Os sintomas típicos, lidos das fontes (interpretação): recompensa sobe e qualidade humana cai (superotimização); comprimento explode (viés de comprimento); KL dispara (\(\beta\) pequeno ou LR alto); razão média já longe de 1 na 1ª época (dropout ligado, ou descompasso amostrador–treinador); perda de valor enorme no começo (crítico não iniciado do RM). O painel abaixo encena cada um.</p>
+  <figure class="la-fig wide" id="fig-painel" data-title="Painel de diagnóstico de uma corrida de PPO">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Quatro gráficos que todo painel de RLHF deveria ter: nota do RM contra qualidade real, KL até o SFT, comprimento médio das respostas, e a razão \(|\rho-1|\) média na 1ª época (barras, eixo direito de 0 a 0,1) junto com a perda de valor (linha, eixo esquerdo de 0 a 1). Escolha um cenário e leia o sintoma e o remédio. As curvas são <b>ilustrativas</b>: a forma de cada uma segue a descrição textual dos sintomas nas fontes (Secrets, N+, Stiennon, Singhal), não dados medidos.</figcaption>
+  </figure>
+  <p>Por fim, o custo. Os números reais dão a escala: o PPO-ptx do InstructGPT 175B custou 60 petaflop/s-dias (o pré-treino do GPT-3, 3.640); o RL do 6,7B de Stiennon, cerca de 320 GPU-dias; uma iteração de PPO no Llama 2 70B, cerca de 330 s. E o PPO é caro por quatro motivos que se somam: dois modelos treináveis (memória de otimizador em dobro), quatro forwards por resposta, \(K\) épocas e um gargalo serial de geração. Daí as três fugas que os próximos capítulos exploram: o DPO elimina o RL, RLOO e GRPO eliminam o crítico, e o RL assíncrono elimina as bolhas.</p>
+</section>
+
+<section class="la-sec">
+  <h2>Na prática: cabe na sua máquina? Ferramentas em 2026</h2>
+  <p>A primeira pergunta de quem quer rodar PPO não é sobre o algoritmo, é sobre memória. Um modelo treinado com Adam em precisão mista custa cerca de <b>16 bytes por parâmetro</b>: 2 dos pesos em bf16, 2 dos gradientes e 12 da cópia mestre em FP32, do primeiro momento e do segundo momento (4 + 4 + 4), na contabilidade do paper do ZeRO (<a data-ch="treino-memoria-lora">capítulo 51</a>). Um modelo congelado em <span class="la-term" data-term="bf16">bf16</span> custa 2 bytes por parâmetro. Política e crítico de \(N\) parâmetros, mais referência e RM do mesmo tamanho:</p>
+  <div class="la-eq">
+    \[ M_{\text{PPO}} \approx 2\times16N + 2\times2N = 36N\ \text{bytes} \]
+    <ul class="la-eq-legend">
+      <li>\(16N\): cada modelo treinável (política e crítico)</li>
+      <li>\(2N\): cada modelo congelado (referência e RM)</li>
+      <li>fora da conta: ativações, buffers de comunicação, fragmentação, a cópia de pesos do motor de inferência e o KV cache dos rollouts</li>
+    </ul>
+  </div>
+  <p>Isso dá 54 GB (50,3 GiB) para 1,5B, 108 GB para 3B, 252 GB (234,7 GiB) para 7B e 288 GB para 8B. Um <span class="la-term" data-term="dgx-spark">DGX Spark</span> expõe cerca de 121,69 GiB de <span class="la-term" data-term="memoria-unificada">memória unificada</span> ao CUDA; dois somam cerca de 243 GiB. Ou seja: PPO com full fine-tuning de política e crítico de 7B (≈ 235 GiB só de estados) já não cabe com ativações e KV nem em dois nós; 3B (≈ 101 GiB) cabe num nó só para os estados. Faça as contas na calculadora.</p>
+  <figure class="la-fig" id="fig-memoria" data-title="Calculadora: quatro modelos na memória">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Cada modelo é uma tira de bytes por parâmetro, na cor do próprio modelo (a mesma da barra empilhada): pesos em tom cheio, gradientes em tom médio e estados do Adam + mestre FP32 em tom claro nos treináveis; só pesos nos congelados. A barra de baixo empilha os GiB contra as linhas do Mac M4 de 24 GB e de um e dois DGX Spark; quando sobra menos de 15% de margem, o mostrador avisa que só os estados cabem. Full FT e “sem crítico” usam a contabilidade das fontes. No modo LoRA, a fração treinável de 1% é uma <b>estimativa ilustrativa</b> (depende do rank e das camadas), e a referência sai de graça porque é a mesma rede com o adaptador desligado, prática comum de engenharia. Ativações e KV cache não estão incluídos.</figcaption>
+  </figure>
+  <p>As saídas usuais aparecem na calculadora. <b>Crítico e RM menores que a política</b>: o InstructGPT usou RM e crítico de 6B para uma política de 175B. <b>LoRA</b>: a referência vira “a mesma rede com o adaptador desligado”, sem cópia extra. <b>Offload do Adam para a CPU</b>: ajuda em GPUs discretas, mas no GB10 não libera memória física, pela mesma razão do sleep mode. E <b>abandonar o crítico</b>, que é o caminho de RLOO e GRPO. Em MoE, como nos três modelos do Módulo 1, a memória escala com os parâmetros <i>totais</i>, enquanto os FLOPs escalam com os ativos.</p>
+  <h3>As ferramentas em 2026</h3>
+  <p>O ecossistema mudou de lugar. O TRL, que por anos foi o jeito mais fácil de rodar PPO, <b>removeu o <code>PPOTrainer</code> na versão 1.13.0</b>, segundo as release notes; a versão atual é a 1.14.1, que mantém estável o <code>RewardTrainer</code> para a etapa do RM. Para PPO com crítico, o caminho hoje são frameworks dedicados de RL:</p>
+  <div class="la-compare">
+    <div><h4>OpenRLHF 0.11.2</h4><p>Ray + vLLM + DeepSpeed. Entrada <code>python3 -m openrlhf.cli.train_ppo_ray</code>; o estimador de vantagem padrão (<code>--algo.advantage.estimator</code>) é o PPO com crítico, e o mesmo script roda <code>group_norm</code> (GRPO), <code>reinforce_baseline</code> e <code>rloo</code>. Flags com namespace: <code>--vllm.num_engines</code>, <code>--vllm.tensor_parallel_size</code>, <code>--ds.lora.rank</code>, e <code>--reward.remote_url</code> para servir o RM por HTTP.</p></div>
+    <div><h4>verl 0.9.1</h4><p>Configuração Hydra, treino em FSDP/FSDP2/Megatron e rollout em vLLM ou SGLang (paper HybridFlow). O exemplo oficial de PPO no GSM8K liga um crítico separado com <code>critic.model.path</code> e põe a KL em <code>algorithm.kl_ctrl.kl_coef=0.001</code>.</p></div>
+    <div><h4>No Mac: mlx-lm-lora</h4><p>O <code>mlx-lm-lora</code> 3.1.3 aceita <code>--train-mode ppo</code> (e <code>rlhf_reinforce</code>) com um modelo de recompensa como juiz. A referência é uma segunda cópia completa, congelada, carregada de <code>--reference-model-path</code>: no Mac de 24 GB, conte com isso.</p></div>
+  </div>
+  <p>O exemplo do verl, como está na documentação do GSM8K (8 GPUs num nó):</p>
+  <pre data-lang="bash"><code>python3 -m verl.trainer.main_ppo \
+  data.train_files=... data.train_batch_size=1024 \
+  data.max_prompt_length=512 data.max_response_length=512 \
+  actor_rollout_ref.model.path=deepseek-ai/deepseek-llm-7b-chat \
+  actor_rollout_ref.actor.optim.lr=1e-6 \
+  actor_rollout_ref.rollout.name=vllm \
+  actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
+  critic.model.path=deepseek-ai/deepseek-llm-7b-chat \
+  algorithm.kl_ctrl.kl_coef=0.001 \
+  trainer.n_gpus_per_node=8 trainer.nnodes=1 trainer.total_epochs=15</code></pre>
+  <p>Leia cada linha com o que você aprendeu. <code>rollout.name=vllm</code> é o motor no laço; <code>gpu_memory_utilization=0.5</code> é a fatia de memória que o vLLM pode reservar, porque os pesos de treino moram nas mesmas GPUs (modo colocado, interpretação); <code>critic.model.path</code> é o quarto modelo; <code>kl_coef=0.001</code> é o \(\beta\), no mesmo patamar do \(\lambda_{KL}\) de Bai. Do lado da infraestrutura, o slime (SGLang + Megatron) declara no README ser o framework de RL por trás das versões 4.5 a 5.3 do GLM, e o vime (junho de 2026) leva o desenho do slime para o ecossistema do vLLM, com modos colocado e desagregado.</p>
+  <p>E onde está o PPO-RLHF hoje? Para alinhamento geral de chat, boa parte da comunidade aberta migrou para o DPO e variantes, sem RM explícito e sem RL (<a data-ch="dpo">capítulo 57</a>), e para REINFORCE, RLOO e GRPO, sem crítico. O HelpSteer2-Preference chegou a 85,0 no Arena Hard (1º lugar em 01/10/2024) com o RM e REINFORCE. Para raciocínio com recompensas verificáveis, o GRPO do DeepSeek-R1 virou o padrão, mas o PPO com crítico voltou a competir quando o crítico é bem tratado (VC-PPO, VAPO). E o gargalo mudou do algoritmo para o sistema: geração eficiente, sincronização de pesos, assincronia e consistência numérica entre amostrador e treinador. É aqui que o Módulo 1 vira pré-requisito do Módulo 2.</p>
+  <div class="la-callout tip"><b class="t">Roteiro para a sua primeira corrida</b><p>Comece pequeno e com o crítico do mesmo tamanho do RM. Desligue o dropout, garanta EOS ≠ PAD, normalize o RM com as demonstrações, branqueie as vantagens e ligue o clipping do valor. Use \(\varepsilon = 0{,}2\), poucas épocas (1 a 4), LR na casa de 10⁻⁶ e um \(\beta\) do patamar da tabela da coleira, ou um alvo de KL. Antes de olhar a recompensa, olhe a razão na 1ª época (precisa sair exatamente de 1), a KL até o SFT e o comprimento médio. Se a memória não fechar, troque full FT por LoRA ou abandone o crítico, que é o assunto do próximo capítulo.</p></div>
+  <p>O próximo passo é justamente arrancar a peça mais cara deste capítulo. O <a data-ch="grpo-rlvr">capítulo 56</a> troca o crítico por estatísticas de grupo (GRPO, RLOO), troca o RM por verificadores de matemática e código (RLVR), e enfrenta de frente o descompasso entre treino e inferência que aqui só apareceu de passagem.</p>
+</section>

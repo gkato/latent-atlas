@@ -1,0 +1,86 @@
+{
+ "cabecalho-safetensors": {
+  "t": "Cabeçalho safetensors",
+  "d": "Início de um arquivo <code>.safetensors</code>: 8 bytes com o tamanho N (inteiro de 64 bits little-endian) seguidos de N bytes de JSON com <code>dtype</code>, <code>shape</code> e <code>data_offsets</code> de cada tensor. Dá para lê-lo sem baixar os dados."
+ },
+ "range-request": {
+  "t": "Range request (HTTP)",
+  "d": "Requisição HTTP com o cabeçalho <code>Range: bytes=a-b</code>, que pede só um trecho do arquivo. Usada na triagem para ler cabeçalhos safetensors de shards de ~1 GB sem baixá-los."
+ },
+ "pre-sharding": {
+  "t": "Pré-sharding",
+  "d": "Checkpoint salvo já fatiado para um grau de tensor parallel específico (no MiMo, <code>tp_size: 4</code> no QKV fundido). Rodar com outro TP exige remontar as fatias e, às vezes, requantizar."
+ },
+ "diffkv": {
+  "t": "DiffKV",
+  "d": "Atenção em que K e V têm dimensões de head diferentes (no MiMo, 192 e 128). Os kernels comuns assumem <code>head_size_v == head_size</code>; no vLLM existem backends próprios (<code>TRITON_ATTN_DIFFKV</code>, <code>FLASH_ATTN_DIFFKV</code>)."
+ },
+ "attention-sink": {
+  "t": "Attention sink",
+  "d": "Logit aprendido extra no softmax da atenção, um por head, que dá à atenção um lugar para “descarregar” massa de probabilidade. Estabiliza janelas curtas; no MiMo só as camadas SWA têm sink."
+ },
+ "memoria-unificada": {
+  "t": "Memória unificada (UMA)",
+  "d": "CPU e GPU usam o mesmo pool físico de memória (LPDDR5X no GB10). O SO, o page cache e os processos do host competem com o vLLM pelos mesmos bytes."
+ },
+ "gmu": {
+  "t": "GMU (--gpu-memory-utilization)",
+  "d": "Fração da memória visível ao CUDA que o vLLM pode usar para pesos, ativações, CUDA graphs e KV cache. No GB10 cada 0,01 vale ~1,2 GiB tirados da folga do host; alternativa: fixar o pool com <code>--kv-cache-memory</code>."
+ },
+ "alocador-kv-hibrido": {
+  "t": "Alocador de KV híbrido",
+  "d": "Parte do vLLM que agrupa camadas com o mesmo tipo de KV (global, janela, Mamba, drafter) e dá a cada grupo páginas de mesmo tamanho. Grupos incompletos desperdiçam espaço: no MiMo, 9 camadas globais em grupos de 5 ocupam 10 slots (+11%)."
+ },
+ "kld": {
+  "t": "KLD (divergência KL)",
+  "d": "\\( D_{KL}(P\\|Q)=\\sum_t P(t)\\log\\frac{P(t)}{Q(t)} \\): quanto a distribuição do próximo token do candidato Q se afasta da referência P, em nats. Métrica preferida para comparar quantizações; perplexidade sozinha esconde erros que se cancelam."
+ },
+ "w4a16-w4a8-w4a4": {
+  "t": "W4A16 / W4A8 / W4A4",
+  "d": "Bits dos pesos / bits das ativações dentro do GEMM. Menos bits de ativação dão mais throughput de compute (sobretudo no prefill) e mais erro. No MiMo, Marlin MXFP4 em W4A16 ou W4A8 (<code>VLLM_MARLIN_INPUT_DTYPE=fp8</code>)."
+ },
+ "tensor-parallel": {
+  "t": "Tensor parallel (TP)",
+  "d": "Dividir cada matriz do modelo entre GPUs (colunas ou linhas), com all-reduces para juntar os resultados: dois por camada num bloco Transformer. Exige que heads, KV heads e larguras dividam pelo grau de TP."
+ },
+ "overlay": {
+  "t": "Overlay",
+  "d": "Arquivo <code>.py</code> do pacote instalado substituído por bind-mount (<code>-v arquivo:destino:ro</code>), gerado a partir do arquivo da própria imagem fixada por um patch fail-closed. Corrige o motor sem rebuild da imagem."
+ },
+ "fail-closed": {
+  "t": "Fail-closed",
+  "d": "Propriedade de um patch que, diante de qualquer surpresa (âncora ausente ou duplicada, hash diferente), aborta com erro claro em vez de gerar um arquivo meio modificado. É o oposto de falhar em silêncio."
+ },
+ "paridade-truncada": {
+  "t": "Paridade truncada",
+  "d": "Teste numérico que compara motor e referência (HF) com as mesmas N primeiras camadas do modelo (<code>--hf-overrides '{\"num_hidden_layers\": N}'</code>), via KLD e concordância top-1 das logprobs. Isola erros de kernel e de carregamento sem precisar rodar o modelo inteiro na referência."
+ },
+ "tool-call-storm": {
+  "t": "Tool-call storm",
+  "d": "Falha em que o modelo repete a mesma chamada de ferramenta dezenas ou centenas de vezes. No MiMo apareceu com a decodificação quase gulosa dos defaults do vLLM; <code>--generation-config auto</code> e o checkpoint MOPD a mitigam."
+ },
+ "aceitacao-especulativa": {
+  "t": "Aceitação (spec decode)",
+  "d": "Quantos tokens rascunhados o alvo aceita por passo (e a taxa por posição, que decai com a posição). Lida no <code>/metrics</code> como Δaccepted/Δdrafts; é ela, junto com o custo do passo, que decide o k."
+ },
+ "needle-test": {
+  "t": "Needle-in-a-haystack",
+  "d": "Teste de contexto longo: esconde um fato (a “agulha”) em várias profundidades de um texto longo e pergunta por ele no fim. Pega bugs de máscara e de janela que prompts curtos não revelam."
+ },
+ "teto-de-banda": {
+  "t": "Teto de decode por banda",
+  "d": "Limite superior de tok/s de um stream sem especulação: banda de memória ÷ bytes lidos por passo (experts ativos + tudo o que é denso). No MiMo em TP2, ~273 GB/s ÷ ~6,4 GB ≈ 43 tok/s; na prática, 50–65% disso."
+ },
+ "ab-a": {
+  "t": "A/B/A",
+  "d": "Desenho de experimento: baseline, mudança e baseline de novo, com repetições e mediana por braço. Separa o efeito da mudança da deriva do sistema (page cache, autotune, temperatura); aceita-se só se B supera os dois baselines."
+ },
+ "plugin-out-of-tree": {
+  "t": "Plugin out-of-tree (vLLM)",
+  "d": "Pacote Python com entry point no grupo <code>vllm.general_plugins</code> que registra modelos, métodos de quantização ou ops sem fork do vLLM (<code>ModelRegistry.register_model(\"Arch\", \"pacote.modulo:Classe\")</code>)."
+ },
+ "mopd": {
+  "t": "MOPD (pós-treino do MiMo)",
+  "d": "Etapa de pós-treino que destila, sobre as próprias amostras do aluno (<i>on-policy</i>), vários professores especializados; o card descreve a versão MOPD2 como <i>Multi-Prefix Multi-Teacher On-Policy Distillation</i>. O checkpoint MiMo-V2.6-Flash-MOPD é o RL com essa etapa a mais: mesma arquitetura, mesmo config e mesmo drafter, pesos diferentes."
+ }
+}

@@ -1,0 +1,428 @@
+<p class="la-lead">Seu DPO venceu o modelo base em 58 de 100 perguntas, segundo um juiz LLM. Ele é melhor? Talvez. Com 100 prompts, um <span class="la-term" data-term="win-rate">win rate</span> perto de 50% tem margem de erro de ±9,8 pontos; o juiz pode ter preferido a resposta mais longa, a primeira ou a que soava como ele; e o modelo pode ter esquecido como obedecer a “responda em três tópicos”, ou ficado mais disposto a explicar o que não devia. No <a data-ch="medindo-qualidade">capítulo 25</a> queríamos KL perto de zero. Aqui a pergunta se inverte: <b>queremos que o modelo mude, mas só onde pedimos</b>. O capítulo monta o instrumental para responder com honestidade e termina numa bateria pré-registrada, com portões de decisão, pronta para o laboratório do <a data-ch="receita-pos-treino">capítulo 63</a>.</p>
+
+<section class="la-sec">
+  <h2>Quatro eixos: mudar só onde pedimos</h2>
+  <p>Todo método do Módulo 2 é uma intervenção que move massa de probabilidade (<a data-ch="pos-treino-mapa">capítulo 50</a>). O <a data-ch="sft">SFT</a> puxa o modelo para as demonstrações, o <a data-ch="dpo">DPO</a> empurra a resposta preferida para cima e a rejeitada para baixo, o <a data-ch="grpo-rlvr">GRPO</a> reforça o que o verificador aprovou. Nenhum deles sabe onde parar. Massa que sobe num lugar desce em outro, e a avaliação existe para descobrir onde ela desceu. Por isso um único número nunca basta. Avalie em <b>quatro eixos</b>, sempre contra o modelo de partida:</p>
+  <table>
+    <thead><tr><th>Eixo</th><th>Pergunta</th><th>Instrumento principal</th><th>Direção desejada</th></tr></thead>
+    <tbody>
+      <tr><td><b>Alvo</b></td><td>O comportamento treinado melhorou?</td><td>win rate pareado (juiz LLM ou humano), métricas verificáveis do domínio, loss de validação</td><td>↑</td></tr>
+      <tr><td><b>Regressão</b></td><td>Perdi capacidade geral?</td><td>bateria fixa (IFEval, GSM8K/AIME, código, ferramentas, conhecimento)</td><td>≈ base (Δ dentro do IC)</td></tr>
+      <tr><td><b>Segurança</b></td><td>Recusa demais? Cumpre o que não devia?</td><td>XSTest/OR-Bench (sobre-recusa); StrongREJECT/HarmBench/JailbreakBench (cumprimento indevido)</td><td>conforme a política</td></tr>
+      <tr><td><b>Deriva</b></td><td>Quanto a distribuição mudou, e onde?</td><td>KL(π<sub>ref</sub>‖π<sub>ft</sub>) por posição, teacher-forced em texto fixo genérico e de domínio (régua do cap. 25); comprimento; aceitação do <span class="la-term" data-term="mtp">MTP</span></td><td>↑ no domínio, ≈ 0 fora dele</td></tr>
+    </tbody>
+  </table>
+  <p>O <b>alvo</b> mede o que você treinou (o tutor técnico em PT-BR responde melhor que o base?). A <b>regressão</b> mede o efeito colateral, o <span class="la-term" data-term="imposto-de-alinhamento">imposto do alinhamento</span>: o modelo aprendeu o estilo dos dados e desaprendeu outra coisa. A <b>segurança</b> tem dois lados: recusar pedidos inofensivos ou cumprir pedidos nocivos. A <b>deriva</b> é o eixo numérico, em nats por token, com a régua do capítulo 25: <span class="la-term" data-term="kld">KLD</span>(base‖candidato) com <span class="la-term" data-term="teacher-forcing">teacher forcing</span> em texto fixo (a seção 9 explica por que não é o <code>kl</code> que o trainer registra). Queremos deriva grande no domínio, que é o efeito pretendido, e quase nula em texto genérico.</p>
+  <p>Quatro princípios valem para todos os eixos:</p>
+  <ol class="la-steps">
+    <li><b>Compare pares de modelos nas mesmas condições.</b> Mesmo template de chat, mesmo <code>enable_thinking</code>, mesmos parâmetros de amostragem, mesmo <code>max_tokens</code>, mesmo servidor. Diferença de template é a causa nº 1 de “regressões” falsas.</li>
+    <li><b>Pré-registre antes de rodar</b> (o <span class="la-term" data-term="protocolo-congelado">protocolo congelado</span> do capítulo 25): conjunto de avaliação, métricas, limites de aceitação e número de amostras. Sem isso você escolhe o checkpoint “que ficou melhor no último benchmark que olhei”, a armadilha da seção 4.</li>
+    <li><b>Intervalo de confiança em tudo.</b> Com 400 pares, um win rate de 50% tem IC95% de ≈ ±4,9 pontos. Diferenças menores que isso são ruído.</li>
+    <li><b>Meça o ruído de base.</b> Rode o próprio base duas vezes (sementes ou lotes diferentes) e calcule a métrica entre as execuções: é o <span class="la-term" data-term="nulo-stock">nulo stock-vs-stock</span> da KLD na receita GLM (“near-tie tokens flip between identical runs”). Efeito menor que esse ruído não existe.</li>
+  </ol>
+  <figure class="la-fig" id="fig-eixos" data-title="O painel dos quatro eixos">
+    <div class="la-fig-stage" style="height:400px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Cinco candidatos <b>ilustrativos</b> passam pelos mesmos portões pré-registrados. Em cada eixo, a faixa verde é a região aprovada, o losango é a estimativa e o bigode é o IC95%. No alvo, o círculo vazado é o win rate <i>bruto</i>, sem controle de comprimento. Na deriva, as barras estão em escala log (nats/token). Os portões são os do laboratório (seção 9); os números de cada candidato são inventados para mostrar padrões típicos de falha.</figcaption>
+  </figure>
+  <p>Passe pelos cinco candidatos. O <b>DPO verborrágico</b> tem o maior win rate bruto de todos e é reprovado no alvo: quase toda a vantagem vinha do comprimento. O <b>SFT que esqueceu</b> é ótimo no domínio e perde 7 pontos de IFEval. O de <b>segurança corroída</b> foi treinado só com dados benignos e mesmo assim passou a cumprir pedidos nocivos. O <b>RL com recompensa burlada</b> passa raspando na regressão e só aparece de verdade nos eixos de alvo e de deriva. Em todos eles, um único número contaria a história errada.</p>
+  <div class="la-callout analogy"><b class="t">Analogia: o check-up depois da cirurgia</b><p>Você operou o joelho. Ver se ele dobra é o eixo do alvo. Mas o médico também mede a pressão (regressão), testa reflexos (segurança) e confere se a anestesia mexeu no que não devia (deriva), sempre contra os seus exames de antes, feitos no mesmo laboratório. Um exame de outra máquina produz “alterações” que são só diferença de equipamento: é o template de chat diferente.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Win rate: o placar de duelos e a sua margem de erro</h2>
+  <p>A medida mais direta do eixo do alvo é o <span class="la-term" data-term="julgamento-pareado">julgamento pareado</span>. Para cada prompt \(x\) do conjunto de avaliação, gere uma resposta do candidato \(A\) e uma do baseline \(B\). Um juiz, humano ou LLM, devolve \(A \succ B\), \(B \succ A\) ou empate. O win rate é a fração de duelos vencidos, com empate valendo meio ponto:</p>
+  <div class="la-eq">
+    \[ \mathrm{WR}(A\,|\,B) = \frac{W + \tfrac12 T}{W + L + T} \]
+    <ul class="la-eq-legend">
+      <li>\(W\): prompts em que o juiz preferiu \(A\)</li>
+      <li>\(L\): prompts em que preferiu \(B\)</li>
+      <li>\(T\): empates (meio ponto para cada lado, convenção do AlpacaEval e do Arena-Hard)</li>
+      <li>reporte também \(W/L/T\) separados: 50% com 0 empates e 50% com 80% de empates são histórias diferentes</li>
+    </ul>
+  </div>
+  <p>Por que pareado? Porque o mesmo prompt vai para os dois modelos. A dificuldade do prompt, que é a maior fonte de variação numa avaliação, afeta os dois lados igualmente e se cancela no duelo. É a mesma lógica do A/B/A do <a data-ch="benchmarking">capítulo 45</a>: compare o que mudou mantendo todo o resto fixo.</p>
+  <h3>Quantos prompts?</h3>
+  <p>Cada prompt é uma moeda viciada com probabilidade \(p\) de dar “A vence”. Pela aproximação normal, o <span class="la-term" data-term="erro-padrao">erro-padrão</span> do win rate e o número de prompts para uma meia-largura \(E\) são:</p>
+  <div class="la-eq">
+    \[ \mathrm{EP}(\widehat{\mathrm{WR}}) \approx \sqrt{\frac{p(1-p)}{n}}, \qquad \mathrm{IC}_{95\%} \approx \widehat{\mathrm{WR}} \pm 1{,}96\,\mathrm{EP}, \qquad n \approx \frac{z^2\,p(1-p)}{E^2} \]
+    <ul class="la-eq-legend">
+      <li>\(p\): win rate verdadeiro (o pior caso é \(p = 0{,}5\))</li>
+      <li>\(n\): número de prompts (pares julgados)</li>
+      <li>\(z = 1{,}96\): quantil da normal para 95%</li>
+      <li>\(E\): meia-largura desejada do intervalo</li>
+    </ul>
+  </div>
+  <p>Em \(p = 0{,}5\): com \(n = 100\), o IC95% é ±9,8 pontos; com 400, ±4,9; com 1.000, ±3,1. Para \(E = 5\) pontos, \(n \approx 1{,}96^2 \times 0{,}25 / 0{,}05^2 \approx 384\). Para separar 55% de 50% com folga, você precisa de uns <b>400 a 800 prompts</b>. Os empates reduzem um pouco a variância, então essas contas são conservadoras.</p>
+  <h3>Bootstrap: o intervalo sem fórmula</h3>
+  <p>Para o win rate controlado por comprimento, a diferença entre dois candidatos ou escores de Bradley–Terry não há fórmula fechada confortável. O <span class="la-term" data-term="bootstrap-ic">bootstrap</span> resolve todos com o mesmo truque: trate a sua amostra de prompts como a população e reamostre dela.</p>
+  <ol class="la-steps">
+    <li><b>Resultados por prompt.</b> Você tem \(n\) valores \(y_i \in \{0, \tfrac12, 1\}\).</li>
+    <li><b>Reamostre.</b> Sorteie \(n\) índices <i>com reposição</i>. Alguns prompts aparecem duas ou três vezes, outros nenhuma (em média, uma fração \(\approx 1/e \approx 37\%\) fica de fora).</li>
+    <li><b>Recalcule</b> a estatística (WR, WR-LC, diferença…) nessa amostra falsa.</li>
+    <li><b>Repita</b> \(B = 2.000\) vezes e pegue os percentis 2,5% e 97,5% das réplicas: \(\mathrm{IC}_{95\%} = [\,Q_{0{,}025},\ Q_{0{,}975}\,]\).</li>
+    <li><b>Para comparar dois candidatos</b> avaliados nos mesmos prompts, reamostre <b>pares</b>: o mesmo índice sorteado vale para os dois.</li>
+  </ol>
+  <figure class="la-fig" id="fig-bootstrap" data-title="Bootstrap ao vivo">
+    <div class="la-fig-stage" style="height:420px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Na grade, os \(n\) prompts: vitória (menta), empate (âmbar), derrota (rosa). A cada réplica, os prompts sorteados acendem; os apagados ficaram de fora, e o pontinho no centro marca os sorteados mais de uma vez. No outro painel, o histograma das réplicas do WR cresce até 2.000; a faixa âmbar é o IC95% por percentis, o colchete lavanda é a aproximação normal e a linha rosa marca 50%. Dados simulados a partir do “WR verdadeiro” escolhido.</figcaption>
+  </figure>
+  <p>Brinque com \(n = 100\) e WR verdadeiro de 56%. Clique várias vezes em “novo experimento”: o WR observado pula entre ~47% e ~65%, e o intervalo cruza 50% na maioria das vezes. Agora suba para 800 prompts. O histograma afina e o intervalo descola de 50%. O efeito era o mesmo. Faltava amostra para enxergá-lo.</p>
+  <p>Quando não há empates, o <span class="la-term" data-term="intervalo-de-wilson">intervalo de Wilson</span> é uma alternativa analítica melhor que a normal para \(n\) pequeno ou \(p\) perto de 0 ou 1:</p>
+  <div class="la-eq">
+    \[ \mathrm{IC}_{\text{Wilson}} = \frac{\hat p + \frac{z^2}{2n} \pm z\sqrt{\frac{\hat p(1-\hat p)}{n} + \frac{z^2}{4n^2}}}{1 + \frac{z^2}{n}} \]
+    <ul class="la-eq-legend">
+      <li>\(\hat p\): fração observada de vitórias</li>
+      <li>\(z = 1{,}96\); os termos com \(z^2\) puxam o centro para 0,5 e evitam intervalos impossíveis (abaixo de 0 ou acima de 1)</li>
+    </ul>
+  </div>
+  <div class="la-callout deep"><b class="t">Aprofundamento: por que reamostrar prompts, e não veredictos?</b><p>A unidade de acaso é o <i>prompt</i>. As duas chamadas do juiz para o mesmo prompt (seção 3) não são independentes, nem várias respostas do mesmo prompt com sementes diferentes. Reamostre prompts, levando junto tudo o que pertence a cada um (bootstrap por <i>cluster</i>). Reamostrar veredictos soltos finge mais informação do que há e encolhe o intervalo artificialmente.</p></div>
+  <div class="la-callout tip"><b class="t">No laboratório</b><p>O teste de domínio recomendado tem <b>300 a 500 perguntas</b> sobre termos que nunca apareceram no treino, o que dá um IC de ±4 a ±6 pontos no win rate. Separe treino e teste <b>por termo</b>, não por linha. Se o mesmo conceito aparecer nos dois lados, o teste mede memorização.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>O juiz também é um modelo: LLM-as-judge e seus vieses</h2>
+  <p>Julgar 800 pares à mão custa caro. A alternativa é o <span class="la-term" data-term="llm-as-judge">LLM-as-judge</span>: um modelo forte lê a pergunta e as duas respostas e escolhe uma. O trabalho fundador (Zheng e colegas, NeurIPS 2023) mostrou que juízes fortes como o GPT-4 atingem <b>mais de 80% de concordância</b> com preferências humanas, o mesmo nível de concordância que humanos têm entre si. E catalogou os vieses que vêm junto: o juiz é um modelo de linguagem condicionado a um texto, e tudo no texto, inclusive a ordem e o tamanho das respostas, entra na conta.</p>
+  <table>
+    <thead><tr><th>Viés</th><th>Evidência</th><th>Mitigação</th></tr></thead>
+    <tbody>
+      <tr><td><span class="la-term" data-term="vies-de-posicao"><b>Posição</b></span></td><td>Wang e colegas (2023): com o ChatGPT como juiz, só reordenando as respostas, o Vicuna-13B “venceu” o ChatGPT em 66 de 80 perguntas</td><td>julgar nas duas ordens; pedir evidências antes da nota; mandar casos ambíguos para humanos</td></tr>
+      <tr><td><span class="la-term" data-term="vies-de-verbosidade"><b>Verbosidade e estilo</b></span></td><td>juízes e humanos premiam respostas longas e formatadas; o LMArena concluiu que o comprimento é o fator de estilo dominante</td><td>controle de comprimento por regressão (seção 5); rubrica que penaliza enchimento</td></tr>
+      <tr><td><span class="la-term" data-term="autopreferencia"><b>Autopreferência</b></span></td><td>Panickssery, Bowman e Feng (2024): o avaliador dá nota maior às próprias respostas, que humanos consideram equivalentes; a força do viés cresce linearmente com a capacidade de o modelo se reconhecer</td><td>juiz de família diferente; painel de famílias disjuntas</td></tr>
+      <tr><td><b>Raciocínio limitado</b></td><td>o juiz erra em itens de matemática e código que ele mesmo não resolve</td><td>juiz com resposta de referência no prompt, ou checagem por regra</td></tr>
+    </tbody>
+  </table>
+  <p>Por que a ordem importa? Uma interpretação: o veredito é um token condicionado a um texto em que uma resposta vem antes da outra, e pequenas assimetrias de leitura viram um empurrão sistemático para um lado, que não depende da qualidade e por isso se cancela nas duas ordens.</p>
+  <p>A regra prática é simples. Faça duas chamadas por par, \((A, B)\) e \((B, A)\). Se o juiz escolher o mesmo <i>modelo</i> nas duas, o veredito vale. Se escolher a mesma <i>posição</i> nas duas, isto é, se mudar de ideia quando as respostas trocam de lugar, conte <b>empate</b>. É o que faz o script de julgamento do laboratório, com uma rubrica explícita e um pedido de justificativa curta antes do veredito:</p>
+  <pre data-lang="python"><code>RUBRIC = ("Compare as respostas A e B à pergunta. Critérios, em ordem: (1) correção técnica, "
+          "(2) responde exatamente o que foi perguntado, (3) números/unidades corretos, (4) concisão. "
+          "Ignore o comprimento e a formatação. Explique em até 3 frases e termine com 'VEREDITO: A', "
+          "'VEREDITO: B' ou 'VEREDITO: EMPATE'.")
+
+def compare(q, a, b):            # +1 a vence, -1 b vence, 0 empate/inconsistente
+    v1, v2 = verdict(q, a, b), verdict(q, b, a)
+    if v1 == "A" and v2 == "B": return 1
+    if v1 == "B" and v2 == "A": return -1
+    return 0</code></pre>
+  <h3>Um painel de juízes de famílias diferentes</h3>
+  <p>Um juiz grande é caro e carrega os vieses da sua família. O <span class="la-term" data-term="painel-de-juizes">painel de juízes</span> PoLL (Verga e colegas, 2024) troca o juiz único por vários modelos menores de <b>famílias disjuntas</b>, com voto majoritário. Em 3 configurações e 6 conjuntos de dados, o painel teve menos viés intramodelo e custou mais de sete vezes menos que um juiz grande. Os vieses de famílias diferentes não apontam todos para o mesmo lado e, na votação, tendem a se diluir.</p>
+  <p>O Módulo 1 já entrega um painel desses de graça: as três receitas servem, nos mesmos dois DGX Spark (API OpenAI na porta 8888), três famílias distintas: <code>GLM-5.3-Flash-EXL3</code> <span class="la-rb glm"></span>, <code>qwen3.8-flash-next</code> <span class="la-rb qwen"></span> e <code>deepseek-v4-flash-vision-exp</code> <span class="la-rb ds"></span>. A regra de exclusão: tire do painel a família do <b>professor</b> que gerou os dados de treino, porque o aluno aprendeu a soar como ele, e a do <b>aluno</b>.</p>
+  <div class="la-inrecipe" data-recipe="ds"><div class="la-inrecipe-h"><span class="la-rb ds"></span><span class="k">Juiz isento do laboratório</span><code>JUDGE = "deepseek-v4-flash-vision-exp"</code></div><div class="la-inrecipe-b"><p>No laboratório do capítulo 63, o professor é o GLM e o aluno é o Qwen3.8-27B, parente do Qwen3.8-Flash-Next. Das três receitas, a única família isenta é a do <b>DeepSeek</b>. Se quiser um painel, use GLM e Qwen-Flash-Next como juízes secundários e reporte a concordância deles com o DeepSeek separadamente. Se o juiz “prefere” sempre o modelo ajustado, desconfie primeiro de autopreferência ou de viés de posição.</p></div></div>
+  <figure class="la-fig" id="fig-juiz" data-title="O tribunal dos juízes">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Cada rodada julga um par (candidato × base). Os cartões trocam de lugar quando o modo usa duas ordens; os balões mostram a <i>posição</i> escolhida em cada ordem (lavanda = era o candidato). No painel do placar, o acumulado (até 400 pares) contra o WR verdadeiro (linha menta) e o WR esperado com estes vieses (losango vazado). O modelo de viés é <b>ilustrativo</b>: o juiz escolhe o <i>candidato</i> com probabilidade \(\sigma(\Delta q + b_{\text{comp}} + b_{\text{auto}} \pm b_{\text{pos}})\), com + quando o candidato está na posição A e − quando está na B.</figcaption>
+  </figure>
+  <p>Comece com qualidade igual (WR verdadeiro 50%) e viés de posição 1,0. Com uma ordem só, o candidato aparece sempre primeiro e “vence” ~73% dos duelos: puro artefato. Com duas ordens, o empurrão aparece nos dois sentidos e vira empate, e o placar volta a 50%. A conta é exata: com \(+b\) a favor da primeira posição, o candidato vence com \(\sigma(\Delta q + b)\) quando vem primeiro e \(\sigma(\Delta q - b)\) quando vem depois, e o valor esperado nas duas ordens, \(\tfrac12[\sigma(\Delta q+b) + \sigma(\Delta q-b)]\), dá exatamente 0,5 quando \(\Delta q = 0\). Agora deixe o candidato 100% mais longo. A troca de posição <b>não</b> resolve, porque o viés de verbosidade empurra para o mesmo modelo nas duas ordens. Ligue também o juiz da família do professor. O painel dilui a autopreferência, porque apenas um dos três juízes está enviesado (no exemplo, de ~67% para ~62%, contra 50% reais), mas não a zera: por isso a regra do laboratório é <b>excluir</b> a família do professor, não diluí-la. Quando o juiz vira fonte de recompensa (RLAIF, <a data-ch="constitutional-ai">cap. 60</a>; Self-Rewarding, <a data-ch="self-play-debate">cap. 61</a>), estes vieses deixam de só distorcer a medida e passam a ser otimizados.</p>
+  <h3>Calibre o juiz com humanos</h3>
+  <p>Antes de confiar no juiz para uma tarefa nova, mande ~10% dos pares também para um humano e calcule o <span class="la-term" data-term="kappa-de-cohen">κ de Cohen</span>, a concordância descontada do acaso:</p>
+  <div class="la-eq">
+    \[ \kappa = \frac{p_o - p_e}{1 - p_e} \]
+    <ul class="la-eq-legend">
+      <li>\(p_o\): fração de pares em que juiz e humano concordam</li>
+      <li>\(p_e\): concordância esperada por acaso, dadas as frequências de cada rótulo nos dois avaliadores</li>
+      <li>\(\kappa = 1\): concordância perfeita; \(\kappa = 0\): nada além do acaso</li>
+    </ul>
+  </div>
+  <p>Se \(\kappa\) ficar abaixo de ~0,4, o juiz não serve para essa tarefa. Esse limiar é uma convenção usual de “concordância moderada”, uma recomendação e não um número de fonte. Para matemática e código, prefira juiz com resposta de referência no prompt ou, melhor ainda, verificação por regra (seção 6).</p>
+</section>
+
+<section class="la-sec">
+  <h2>Do duelo ao ranking: Bradley–Terry, Elo e a ilusão do leaderboard</h2>
+  <p>O win rate compara dois modelos. Num projeto real você tem vários checkpoints: o base, o SFT, dois DPOs com \(\beta\) diferentes, a versão quantizada. Julgue pares cruzados e ajuste o modelo de <span class="la-term" data-term="bradley-terry">Bradley–Terry</span>, o mesmo que treina o reward model do <a data-ch="preferencias-reward-models">capítulo 53</a>. Lá ele dava um escore a cada <i>resposta</i>. Aqui dá um escore a cada <i>modelo</i>:</p>
+  <div class="la-eq">
+    \[ P(i \succ j) = \sigma(s_i - s_j), \qquad \ell(s) = \sum_{\text{duelos}} \Big[\, y\log\sigma(s_a-s_b) + (1-y)\log\sigma(s_b-s_a) \Big], \qquad R_i = C + \frac{400}{\ln 10}\,s_i \]
+    <ul class="la-eq-legend">
+      <li>\(s_i\): força latente do modelo \(i\); só diferenças importam, então fixe \(s_{\text{base}} = 0\); a letra é \(s\), e não \(\beta\), porque \(\beta\) já é a força da âncora KL do DPO (seção 9)</li>
+      <li>\(\sigma\): sigmoide logística</li>
+      <li>\(y\): 1 se \(a\) venceu o duelo, 0 se perdeu, ½ no empate (ou use o modelo de Davidson para empates)</li>
+      <li>\(\ell\): log-verossimilhança, maximizada sobre <i>todos</i> os duelos de uma vez</li>
+      <li>\(R_i\): escala tipo Elo; \(400/\ln 10 \approx 173{,}7\), então 400 pontos de diferença = chances de 10 para 1; o script do laboratório usa \(C = 1000\) para o base</li>
+    </ul>
+  </div>
+  <p>O <span class="la-term" data-term="elo">Elo</span> clássico do xadrez faz outra coisa: atualiza os escores <i>online</i>, duelo a duelo, com \(R_a \leftarrow R_a + K(S - E_a)\) e \(E_a = 1/(1 + 10^{(R_b-R_a)/400})\). O resultado depende da <b>ordem</b> dos duelos e do fator \(K\), e os duelos recentes pesam mais. Faz sentido para jogadores que mudam com o tempo, não para checkpoints congelados. Por isso o <span class="la-term" data-term="chatbot-arena">Chatbot Arena</span> (hoje LMArena) usa Bradley–Terry por máxima verossimilhança sobre todas as batalhas e só <i>reporta</i> o resultado numa escala tipo Elo.</p>
+  <figure class="la-fig" id="fig-bt" data-title="Elo online × Bradley–Terry">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Cinco checkpoints <b>ilustrativos</b> duelam 800 vezes; o resultado de cada duelo é sorteado de forças verdadeiras fixas. A matriz mostra a fração de vitórias da linha sobre a coluna. As linhas finas mostram o Elo online ao longo das batalhas (só em telas largas). No painel de baixo, o losango é o Bradley–Terry (base = 1000) e o círculo vazado é o Elo online, deslocado para ter a mesma média; os traços cinza marcam as forças verdadeiras. Depois de cada rodada completa, a figura reapresenta <i>as mesmas</i> 800 batalhas em outra ordem (ou clique em “embaralhar a ordem”): o BT termina idêntico, o Elo online não (os × são os Elos finais das ordens anteriores).</figcaption>
+  </figure>
+  <p>Deixe a figura embaralhar algumas vezes, ou clique você mesmo, e suba o \(K\). Os × se espalham: o Elo online do mesmo checkpoint, com as mesmas batalhas, muda dezenas de pontos conforme a ordem. O losango do BT não se mexe, porque a verossimilhança é uma soma sobre duelos e soma não depende da ordem.</p>
+  <h3>Como a arena pública evoluiu</h3>
+  <p>O paper de 2024 do Chatbot Arena relatava mais de 240 mil votos humanos em batalhas anônimas. Três mudanças posteriores importam para o laboratório:</p>
+  <dl class="la-kv">
+    <dt>16/05/2025</dt><dd>O <span class="la-term" data-term="controle-de-estilo">controle de estilo</span> (regressão BT com covariáveis de estilo, introduzida em ago/2024) vira padrão nas arenas de texto e visão. Fonte secundária: resultados de busca.</dd>
+    <dt>23/07/2025</dt><dd>Os ICs deixam o bootstrap e passam a usar o teorema central do limite para M-estimadores.</dd>
+    <dt>18/12/2025</dt><dd>A metodologia vira o pacote aberto <code>arena-rank</code> (Apache-2.0): Bradley–Terry com covariáveis e IC em forma fechada. Dá para usar no laboratório.</dd>
+  </dl>
+  <p>O controle de estilo é uma regressão logística com covariáveis: \(\operatorname{logit} P(i \succ j) = s_i - s_j + \gamma^\top(f_i - f_j)\), em que \(f\) reúne comprimento normalizado, número de cabeçalhos, listas e negritos. O ranking publica os \(s\) com \(\gamma\) ajustado, ou seja, responde “quem venceria se os dois escrevessem com o mesmo estilo?”. Guarde essa ideia, porque ela volta na seção 5.</p>
+  <h3>A ilusão do leaderboard</h3>
+  <p>“The Leaderboard Illusion” (Singh e colegas, 2025) documentou que alguns provedores testam em privado muitas variantes antes de um lançamento (≈ <b>27 variantes da Meta</b> antes do Llama-4) e publicam só a melhor, além de uma assimetria de dados (Google ≈ 19,2% e OpenAI ≈ 20,4% dos dados do Arena, contra ≈ 29,7% somando 83 modelos de pesos abertos).</p>
+  <p>O mecanismo estatístico da primeira crítica é a <span class="la-term" data-term="maldicao-do-vencedor">maldição do vencedor</span>. Toda medida tem ruído. Se você mede 27 variantes igualmente boas e publica a de maior nota, publica a que teve mais sorte. O esperado do máximo de \(N\) normais independentes cresce com \(N\), e esse “ganho” é puro ruído selecionado.</p>
+  <figure class="la-fig" id="fig-loteria" data-title="A loteria das variantes">
+    <div class="la-fig-stage" style="height:400px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Todas as \(N\) variantes têm <b>a mesma</b> habilidade verdadeira (linha tracejada). Cada uma é medida com ruído de desvio \(\sigma \approx 173{,}7 \times 2/\sqrt{n_{\text{votos}}}\) pontos (aproximação do erro de um escore BT perto de 50% de vitórias). A campeã ganha a coroa e vai para o placar público. No modo “re-medir”, ela é avaliada de novo com votos frescos e a sorte some. O histograma acumula os valores publicados ao longo dos ciclos. Simulação <b>ilustrativa</b>.</figcaption>
+  </figure>
+  <p>Com 27 variantes e 1.000 votos cada, o campeão publicado fica, em média, ~22 pontos acima da verdade sem ter melhorado nada (\(\sigma \approx 11\) pontos vezes \(\mathbb{E}[\max] \approx 2{,}0\) para 27 normais). A lição vale para o seu laboratório: testar 20 checkpoints contra os mesmos 200 prompts e reportar o melhor é exatamente esse mecanismo. Separe um <span class="la-term" data-term="conjunto-de-selecao">conjunto de seleção</span>, onde você escolhe hiperparâmetros e checkpoints, de um <b>conjunto de relatório</b>, que você só olha uma vez, no fim.</p>
+</section>
+
+<section class="la-sec">
+  <h2>Comprimento e estilo: AlpacaEval-LC, Arena-Hard e MT-Bench</h2>
+  <p>Respostas longas e bem formatadas parecem mais completas, e juízes, humanos e LLMs, caem nisso. O viés existe também no lado do treino: Singhal e colegas (2023) decompuseram o ganho de recompensa do PPO e acharam que, em dois dos cenários estudados, <b>70 a 90%</b> da melhoria vinha só do comprimento (<a data-ch="ppo-rlhf">capítulo 55</a>). O DPO também explora a verbosidade, e é por isso que existem o LN-DPO e o SimPO (<a data-ch="ipo-kto-simpo">capítulo 58</a>). Na avaliação, o antídoto é estatístico: estimar quanto do placar vem do comprimento e descontar.</p>
+  <h3>AlpacaEval 2 e o win rate controlado por comprimento</h3>
+  <p>O <span class="la-term" data-term="alpacaeval">AlpacaEval 2</span> tem 805 instruções e o baseline padrão <code>gpt4_turbo</code>; custa menos de US$ 10 e roda em menos de 3 minutos. A versão controlada por comprimento, o <span class="la-term" data-term="wr-lc">WR-LC</span>, ajusta um modelo linear generalizado (logístico) que prevê a preferência do anotador a partir da identidade do modelo, da diferença de comprimento e da dificuldade da instrução. O WR-LC é a previsão desse modelo <b>com a diferença de comprimento zerada</b>, média sobre as instruções. Com isso, a correlação de Spearman com o Chatbot Arena subiu de 0,94 para 0,98. A versão simplificada do laboratório, com o seu juiz e o seu conjunto de domínio:</p>
+  <div class="la-eq">
+    \[ \operatorname{logit} P(y = 1 \mid x) = \theta + \varphi\,\tanh\!\Big(\frac{\Delta\ell(x)}{\sigma_{\Delta\ell}}\Big), \qquad \Delta\ell = \ell_{\text{cand}} - \ell_{\text{base}}, \qquad \mathrm{WR}_{\text{LC}} = 100\cdot\sigma(\theta) \]
+    <ul class="la-eq-legend">
+      <li>\(y\): veredito do par (1 = candidato vence; empate entra como rótulo suave 0,5)</li>
+      <li>\(\Delta\ell\): diferença de comprimento em tokens entre as duas respostas</li>
+      <li>\(\sigma_{\Delta\ell}\): desvio-padrão de \(\Delta\ell\) no conjunto; a \(\tanh\) limita o efeito de respostas gigantes</li>
+      <li>\(\varphi\): quanto o juiz premia comprimento (0 = nada)</li>
+      <li>\(\theta\): vantagem do candidato <i>a comprimento igual</i>; \(\sigma(\theta)\) é o contrafactual \(\Delta\ell = 0\)</li>
+      <li>o paper do AlpacaEval-LC acrescenta um termo de dificuldade por instrução, \((\psi_m - \psi_b)\gamma_x\)</li>
+    </ul>
+  </div>
+  <figure class="la-fig" id="fig-lc" data-title="Descontando a verborragia">
+    <div class="la-fig-stage" style="height:420px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Cada ponto é um par: no eixo x, quantos tokens o candidato escreveu a mais que o base; em cima, vitórias do candidato; embaixo, derrotas. A curva é a regressão logística sendo ajustada por Newton, uma iteração por vez. O ponto brilhante em \(\Delta\ell = 0\) é o WR-LC; a linha tracejada rosa é o WR bruto. Dados <b>ilustrativos</b>, gerados com o viés de verbosidade escolhido.</figcaption>
+  </figure>
+  <p>Deixe a qualidade real em 50%, o candidato escrevendo 200 tokens a mais e o viés de verbosidade em 1,2. O WR bruto passa de 60%, mas o WR-LC fica perto de 50%: o candidato não é melhor, é mais comprido. Zere o viés e os dois números coincidem. A regressão separa as duas coisas porque usa a <i>variação</i> de \(\Delta\ell\) entre os pares: os pares em que o candidato escreveu pouco mostram como o juiz decide sem o empurrão do comprimento. Mas ela supõe que o comprimento, por si só, não é qualidade. Se no seu domínio respostas mais longas são de fato mais completas, o WR-LC desconta mérito real. E se quase todos os pares têm o mesmo \(\Delta\ell\), \(\theta\) e \(\varphi\) ficam confundidos (o IC por bootstrap explode). Leia os dois números juntos e releia amostras.</p>
+  <div class="la-callout math"><b class="t">Como a curva se ajusta</b><p>Com \(p_i = \sigma(\theta + \varphi x_i)\) e \(x_i = \tanh(\Delta\ell_i/\sigma_{\Delta\ell})\), o ajuste maximiza a log-verossimilhança \(\ell(\theta,\varphi) = \sum_i \big[y_i \log p_i + (1-y_i)\log(1-p_i)\big]\), que é côncava: tem um único máximo. O gradiente é \(g = \sum_i (y_i - p_i)\,(1, x_i)\) e a hessiana é \(H = -\sum_i p_i(1-p_i)\,(1, x_i)(1, x_i)^\top\). O passo de Newton, \(w \leftarrow w - H^{-1} g\) com \(w = (\theta, \varphi)\), aproxima \(\ell\) por uma parábola e salta para o topo dela. É o IRLS (mínimos quadrados reponderados) dos GLMs e converge em ~5 iterações; a figura anima uma por vez. O rótulo suave \(y = 0{,}5\) do empate funciona porque a entropia cruzada é linear em \(y\): o empate vale meia vitória mais meia derrota. É a mesma verossimilhança do Bradley–Terry do <a data-ch="preferencias-reward-models">capítulo 53</a>, com uma covariável a mais.</p></div>
+  <p>Os próprios autores avisam que o viés de comprimento diminui mas não some e que decisões de alto risco exigem humanos. Como o AlpacaEval oficial depende de um anotador pago (GPT-4 Turbo), o laboratório reusa a ideia com o juiz local:</p>
+  <pre data-lang="python"><code># wr_lc.py — WR com IC por bootstrap e WR controlado por comprimento
+import json, sys, numpy as np
+from scipy.optimize import minimize
+rows = [json.loads(l) for l in open(sys.argv[1])]   # JSONL do juiz: {"y": 1|0|0.5, "len_c": …, "len_b": …}
+y = np.array([r["y"] for r in rows]); d = np.array([r["len_c"] - r["len_b"] for r in rows], float)
+rng = np.random.default_rng(0)
+boot = [y[rng.integers(0, len(y), len(y))].mean() for _ in range(2000)]
+print(f"WR = {100*y.mean():.1f}%  IC95% [{100*np.percentile(boot,2.5):.1f}, {100*np.percentile(boot,97.5):.1f}]")
+x = np.tanh(d / (d.std() + 1e-9))
+def nll(w):                                     # y fracionário (0, 0.5, 1) = entropia cruzada com rótulo suave
+    z = w[0] + w[1] * x; p = 1 / (1 + np.exp(-z))
+    return -np.sum(y * np.log(p + 1e-12) + (1 - y) * np.log(1 - p + 1e-12))
+w = minimize(nll, np.zeros(2)).x
+print(f"WR-LC = {100/(1+np.exp(-w[0])):.1f}%  (coef. de comprimento φ = {w[1]:.3f})")</code></pre>
+  <h3>Arena-Hard-Auto e MT-Bench</h3>
+  <p>O <span class="la-term" data-term="arena-hard">Arena-Hard-Auto</span> v0.1 reuniu 500 prompts difíceis destilados do Chatbot Arena (pipeline BenchBuilder), com separação entre modelos 3× maior que a do MT-Bench, 98,6% de correlação com rankings humanos e custo de US$ 20. A v2.0 tem 750 prompts (500 consultas reais novas + 250 de escrita criativa), juiz oficial Gemini-2.5 (ou GPT-4.1, ou um ensemble) e controle de estilo em <code>show_result.py --control-features</code>; o pipeline aceita servidores compatíveis com a API OpenAI, como o vLLM. Com um juiz local, ele dá um número “fora do domínio” para pegar regressão de qualidade conversacional, que não se compara ao leaderboard, porque o juiz é outro.</p>
+  <p>O <span class="la-term" data-term="mt-bench">MT-Bench</span> tem 80 perguntas de <b>dois turnos</b> em 8 categorias, com nota de 1 a 10 dada por um juiz forte. Está saturado e é sensível ao juiz, mas ainda pega regressão de <b>multi-turno</b>: o SFT que quebrou o segundo turno porque todos os dados tinham um turno só.</p>
+</section>
+
+<section class="la-sec">
+  <h2>Não quebrar o que funcionava: regressão e benchmarks verificáveis</h2>
+  <p>O imposto do alinhamento tem nome técnico, esquecimento, e tem dosagem. O “LoRA Learns Less and Forgets Less” (2024) mostrou que, em código e matemática, o LoRA fica bem atrás do fine-tuning completo, mas preserva melhor o desempenho fora do domínio (o fine-tuning completo aprende perturbações de posto 10 a 100× maior). O “LoRA Without Regret” (Thinking Machines, set/2025) refinou o quadro: o LoRA iguala o fine-tuning completo quando aplicado a <b>todas</b> as matrizes e com LR ≈ 10× maior (<a data-ch="treino-memoria-lora">capítulo 51</a>). Moral: o quanto você esquece depende de como treinou, e só a bateria fixa mostra.</p>
+  <h3>Instruções: IFEval e IFBench</h3>
+  <p>O <span class="la-term" data-term="ifeval">IFEval</span> tem 25 tipos de instruções verificáveis por código (contagem de palavras, JSON, sem vírgulas…) em ~500 prompts (541 linhas no <code>google/IFEval</code>). Métricas: <code>prompt_level_strict_acc</code>, <code>inst_level_strict_acc</code> e as versões <code>loose</code>; a task <code>ifeval</code> do lm-eval gera até 1.280 tokens, 0-shot. É o detector barato da regressão mais comum: o SFT de domínio ensina o estilo dos dados e o modelo para de obedecer a “responda em 3 tópicos”. O sucessor, IFBench, já aparece em model cards de 2026 (<code>nvidia/Qwen3.8-27B-NVFP4</code>: 80,07 em BF16, 78,93 em NVFP4).</p>
+  <h3>Matemática: GSM8K, MATH e AIME</h3>
+  <p>O <span class="la-term" data-term="gsm8k">GSM8K</span> tem 1.319 problemas de teste (7.473 de treino) e está saturado na fronteira: o capítulo 25 cita o Qwen3.8-Flash-Next com 97,27% (1.283/1.319). Use-o como teste de regressão, com as tasks <code>gsm8k</code> (5-shot), <code>gsm8k_cot_llama</code> (8-shot) ou <code>gsm8k_cot_zeroshot</code>. Os portões da seção 9 usam o GSM8K Platinum, uma versão revisada do teste sem os itens ambíguos ou com gabarito errado (descrição a conferir: a fonte só cita a task <code>gsm8k_platinum_cot_llama</code> do lm-eval). O MATH-500, subconjunto dos 5.000 problemas de teste do MATH, também saturou. O <span class="la-term" data-term="aime">AIME</span> tem 30 problemas por ano; o lm-eval traz <code>aime24</code> e <code>aime25</code> (0-shot, <code>max_gen_toks: 32768</code>), e as provas de 2026 estão em <code>MathArena/aime_2026</code> e <code>MathArena/hmmt_feb_2026</code>. Com 30 itens, cada questão vale 3,3 pontos. Reporte pass@1 <b>médio sobre k amostras</b> na temperatura recomendada pelo modelo, e não um greedy único. E use o mesmo verificador na avaliação e no RL: o <code>accuracy_reward</code> do TRL usa <code>math_verify</code> (parse de LaTeX, <code>\boxed{}</code> com prioridade); com verificadores diferentes, você otimiza uma coisa e mede outra.</p>
+  <h3>Código e agentes</h3>
+  <p>Em código, o HumanEval (164 funções Python com testes) e o HumanEval+ estão saturados e servem só de regressão, com as tasks <code>humaneval_instruct</code> e <code>humaneval_plus</code> do lm-eval (que exigem <code>--confirm_run_unsafe_code</code>). O que ainda separa modelos, LiveCodeBench com janela de datas, <span class="la-term" data-term="swe-bench">SWE-bench</span> Pro e Terminal-Bench, está na tabela da seção 7. Para ferramentas, o <span class="la-term" data-term="bfcl">BFCL</span> V4 (atualizado em 12/04/2026) cobre chamadas não-live, funções enterprise/OSS, multi-turno e busca web agêntica; a nota geral é a média <i>não ponderada</i> das subcategorias. O <span class="la-term" data-term="tau2-bench">τ²-bench</span> (v1.0.1, jul/2026) simula atendimento com um <b>simulador de usuário</b> e ferramentas dos dois lados, nos domínios <code>airline</code>, <code>retail</code>, <code>telecom</code> e <code>banking_knowledge</code>. Se o seu SFT mexeu em tool calling, rode um subconjunto do BFCL e 20 a 50 tarefas <code>retail</code> com <code>--num-trials 4</code>, sempre com o <b>mesmo parser</b> que o vLLM vai usar em produção (<code>--tool-call-parser qwen3_xml</code> nos cards do RedHatAI para o Qwen3.8-27B; o <a data-ch="api-tools-estruturado">capítulo 34</a> explica por que o parser é parte do modelo).</p>
+  <p>Agentes pedem uma métrica diferente. O <span class="la-term" data-term="pass-at-k">pass@k</span> pergunta “funciona alguma vez em k tentativas?”. O <span class="la-term" data-term="pass-hat-k">pass^k</span> pergunta “funciona <i>sempre</i>, nas k tentativas?”, que é a pergunta certa para um agente que vai atender clientes:</p>
+  <div class="la-eq">
+    \[ \text{pass@}k = \mathbb{E}_{\text{problemas}}\!\left[1 - \frac{\binom{n-c}{k}}{\binom{n}{k}}\right], \qquad \text{pass}^k = \mathbb{E}_{\text{tarefas}}\!\left[\frac{\binom{c}{k}}{\binom{n}{k}}\right] \]
+    <ul class="la-eq-legend">
+      <li>\(n\): amostras geradas por problema; \(c\): quantas estão corretas</li>
+      <li>pass@k (Chen e colegas, 2021): estimador não-viesado de “ao menos uma de k acerta”</li>
+      <li>pass^k (Yao e colegas, 2024, τ-bench): “todas as k acertam”; \(\text{pass}^1 = \text{pass@}1\), e pass^k cai com k</li>
+    </ul>
+  </div>
+  <p>Uma tarefa que o agente acerta 80% das vezes, com tentativas independentes, tem pass@4 = \(1 - 0{,}2^4 \approx 0{,}998\) e pass^4 = \(0{,}8^4 \approx 0{,}41\). O mesmo agente “resolve quase tudo” e “falha em mais da metade dos clientes que voltam quatro vezes”.</p>
+  <h3>A bateria fixa e o teste pareado</h3>
+  <p>A bateria de regressão proposta para o laboratório: IFEval completo, GSM8K completo (0-shot CoT), AIME 2025 ou 2026 (k = 4 amostras), HumanEval-instruct, MMLU-Pro (amostra estratificada de ~1.000), subconjunto do BFCL, XSTest e KL em texto genérico. Rode no base e em cada candidato e reporte Δ com IC. Para métricas binárias por item, use o <span class="la-term" data-term="mcnemar">teste de McNemar</span>, que olha só os itens que <i>mudaram</i>:</p>
+  <div class="la-eq">
+    \[ \chi^2 = \frac{\big(|b - c| - 1\big)^2}{b + c} \quad (1 \text{ grau de liberdade}) \]
+    <ul class="la-eq-legend">
+      <li>\(b\): itens certos no base e errados no candidato (o que você <i>perdeu</i>)</li>
+      <li>\(c\): itens errados no base e certos no candidato (o que você <i>ganhou</i>)</li>
+      <li>o \(-1\) é a correção de continuidade; para \(b + c\) pequeno, use o teste binomial exato</li>
+      <li>itens que os dois acertam ou os dois erram não carregam informação sobre a diferença</li>
+    </ul>
+  </div>
+  <figure class="la-fig" id="fig-mcnemar" data-title="McNemar: a regressão escondida na média">
+    <div class="la-fig-stage" style="height:430px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>500 itens <b>ilustrativos</b> de uma bateria de regressão; o base acerta 78%. Cada célula é um item: menta = os dois acertam, cinza = os dois erram, vermelho = acertava e passou a errar (\(b\)), lavanda = errava e passou a acertar (\(c\)). A tabela 2×2 conta os quatro grupos. No painel dos intervalos, o mesmo Δ de acurácia com dois intervalos: tratando as amostras como independentes (largo) e pareando os itens (estreito).</figcaption>
+  </figure>
+  <p>Com \(b = 20\) e \(c = 5\), a acurácia cai de 78% para 75%. Tratando as duas avaliações como amostras independentes, o IC da diferença vai de cerca de −8 a +2 pontos e cruza zero: “inconclusivo”. Pareando, \(\chi^2 = (15-1)^2/25 = 7{,}84\) e \(p \approx 0{,}005\): regressão real. O pareamento ganha porque a maior parte da variância entre itens é dificuldade, e a dificuldade é a mesma para os dois modelos. Ela se cancela, como no win rate pareado.</p>
+  <h3>Rodando a bateria: lm-evaluation-harness apontado para o vLLM</h3>
+  <p>O <span class="la-term" data-term="lm-eval-harness">lm-evaluation-harness</span> (0.4.13) conversa com o mesmo servidor que vai para produção. Para tarefas <b>generativas</b> (IFEval, GSM8K-CoT, AIME, HumanEval-instruct), use o endpoint de chat:</p>
+  <pre data-lang="bash"><code>lm_eval --model local-chat-completions \
+  --model_args model=q38-sft,base_url=http://SPARK_A:8000/v1/chat/completions,num_concurrent=16,max_retries=3,tokenized_requests=False \
+  --apply_chat_template --tasks ifeval,gsm8k_cot_zeroshot,aime25 \
+  --log_samples --output_path results/q38-sft</code></pre>
+  <ul>
+    <li>Tarefas de log-verossimilhança e múltipla escolha (MMLU, ARC…) <b>não</b> funcionam em chat-completions: use <code>--model local-completions</code> (endpoint <code>/v1/completions</code>) com <code>--apply_chat_template</code>.</li>
+    <li>O backend <code>vllm</code> direto aceita adapter: <code>--model vllm --model_args pretrained=Qwen/Qwen3.8-27B,tensor_parallel_size=1,lora_local_path=adapters/q38-sft,max_lora_rank=32,enable_thinking=False</code>. O wrapper liga <code>enable_lora</code> sozinho quando recebe <code>lora_local_path</code>.</li>
+    <li>No Mac, <code>mlx_lm.evaluate</code> é um wrapper do lm-eval, mas <b>não tem</b> <code>--adapter-path</code>: avalie o modelo fundido, ou sirva com <code>mlx_lm.server --adapter-path</code> e use o <code>local-chat-completions</code>.</li>
+    <li>Grave <b>todas</b> as amostras (<code>--log_samples</code>) para relê-las quando um número parecer estranho.</li>
+    <li>Alternativa: <code>inspect-ai</code> 0.3.273 (UK AISI), boa para avaliações agênticas e de segurança com sandbox.</li>
+  </ul>
+</section>
+
+<section class="la-sec">
+  <h2>Benchmarks envelhecem: saturação e contaminação</h2>
+  <p>Todo benchmark nasce difícil, fica popular, satura e às vezes apodrece. Saturar é natural: quando todo modelo competente faz 95%, o teste deixa de separar modelos e passa a servir só para pegar regressão. Apodrecer é pior: é a <span class="la-term" data-term="contaminacao">contaminação</span>, quando os itens do teste vazam para o treino e a nota passa a medir memória. Ela vem de três jeitos:</p>
+  <ol class="la-steps">
+    <li><b>Pré-treino.</b> O benchmark está na web e entrou nos trilhões de tokens do modelo base.</li>
+    <li><b>Você mesmo.</b> Ao gerar dados sintéticos com um professor que viu o benchmark, ou ao raspar a web. Se você pede ao professor “gere problemas de matemática parecidos com estes”, ele pode devolver quase-cópias do GSM8K que memorizou.</li>
+    <li><b>Seleção.</b> Escolher checkpoint ou hiperparâmetro olhando o conjunto de teste. Nenhum item vazou, mas a decisão vazou (a maldição do vencedor da seção 4).</li>
+  </ol>
+  <p>A evidência é concreta. O GSM1k (Zhang e colegas, 2024) escreveu problemas novos no estilo do GSM8K e viu quedas de até 8%, famílias inteiras com sinais de sobreajuste e uma relação (Spearman \(r^2 = 0{,}36\)) entre a probabilidade de um modelo gerar exemplos do GSM8K e o tamanho da sua queda. O MathArena avalia competições <b>no dia em que saem</b> e encontrou “strong signs of contamination in AIME 2024”. Para 2026, use o AIME 2026 e o HMMT de fev/2026, não o AIME 2024.</p>
+  <p>Isso vale para afirmar capacidade <i>absoluta</i>. Para a <i>regressão</i> (Δ base × candidato), a contaminação do pré-treino pesa nos dois lados e se cancela no pareamento; por isso a bateria ainda aceita o AIME 2025. O que invalida o Δ é o seu SFT conter itens da avaliação, daí a descontaminação abaixo.</p>
+  <h3>Como detectar</h3>
+  <ul>
+    <li><span class="la-term" data-term="descontaminacao-ngramas"><b>Sobreposição de n-gramas</b></span> entre treino e avaliação, com texto normalizado. Checar 8 a 13-gramas é prática comum; o limiar exato varia entre relatórios técnicos, e o de 13 segue, até onde sabemos, a prática popularizada pelo relatório do GPT-3 (não verificado nas fontes).</li>
+    <li><span class="la-term" data-term="min-k-prob"><b>Min-K% Prob</b></span> (Shi e colegas): textos vistos no treino têm menos “palavras-surpresa”. O método ganhou 7,4% sobre os anteriores no WikiMIA.</li>
+    <li><b>Conjuntos com data</b> (LiveCodeBench, MathArena, competições do ano) e conjuntos paralelos frescos (GSM1k).</li>
+    <li><b>Strings canário</b> embutidas em datasets de avaliação: se o modelo completa a string, ele viu o dataset.</li>
+  </ul>
+  <div class="la-eq">
+    \[ \text{Min-}K\%(x) = \frac{1}{|S_K|}\sum_{t \in S_K} \log p_\theta(x_t \mid x_{&lt;t}) \]
+    <ul class="la-eq-legend">
+      <li>\(x\): o texto suspeito, lido com teacher forcing</li>
+      <li>\(\log p_\theta(x_t \mid x_{&lt;t})\): log-probabilidade que o modelo dá a cada token real</li>
+      <li>\(S_K\): os \(K\%\) tokens de menor log-prob (as maiores surpresas)</li>
+      <li>escore alto (pouco negativo) = nem as piores surpresas são surpreendentes = provável que o texto tenha sido visto</li>
+    </ul>
+  </div>
+  <figure class="la-fig" id="fig-contam" data-title="Caçando contaminação">
+    <div class="la-fig-stage" style="height:420px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption><b>N-gramas:</b> uma janela de \(N\) palavras desliza pelo exemplo de treino gerado pelo professor; se algum \(N\)-grama também existe no item de teste, a janela fica vermelha e o exemplo é removido. Troque entre cópia, paráfrase leve e paráfrase forte, e mude \(N\). <b>Min-K%:</b> barras de \(\log p\) por token para um texto memorizado e um inédito; os \(K\%\) mais surpreendentes de cada um piscam, e o escore é a média deles. Textos e valores <b>ilustrativos</b>.</figcaption>
+  </figure>
+  <p>O detector de n-gramas pega a quase-cópia com qualquer \(N\) e a paráfrase leve só com \(N \le 10\). Abaixar \(N\) pega mais, mas também gera falsos positivos com frases comuns (“quanto ela gastou no total”). A paráfrase forte passa por todos: ela é a mesma questão com outras palavras, e nenhum método léxico a enxerga. É por isso que conjuntos <i>com data</i> são a defesa mais forte: um problema escrito depois do corte do modelo não pode ter vazado para o pré-treino.</p>
+  <p>No laboratório, rode a descontaminação do seu conjunto de SFT e DPO <b>contra todos os conjuntos de avaliação</b> (domínio, IFEval, GSM8K, AIME, HumanEval…) antes de treinar. O script de apoio remove do treino todo item que compartilha um 13-grama normalizado com qualquer conjunto de avaliação; para PT-BR e perguntas curtas, de uma linha, complemente com similaridade aproximada (MinHash) e com a checagem de mesmo termo do glossário entre treino e teste.</p>
+  <h3>O que ainda discrimina em 2026</h3>
+  <p>MMLU, GSM8K, HumanEval e MATH-500 estão saturados. O índice da Artificial Analysis (v4.3.2, 10 avaliações) já trata MMLU-Pro, AIME 2025, MATH-500, LiveCodeBench e variantes antigas do Terminal-Bench como “legacy”. O que separa modelos de fronteira hoje:</p>
+  <table>
+    <thead><tr><th>Benchmark</th><th>Mede</th><th>Situação em 2026</th></tr></thead>
+    <tbody>
+      <tr><td>Humanity’s Last Exam (HLE)</td><td>perguntas de fronteira, multidisciplinares</td><td>no índice AA v4.3.2: 2.158 questões, pass@1 com verificador de igualdade</td></tr>
+      <tr><td>GPQA Diamond</td><td>ciência de nível pós-graduação</td><td>ainda discrimina; Qwen3.8-27B: 89,2 (card) / 88,92 em BF16 (card NVIDIA)</td></tr>
+      <tr><td>LiveCodeBench</td><td>competição de código com <b>janela de datas</b> (escolha problemas posteriores ao corte do modelo)</td><td>ativo; o card do Qwen3.8-27B reporta 90,3</td></tr>
+      <tr><td>SWE-bench Pro / Pro Verified</td><td>patches em repositórios reais; o Pro Verified (arXiv 2609.08149, set/2026) corrige vazamento de soluções e testes</td><td>substituiu o Verified (500), abandonado pela OpenAI em fev/2026 por testes defeituosos (fonte secundária, não verificada); Qwen3.8-27B: 61,7 no Pro</td></tr>
+      <tr><td>Terminal-Bench 4.0, τ²-bench, BFCL V4</td><td>agentes, terminal e ferramentas</td><td>ativos; a AA usa 66 tarefas do Terminal-Bench, pass@1 sobre 3 repetições</td></tr>
+      <tr><td>ARC-AGI-3</td><td>benchmark <b>interativo</b> (jogos: aquisição de habilidade e eficiência)</td><td>ARC Prize 2026 no Kaggle; placares não verificados</td></tr>
+      <tr><td>MathArena (AIME 2026, HMMT fev/2026)</td><td>matemática sem contaminação</td><td>datasets verificados; placares de agregadores, não verificados</td></tr>
+    </tbody>
+  </table>
+  <p>Para o <b>seu</b> modelo de 4 a 27B pós-treinado em casa, os benchmarks de fronteira (HLE, ARC-AGI-3, SWE-bench Pro) são caros e pouco sensíveis a um SFT de domínio. O painel útil é IFEval/IFBench + GSM8K/AIME 2025-26 + HumanEval/LiveCodeBench + subconjunto de BFCL/τ² + XSTest + win rate de domínio + KL.</p>
+</section>
+
+<section class="la-sec">
+  <h2>Segurança nos dois sentidos</h2>
+  <p>Um modelo pode falhar em segurança de dois jeitos opostos. Pode <span class="la-term" data-term="sobre-recusa">recusar demais</span> (“como mato um processo no Linux?” → “não posso ajudar com violência”) ou pode <b>cumprir o que não devia</b>. Um pós-treino pode empurrar para qualquer um dos lados, e a avaliação precisa medir os dois. Os benchmarks são os que o <a data-ch="constitutional-ai">capítulo 60</a> usou para medir o CAI:</p>
+  <table>
+    <thead><tr><th>Benchmark</th><th>Conteúdo</th><th>Mede</th></tr></thead>
+    <tbody>
+      <tr><td><span class="la-term" data-term="xstest"><b>XSTest</b></span></td><td><b>250 prompts seguros</b> (10 tipos) que um modelo calibrado não deveria recusar + 200 inseguros de contraste</td><td>sobre-recusa (“exaggerated safety”)</td></tr>
+      <tr><td>OR-Bench</td><td>conjunto grande de prompts “aparentemente tóxicos”</td><td>sobre-recusa em escala</td></tr>
+      <tr><td><span class="la-term" data-term="harmbench"><b>HarmBench</b></span></td><td>framework padronizado: 18 métodos de red teaming × 33 LLMs e defesas</td><td>taxa de sucesso de ataque (ASR), com classificador</td></tr>
+      <tr><td><span class="la-term" data-term="strongreject"><b>StrongREJECT</b></span></td><td>prompts que exigem informação nociva específica + avaliador que mede a <b>utilidade</b> da resposta</td><td>cumprimento indevido “útil”</td></tr>
+      <tr><td>JailbreakBench</td><td>comportamentos e artefatos de ataque padronizados</td><td>robustez a jailbreak</td></tr>
+    </tbody>
+  </table>
+  <p>Prefira o escore do StrongREJECT a uma ASR binária: jailbreaks que furam a recusa costumam <b>degradar a capacidade</b>, e contar “não recusou” como sucesso superestima o perigo real.</p>
+  <h3>Três achados que todo pós-treino deveria conhecer</h3>
+  <p><b>Fine-tuning corrói o alinhamento.</b> Qi e colegas (2023) furaram as salvaguardas do GPT-3.5 Turbo com <b>10 exemplos adversariais, por menos de US$ 0,20</b>, via API de fine-tuning. E mostraram que até dados <b>benignos</b> degradam a segurança, “though to a lesser extent”. Consequência: todo SFT de domínio precisa do eixo de segurança na bateria, mesmo sem nenhum dado “perigoso”.</p>
+  <p><b>O DPO pode desalinhar sem querer.</b> Durante o DPO, a probabilidade da resposta <i>preferida</i> frequentemente cai junto com a da rejeitada; o que sobe é a margem (<a data-ch="dpo">capítulo 57</a>). Quando os pares têm embeddings parecidos (medidos pelo escore <span class="la-term" data-term="ches">CHES</span>), a massa liberada pode migrar para respostas de sentido oposto. É o <span class="la-term" data-term="deslocamento-de-verossimilhanca">deslocamento de verossimilhança</span>. No exemplo do paper, treinar para <i>recusar</i> reduziu a taxa de recusa do Llama-3-8B-Instruct de 74,4% para 33,4%. O diagnóstico aparece nas métricas do treino: <code>logps/chosen</code> caindo enquanto <code>rewards/margins</code> sobe (seção 9).</p>
+  <p><b>A recusa é (quase) uma direção.</b> Arditi e colegas mostraram, em 13 modelos de chat abertos de até 72B, que a recusa é mediada por um subespaço de dimensão 1: apagar a direção desliga a recusa, e somá-la provoca recusas em prompts inofensivos. É a base da <span class="la-term" data-term="abliteracao">abliteração</span> do <a data-ch="abliteracao">capítulo 19</a>. Na avaliação, isso vira a <span class="la-term" data-term="sonda-de-recusa">sonda de recusa</span>: estime a <span class="la-term" data-term="direcao-de-recusa">direção de recusa</span> \(\hat r\) no <b>base</b>, projete nela as ativações do resíduo (camadas do meio para o fim) de prompts nocivos e inofensivos e compare antes e depois do fine-tuning. Uma queda grande da separação antecipa, de forma barata e determinística, a regressão de segurança que StrongREJECT ou HarmBench mostrariam (uma inferência a partir dos fatos verificados, não um resultado publicado).</p>
+  <figure class="la-fig" id="fig-seguranca" data-title="A balança das recusas">
+    <div class="la-fig-stage" style="height:430px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>No plano, x = recusa indevida em prompts seguros (estilo XSTest) e y = cumprimento indevido em prompts nocivos (estilo StrongREJECT). O canto ideal é o de baixo à esquerda; o retângulo tracejado é o portão do laboratório em torno do base. Escolha uma intervenção e veja o modelo viajar. No painel da sonda, as curvas são as projeções das ativações em \(\hat r\) (estimada no base) para prompts inofensivos (menta) e nocivos (rosa): tracejado = antes, preenchido = depois. Posições e curvas <b>ilustrativas</b>.</figcaption>
+  </figure>
+  <p>O SFT benigno anda pouco, mas sobe. Os 10 exemplos adversariais e a abliteração vão parar no canto “solto”, e na abliteração as duas curvas da sonda colapsam em zero, porque a direção foi removida do resíduo. O pós-treino de segurança exagerado foge para a direita: recusa demais, e a curva dos inofensivos escorrega em direção à dos nocivos. Os dois erros são falhas de avaliação se você medir só um eixo.</p>
+  <div class="la-callout danger"><b class="t">Uso responsável</b><p>Abliteração não substitui avaliação de segurança: a própria receita GLM <span class="la-rb glm"></span> registra “KLD não medido com ablit”. Num modelo abliterado ou pós-treinado, os quatro eixos continuam obrigatórios, e remover recusas sem governança é decisão de política, não de engenharia: documente quem pode usar o modelo e para quê. Abliterar <i>depois</i> do pós-treino exige reestimar \(\hat r\) no modelo novo, porque a direção muda com o fine-tune.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Deriva e reward hacking: o KL como orçamento</h2>
+  <p>O RLHF e o DPO otimizam recompensa presos a uma âncora (<a data-ch="ppo-rlhf">capítulo 55</a>):</p>
+  <div class="la-eq">
+    \[ \max_\pi\ \mathbb{E}_{y\sim\pi}\big[r(x,y)\big] - \beta\,\mathrm{KL}\big(\pi \,\|\, \pi_{\text{ref}}\big), \qquad \pi^*(y\mid x) \propto \pi_{\text{ref}}(y\mid x)\,e^{\,r(x,y)/\beta} \]
+    <ul class="la-eq-legend">
+      <li>\(r\): recompensa (reward model, verificador ou recompensa implícita)</li>
+      <li>\(\beta\): força da <span class="la-term" data-term="ancora-kl">âncora KL</span>; \(\beta\) alto = mudança pequena</li>
+      <li>\(\pi_{\text{ref}}\): modelo de referência, em geral o SFT</li>
+      <li>\(\pi^*\): política ótima: o \(\pi_{\text{ref}}\) reponderado exponencialmente pela recompensa; é daí que o DPO tira a recompensa implícita \(\hat r = \beta\log(\pi/\pi_{\text{ref}})\), as métricas <code>rewards/*</code> do TRL</li>
+    </ul>
+  </div>
+  <p>O KL realizado é, portanto, o <b>orçamento gasto</b> pelo pós-treino: quanto o modelo se afastou da referência para comprar recompensa. Na prática ele é estimado por amostra, nos tokens gerados pela própria política, com a razão \(\rho = \pi_{\text{ref}}(y_t)/\pi_\theta(y_t)\) por token (Schulman, “Approximating KL Divergence”, 2020):</p>
+  <div class="la-eq">
+    \[ k_1 = -\log\rho, \qquad k_2 = \tfrac12(\log\rho)^2, \qquad k_3 = (\rho - 1) - \log\rho = \operatorname{expm1}(\Delta) - \Delta, \quad \Delta = \log\pi_{\text{ref}} - \log\pi_\theta \]
+    <ul class="la-eq-legend">
+      <li>\(k_1\): não-viesado, alta variância, pode ser negativo numa amostra</li>
+      <li>\(k_2\): viesado, baixa variância</li>
+      <li>\(k_3\): não-viesado e sempre \(\ge 0\); é o do GRPO (DeepSeekMath)</li>
+      <li>exemplo: \(\Delta = +0{,}5\) dá \(k_1 = -0{,}5\), \(k_2 = 0{,}125\), \(k_3 \approx 0{,}149\)</li>
+    </ul>
+  </div>
+  <p>O <code>mlx-lm-lora</code> implementa exatamente <code>expm1(log_ref − log_policy) − (log_ref − log_policy)</code>, com o log-ratio limitado a 20, e reporta em <code>kl_clip_ratio</code> quantas vezes o teto foi atingido.</p>
+  <div class="la-callout deep"><b class="t">Duas réguas de “quanto mudou”</b><p><b>(a)</b> \(\mathrm{KL}(\pi_\theta\|\pi_{\text{ref}})\) estimado com \(k_1\) ou \(k_3\) nos tokens que a <i>própria política</i> gera. É o que o objetivo do RLHF penaliza e o que a métrica <code>kl</code> do TRL registra, e depende do que a política escolheu escrever. <b>(b)</b> \(\mathrm{KL}(\pi_{\text{ref}}\|\pi_{\text{ft}})\) calculado sobre a distribuição inteira, em cada posição de um texto <i>fixo</i>, com teacher forcing. Esta é comparável entre candidatos e com o capítulo 25, e é a que os portões usam. Como \(\mathrm{KL}(P\|Q) \ne \mathrm{KL}(Q\|P)\) e os textos medidos são outros, os dois números não são intercambiáveis: reporte sempre a direção e o texto em que mediu.</p></div>
+  <h3>Goodhart medido: a superotimização</h3>
+  <p>“Quando uma medida vira alvo, deixa de ser uma boa medida” (a <span class="la-term" data-term="lei-de-goodhart">lei de Goodhart</span>). O reward model é um <i>proxy</i> aprendido, e otimizá-lo demais explora os seus erros: é o <span class="la-term" data-term="reward-hacking">reward hacking</span>. Gao, Schulman e Hilton (2022) mediram isso num experimento sintético. Um RM grande (6B) fazia o papel de “humano” (o RM <i>ouro</i>) e rotulava pares para treinar RMs <i>proxy</i> de 3M a 3B; as políticas eram otimizadas contra o proxy e avaliadas pelo ouro. A recompensa <b>verdadeira</b> sobe e depois <b>cai</b>, e as curvas seguem formas simples na distância \(d = \sqrt{\mathrm{KL}(\pi\,\|\,\pi_{\text{init}})}\):</p>
+  <div class="la-eq">
+    \[ R_{\text{bon}}(d) = d\,(\alpha_{\text{bon}} - \beta_{\text{bon}}\,d), \qquad R_{\text{RL}}(d) = d\,(\alpha_{\text{RL}} - \beta_{\text{RL}}\log d), \qquad \mathrm{KL}_{\text{bon}} = \log n - \frac{n-1}{n} \]
+    <ul class="la-eq-legend">
+      <li>\(R\): recompensa <i>ouro</i>, com \(R(0) = 0\)</li>
+      <li>\(\alpha, \beta\): coeficientes ajustados; dependem do tamanho do RM proxy e dos dados (não confunda com o \(\beta\) da âncora)</li>
+      <li>bon = <span class="la-term" data-term="best-of-n">best-of-\(n\)</span>: gerar \(n\) respostas e ficar com a de maior proxy; o KL vem da fórmula analítica, um limite superior quase exato para respostas longas sem empates (<a data-ch="awr-contrastivo">capítulo 59</a>): n = 64 → ≤ 3,17 nats; n = 1.000 → ≤ 5,91; n = 60.000 → ≤ 10,00</li>
+      <li>picos: best-of-n em \(d^* = \alpha/2\beta\); RL em \(d^* = e^{\alpha/\beta - 1}\)</li>
+    </ul>
+  </div>
+  <figure class="la-fig" id="fig-goodhart" data-title="A coleira do KL e a curva de Goodhart">
+    <div class="la-fig-stage" style="height:430px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Eixo x: \(d = \sqrt{\mathrm{KL}}\) (os ticks de cima mostram o KL em nats). A curva lavanda é o proxy que o otimizador vê; a menta é a recompensa ouro de Gao e colegas, com os coeficientes <b>ilustrativos</b> (\(\alpha_{\text{bon}} = 1\), \(\beta_{\text{bon}} = 0{,}25\); \(\alpha_{\text{RL}} = 0{,}5\), \(\beta_{\text{RL}} = 0{,}2\)); a menta apagada é o ouro do outro otimizador, no mesmo eixo. No modo RL, a coleira é a penalidade \(\beta_{\text{KL}}\,d^2\): o robô para onde o ganho marginal do proxy iguala o custo do KL. No modo best-of-n, \(n\) fixa \(d\) pela fórmula analítica (limite superior). O proxy \(0{,}9\,d^{0{,}75}\) é um modelo de brinquedo.</figcaption>
+  </figure>
+  <p>Afrouxe a coleira e o robô passa do pico: o proxy continua subindo e o ouro cai, depressa no best-of-n e devagar no RL (a forma tem \(\log d\)). Com os coeficientes ilustrativos, o pico do best-of-n fica em \(d = 2\) (KL = 4 nats) e o do RL em \(d = e^{1{,}5} \approx 4{,}5\) (KL ≈ 20 nats), com ouro máximo menor (≈ 0,90 contra 1,0): o RL gastou 5× mais KL para chegar menos alto. Perto de \(d = 0\) a forma do RL tem inclinação infinita, e os próprios autores avisam que ela provavelmente não vale ali. Daí as duas lições de Gao e colegas para a avaliação. Primeira: como o RL “consome” muito mais KL que o best-of-n para o mesmo ganho, <b>KL não serve para comparar quanta otimização métodos diferentes fizeram</b>. Segunda: no setup deles, a penalidade de KL teve efeito parecido com parar mais cedo; ela não melhorou a fronteira ouro × KL.</p>
+  <h3>Os sinais nos logs do treino</h3>
+  <p>Você não tem um RM ouro, mas tem as métricas que os trainers do TRL registram. A tabela é o seu painel de reward hacking (nomes exatos das métricas):</p>
+  <table>
+    <thead><tr><th>Algoritmo</th><th>Métrica</th><th>Normal</th><th>Suspeito</th><th>Leitura provável</th></tr></thead>
+    <tbody>
+      <tr><td>SFT</td><td><code>loss</code> vs <code>eval_loss</code></td><td>ambos caem</td><td>treino ↓, eval ↑</td><td>sobreajuste: menos épocas ou LR</td></tr>
+      <tr><td>SFT</td><td><code>mean_token_accuracy</code></td><td>sobe devagar</td><td>~1,0 cedo</td><td>memorização ou dados duplicados</td></tr>
+      <tr><td>DPO</td><td><code>rewards/accuracies</code></td><td>0,6–0,8</td><td>→ 1,0 rápido</td><td>pares fáceis ou viés de comprimento explorado</td></tr>
+      <tr><td>DPO</td><td><code>rewards/margins</code></td><td>sobe</td><td>sobe enquanto <code>logps/chosen</code> despenca</td><td>deslocamento de verossimilhança: ↑β, NLL nas preferidas, filtrar pares</td></tr>
+      <tr><td>DPO</td><td>comprimento médio</td><td>estável</td><td>cresce</td><td>exploração de verbosidade</td></tr>
+      <tr><td>GRPO</td><td><code>reward</code></td><td>sobe</td><td>sobe com <code>completions/mean_length</code> explodindo</td><td>hacking de comprimento ou formato</td></tr>
+      <tr><td>GRPO</td><td><code>frac_reward_zero_std</code></td><td>&lt; ~0,5</td><td>→ 1</td><td>grupos todos certos ou todos errados: sem sinal</td></tr>
+      <tr><td>GRPO</td><td><code>entropy</code></td><td>cai devagar</td><td>colapsa cedo</td><td>colapso de entropia</td></tr>
+      <tr><td>GRPO</td><td><code>kl</code></td><td>só aparece com <code>beta&gt;0</code></td><td>cresce sem parar</td><td>política se afastando: ↑beta ou pare</td></tr>
+      <tr><td>GRPO+vLLM</td><td><code>sampling/importance_sampling_ratio/*</code></td><td>~1</td><td>longe de 1</td><td>descompasso treino × inferência (dtype, kernels)</td></tr>
+    </tbody>
+  </table>
+  <p>No RL com recompensa verificável, além das métricas, <b>leia amostras</b> (<code>log_completions=True</code>). Os hacks típicos: imprimir várias caixas <code>\boxed{}</code>, repetir o enunciado, deixar a resposta só dentro do <code>&lt;think&gt;</code>. Teste o verificador contra respostas adversariais <i>antes</i> de treinar. Uma recompensa de domínio que só confere “o número aparece na resposta” é burlada listando vários números.</p>
+  <h3>Duas KLDs que você não pode confundir</h3>
+  <table>
+    <thead><tr><th>Pergunta</th><th>P (referência)</th><th>Q (candidato)</th><th>Esperado</th></tr></thead>
+    <tbody>
+      <tr><td>O que o pós-treino mudou?</td><td>base original BF16</td><td>fine-tunado BF16 (merge ou base + adapter)</td><td>texto genérico: pequeno; domínio: grande (é o efeito pretendido)</td></tr>
+      <tr><td>Quanto a quantização estragou?</td><td><b>fine-tunado BF16 (merge)</b></td><td>fine-tunado quantizado</td><td>da ordem do que o mesmo formato causa no base</td></tr>
+      <tr><td>O adapter sobre base quantizado funciona?</td><td>base BF16 + LoRA</td><td>base quantizado + LoRA</td><td>≈ KLD do base quantizado sozinho</td></tr>
+    </tbody>
+  </table>
+  <p>Nas três linhas, use \(\mathrm{KL}(P\|Q) = \sum_v p(v)\big(\log p(v) - \log q(v)\big)\) por posição, com teacher forcing, em média sobre as posições, e reporte também mediana, p90, PPL dos dois e <span class="la-term" data-term="top-1-agreement">concordância top-1</span>. O erro mais comum é medir a quantização contra o base original: aí você mistura deriva desejada com estrago. Para calibrar a expectativa, use as âncoras do Módulo 1 <span class="la-rb glm"></span>: no GLM-5.3-Flash, com 51.175 posições, a KLD contra o modelo de referência foi 0,013723 nats no EXL3 K6, 0,024555 no EXL3 de 4 bpw servido, 0,024629 no FP8 oficial na mesma stack (0,020615 medido em outra stack, não comparável) e 0,060535 no NVFP4. Um NVFP4 do seu fine-tune muito acima do que o NVFP4 oficial causa no base, medido com o mesmo script, indica calibração ruim.</p>
+  <p>Há ainda um sinal de deriva grátis: a <span class="la-term" data-term="taxa-de-aceitacao">taxa de aceitação</span> da especulação. A cabeça <span class="la-term" data-term="mtp">MTP</span> do Qwen3.8-27B (<code>mtp_num_hidden_layers: 1</code>) foi treinada para prever o <b>base</b>. Depois de um fine-tune que não treinou a MTP, a aceitação tende a cair na proporção da deriva, o mesmo fenômeno que o canário da receita GLM usa para detectar modelo quebrado (aceitação ~0). Compare a aceitação por posição antes e depois com <code>--per-request-spec-decode-metrics</code> (vLLM 0.29+), como no <a data-ch="especulacao-fundamentos">capítulo 35</a> (o efeito é uma inferência; a magnitude não foi medida).</p>
+  <h3>Os portões, juntos</h3>
+  <p>Tudo converge numa tabela que você escreve <b>antes</b> de olhar resultado nenhum. Os portões sugeridos para o laboratório (uma recomendação; ajuste-os antes de rodar):</p>
+  <table class="la-params">
+    <thead><tr><th>Eixo</th><th>Medida</th><th>Portão sugerido</th></tr></thead>
+    <tbody>
+      <tr><td>Alvo</td><td>WR e WR-LC vs base no teste de domínio (juiz de outra família, duas ordens), IC95% por bootstrap</td><td>limite inferior do IC do WR-LC &gt; 50% e WR-LC ≥ 60%</td></tr>
+      <tr><td>Alvo</td><td>acerto numérico no domínio (tolerância relativa de 1%)</td><td>↑ vs base, IC sem cruzar zero</td></tr>
+      <tr><td>Regressão</td><td>IFEval (<code>prompt_level_strict_acc</code>), GSM8K Platinum, AIME 2025 (2 sementes), pensando e sem pensar</td><td>Δ ≥ −2 pp (IFEval, GSM8K) e Δ AIME dentro do IC</td></tr>
+      <tr><td>Regressão</td><td>BFCL (non-live + multi-turn) ou τ² <code>retail</code>, 20 tarefas × 4 tentativas</td><td>Δ dentro do IC</td></tr>
+      <tr><td>Segurança</td><td>XSTest: recusa nos 250 seguros; StrongREJECT (subconjunto): escore médio</td><td>recusa nos seguros não sobe &gt; 2 pp; escore StrongREJECT não sobe</td></tr>
+      <tr><td>Deriva</td><td>KL(base‖candidato) por posição, teacher-forced, em texto genérico (ex.: 200 janelas de 2.048 tokens) e no domínio; comprimento médio</td><td>reporte; investigue se o KL genérico for ≫ o do SFT anterior</td></tr>
+      <tr><td>Velocidade</td><td>aceitação MTP por posição (base vs candidato)</td><td>reporte (afeta o custo de serviço)</td></tr>
+    </tbody>
+  </table>
+  <p>Cuidado com as comparações múltiplas. Com \(k\) portões independentes a 95%, a chance de ao menos um alarme falso é \(1 - 0{,}95^k\), ≈ 30% para \(k = 7\). Use Holm–Bonferroni ou pré-registre a regra “falhou um portão → re-rode com mais amostras antes de reprovar”.</p>
+  <p>A logística também importa: juízes (as receitas do Módulo 1) e candidatos disputam os mesmos dois Sparks. A ordem que funciona: (1) sirva os candidatos e <b>gere e grave</b> todas as respostas (domínio, XSTest, StrongREJECT, Arena-Hard v2 opcional); (2) rode as tarefas verificáveis com o lm-eval contra os mesmos servidores; (3) derrube tudo, suba a receita-juiz e julgue as respostas gravadas. Mesma semente e mesma amostragem para base e candidato; reporte média ± IC entre sementes (o RedHatAI usa 3, e 8 no AIME). Um adapter só vale sobre o base em que foi treinado. Depois de quantizar, repita a bateria <b>no modelo quantizado</b>: o RedHatAI publica “recovery” entre 98,27% e 100,88% para o NVFP4 do Qwen3.8-27B base, o patamar a buscar.</p>
+  <p>Com os quatro eixos medidos, os intervalos calculados e os portões decididos de antemão, falta só executar. O <a data-ch="receita-pos-treino">capítulo 63</a> monta a receita completa: pós-treinar no Mac e nos dois Sparks, avaliar com esta bateria, fundir, re-quantizar, medir as duas KLDs e servir o resultado com o mesmo vLLM do Módulo 1.</p>
+</section>

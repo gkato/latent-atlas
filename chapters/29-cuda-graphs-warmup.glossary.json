@@ -1,0 +1,158 @@
+{
+  "kernel": {
+    "t": "Kernel",
+    "d": "Função que roda na GPU em milhares de threads ao mesmo tempo. A CPU não a executa: ela só pede ao driver que a enfileire num stream."
+  },
+  "cuda-stream": {
+    "t": "Stream CUDA",
+    "d": "Fila FIFO de trabalho da GPU. Operações no mesmo stream executam em ordem; a CPU enfileira de forma assíncrona e segue adiante sem esperar."
+  },
+  "modo-eager": {
+    "t": "Modo eager",
+    "d": "Execução operação por operação: o Python chega numa linha, o PyTorch escolhe o kernel e a CPU o lança na hora. No vLLM: <code>--enforce-eager</code> ou <code>cudagraph_mode: NONE</code>."
+  },
+  "captura-de-stream": {
+    "t": "Stream capture (captura)",
+    "d": "Modo em que as operações enfileiradas num stream são <i>gravadas</i> num grafo em vez de executadas (<code>cudaStreamBeginCapture</code> → <code>cudaStreamEndCapture</code>). Nada roda durante a captura."
+  },
+  "replay": {
+    "t": "Replay",
+    "d": "Reexecução de um CUDA graph instanciado (<code>cudaGraphLaunch</code>): uma chamada da CPU dispara todos os kernels gravados, que leem e escrevem exatamente os mesmos endereços de memória da captura."
+  },
+  "buffer-estatico": {
+    "t": "Buffer estático",
+    "d": "Tensor de endereço fixo usado como entrada ou saída de um CUDA graph. Antes de cada replay, copiam-se os dados novos para dentro dele; nunca se troca o tensor."
+  },
+  "tamanhos-de-captura": {
+    "t": "Tamanhos de captura",
+    "d": "Lista de tamanhos de lote (em tokens) para os quais o vLLM grava um CUDA graph. Um lote menor é completado (padding) até o próximo tamanho da lista; um maior que o último roda eager."
+  },
+  "padding-de-lote": {
+    "t": "Padding de lote",
+    "d": "Completar um lote com linhas falsas até o tamanho capturado mais próximo. O trabalho dessas linhas é desperdiçado, e elas precisam ser mascaradas para não escrever em lugar errado."
+  },
+  "decode-uniforme": {
+    "t": "Decode uniforme",
+    "d": "Passo em que todas as requisições têm o mesmo número de tokens de consulta: 1 sem especulação, ou k+1 quando cada uma verifica k rascunhos. É o caso que os graphs FULL cobrem."
+  },
+  "linhas-de-verificacao": {
+    "t": "Linhas de verificação (verify rows)",
+    "d": "Número de tokens de um passo de decode especulativo: sequências × (k+1). Na DS, 6 × 7 = 42; define quais tamanhos de captura são necessários."
+  },
+  "decodificacao-especulativa": {
+    "t": "Decodificação especulativa",
+    "d": "Um rascunhador barato propõe k tokens e o modelo grande verifica todos num único passo, aceitando o maior prefixo correto. Detalhada na Parte VII."
+  },
+  "piecewise": {
+    "t": "Graph piecewise",
+    "d": "Modo em que o forward é cortado nas operações de atenção: os pedaços entre elas viram CUDA graphs e a atenção roda eager entre um pedaço e outro. Exige a compilação piecewise do torch.compile."
+  },
+  "full-graph": {
+    "t": "Graph FULL",
+    "d": "CUDA graph que cobre o forward inteiro, atenção incluída. Exige metadados de atenção em buffers persistentes e, em muitos backends, lote uniforme."
+  },
+  "breakable-cudagraph": {
+    "t": "Breakable CUDA graphs",
+    "d": "Variante do vLLM em que funções marcadas quebram a captura em tempo de captura: encerram o segmento, rodam eager no stream e abrem outro segmento, sem depender da compilação piecewise. DS e Qwen (lane v0.30) a desligam com <code>VLLM_USE_BREAKABLE_CUDAGRAPH=0</code>; o GLM não define a variável."
+  },
+  "batch-descriptor": {
+    "t": "BatchDescriptor",
+    "d": "Chave com que o dispatcher do vLLM escolhe qual CUDA graph tocar num passo: número de tokens, número de requisições, se o lote é uniforme e se há LoRA."
+  },
+  "torch-compile": {
+    "t": "torch.compile",
+    "d": "Compilador do PyTorch: o Dynamo captura o forward como um grafo FX e o Inductor gera kernels fundidos (Triton). No vLLM é controlado por <code>--compilation-config</code> (mode 0 a 3)."
+  },
+  "dynamo": {
+    "t": "TorchDynamo",
+    "d": "Parte do torch.compile que intercepta o bytecode Python e grava as operações de tensor num grafo FX, junto com guardas (condições sob as quais o grafo continua válido)."
+  },
+  "inductor": {
+    "t": "Inductor",
+    "d": "Backend do torch.compile que transforma o grafo FX em código otimizado, fundindo operações vizinhas (soma, norma, ativação) num único kernel Triton."
+  },
+  "grafo-fx": {
+    "t": "Grafo FX",
+    "d": "Representação do PyTorch de um programa como uma lista de nós (operações) ligados pelos tensores que passam entre eles; é o que o torch.compile analisa e reescreve."
+  },
+  "custom-op": {
+    "t": "Custom op",
+    "d": "Operação registrada no <code>torch.library</code> (no vLLM, via <code>direct_register_custom_op</code>, e chamada como <code>torch.ops.vllm.nome</code>) que o compilador trata como caixa-preta."
+  },
+  "fake-impl": {
+    "t": "Fake impl",
+    "d": "Implementação “de mentira” de uma custom op: não calcula nada, só devolve tensores com forma e dtype corretos para que o compilador consiga propagar formas pelo grafo."
+  },
+  "mutates-args": {
+    "t": "mutates_args",
+    "d": "Lista dos argumentos que uma custom op escreve no lugar (in-place). Avisa o compilador para não reordenar, duplicar nem eliminar essas escritas."
+  },
+  "async-scheduling": {
+    "t": "Async scheduling",
+    "d": "Modo do vLLM em que o scheduler prepara o passo N+1 enquanto a GPU executa o passo N, escondendo o custo de CPU do agendamento (não o dos lançamentos dentro do passo)."
+  },
+  "jit": {
+    "t": "JIT (compilação just-in-time)",
+    "d": "Compilar um kernel na primeira vez que ele é chamado com uma certa chave (constantes, dtypes, alinhamentos), em vez de na instalação. Triton, TileLang, CuTeDSL, DeepGEMM e FlashInfer funcionam assim."
+  },
+  "constexpr": {
+    "t": "tl.constexpr",
+    "d": "Parâmetro de kernel Triton conhecido em tempo de compilação. Cada valor distinto gera um binário distinto (e ramos mortos são eliminados)."
+  },
+  "cache-de-jit": {
+    "t": "Cache de JIT",
+    "d": "Diretório onde um compilador JIT guarda os binários já gerados (<code>TRITON_CACHE_DIR</code>, <code>TILELANG_CACHE_DIR</code>, <code>~/.nv/ComputeCache</code>…). Se ele morre a cada recriação do container, tudo recompila."
+  },
+  "bucket": {
+    "t": "Bucket de forma",
+    "d": "Faixa de tamanhos arredondada (ex.: para a próxima potência de 2) para que muitos tamanhos reais compartilhem o mesmo kernel compilado."
+  },
+  "warmup": {
+    "t": "Warmup",
+    "d": "Execuções sintéticas no boot que forçam compilações JIT, alocações e autotunes antes que o tráfego real chegue."
+  },
+  "autotune": {
+    "t": "Autotuning",
+    "d": "Medir várias táticas de um kernel (tamanho de tile, split-K, estágios) para uma forma e guardar a mais rápida num cache. Deve acontecer antes da captura e ser coerente entre ranks."
+  },
+  "rank": {
+    "t": "Rank",
+    "d": "Cada processo de um grupo distribuído — aqui, uma GPU em um nó. O rank 0 costuma ser o líder."
+  },
+  "all-reduce": {
+    "t": "All-reduce",
+    "d": "Coletiva em que todos os ranks contribuem um tensor, os tensores são somados e todos recebem o resultado. Todos precisam chamar a mesma coletiva, com o mesmo tamanho, na mesma ordem."
+  },
+  "watchdog-nccl": {
+    "t": "Watchdog do NCCL",
+    "d": "Thread do ProcessGroupNCCL do PyTorch que derruba o processo se uma coletiva não termina dentro do prazo (600 s por padrão)."
+  },
+  "ima": {
+    "t": "IMA (illegal memory access)",
+    "d": "Erro CUDA de acesso a endereço inválido; em geral derruba o processo. Nas receitas aparece como sintoma de índices ou slots corrompidos."
+  },
+  "canario": {
+    "t": "Canário de boot",
+    "d": "Teste automático pós-boot que confere se o motor responde com sentido (ex.: “OK” a temperatura 0 e rascunhos aceitos) antes de declarar o serviço pronto."
+  },
+  "rodada-de-decode": {
+    "t": "Rodada de decode (TensorFold)",
+    "d": "Unidade de trabalho do decode no TensorFold: cada stream propõe rascunhos, um único forward verifica a janela <code>[token pendente, rascunhos…]</code>, cada linha é amostrada com a chave da requisição, aceita-se até o primeiro desacordo e as linhas aceitas são cometidas."
+  },
+  "janela-de-verificacao": {
+    "t": "Janela de verificação",
+    "d": "As linhas que um forward de verificação processa: o token pendente mais os rascunhos de um stream (até 16 linhas no TensorFold) ou de vários streams lado a lado (até 32 na v1.3.2; de 16 a 64 desde a v1.5, com <code>TF_GLM_MULTI_WINDOW</code>). No TensorFold, cada largura de janela tem seu CUDA graph."
+  },
+  "tabela-no-device": {
+    "t": "Tabela de metadados no device",
+    "d": "Tensor na GPU com os metadados que mudam a cada passo (posição, base do extent, slot, paridade, limites). O graph grava o endereço da tabela; o host reescreve o conteúdo no lugar antes de cada replay e os kernels o leem, de modo que um graph serve qualquer mistura de streams."
+  },
+  "paridade-dupla": {
+    "t": "Paridade dupla (estado KDA)",
+    "d": "Cada slot guarda o estado recorrente em duas cópias: a janela de verificação lê uma e escreve na outra. Se todos os rascunhos forem aceitos, troca-se a paridade; senão, o estado é recalculado só com as linhas mantidas (replay)."
+  },
+  "epoca-no-device": {
+    "t": "Época no device",
+    "d": "Contador de trocas guardado na memória da GPU e avançado pelo próprio kernel (o último bloco a terminar). Como não é um argumento passado pela CPU, cada replay de um CUDA graph usa o número seguinte — é assim que o all-gather RDMA do TensorFold sobrevive ao replay."
+  }
+}

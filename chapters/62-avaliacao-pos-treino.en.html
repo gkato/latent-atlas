@@ -1,0 +1,428 @@
+<p class="la-lead">Your DPO beat the base model on 58 of 100 questions, according to an LLM judge. Is it better? Maybe. With 100 prompts, a <span class="la-term" data-term="win-rate">win rate</span> near 50% has a margin of error of ±9.8 points; the judge may have preferred the longer answer, the first one, or the one that sounded like itself; and the model may have forgotten how to obey “answer in three bullet points,” or become more willing to explain what it shouldn't. In <a data-ch="medindo-qualidade">chapter 25</a> we wanted KL close to zero. Here the question flips: <b>we want the model to change, but only where we asked</b>. This chapter builds the toolkit to answer honestly and ends with a preregistered battery, with decision gates, ready for the lab in <a data-ch="receita-pos-treino">chapter 63</a>.</p>
+
+<section class="la-sec">
+  <h2>Four axes: change only where we asked</h2>
+  <p>Every Module 2 method is an intervention that moves probability mass (<a data-ch="pos-treino-mapa">chapter 50</a>). <a data-ch="sft">SFT</a> pulls the model toward the demonstrations, <a data-ch="dpo">DPO</a> pushes the preferred response up and the rejected one down, <a data-ch="grpo-rlvr">GRPO</a> reinforces whatever the verifier approved. None of them knows where to stop. Mass that rises in one place falls somewhere else, and evaluation exists to find out where it fell. That's why a single number is never enough. Evaluate on <b>four axes</b>, always against the starting model:</p>
+  <table>
+    <thead><tr><th>Axis</th><th>Question</th><th>Main instrument</th><th>Desired direction</th></tr></thead>
+    <tbody>
+      <tr><td><b>Target</b></td><td>Did the trained behavior improve?</td><td>paired win rate (LLM or human judge), verifiable domain metrics, validation loss</td><td>↑</td></tr>
+      <tr><td><b>Regression</b></td><td>Did I lose general capability?</td><td>fixed battery (IFEval, GSM8K/AIME, code, tools, knowledge)</td><td>≈ base (Δ within the CI)</td></tr>
+      <tr><td><b>Safety</b></td><td>Does it refuse too much? Does it comply with what it shouldn't?</td><td>XSTest/OR-Bench (over-refusal); StrongREJECT/HarmBench/JailbreakBench (undue compliance)</td><td>as the policy dictates</td></tr>
+      <tr><td><b>Drift</b></td><td>How much did the distribution change, and where?</td><td>KL(π<sub>ref</sub>‖π<sub>ft</sub>) per position, teacher-forced on fixed generic and domain text (the ch. 25 ruler); length; <span class="la-term" data-term="mtp">MTP</span> acceptance</td><td>↑ in the domain, ≈ 0 outside it</td></tr>
+    </tbody>
+  </table>
+  <p>The <b>target</b> measures what you trained (does the technical tutor answer better than the base?). <b>Regression</b> measures the side effect, the <span class="la-term" data-term="imposto-de-alinhamento">alignment tax</span>: the model learned the style of the data and unlearned something else. <b>Safety</b> has two sides: refusing harmless requests or complying with harmful ones. <b>Drift</b> is the numeric axis, in nats per token, with the chapter 25 ruler: <span class="la-term" data-term="kld">KLD</span>(base‖candidate) with <span class="la-term" data-term="teacher-forcing">teacher forcing</span> on fixed text (section 9 explains why it isn't the <code>kl</code> the trainer logs). We want large drift in the domain, which is the intended effect, and almost none on generic text.</p>
+  <p>Four principles apply to every axis:</p>
+  <ol class="la-steps">
+    <li><b>Compare pairs of models under the same conditions.</b> Same chat template, same <code>enable_thinking</code>, same sampling parameters, same <code>max_tokens</code>, same server. A template difference is the No. 1 cause of fake “regressions.”</li>
+    <li><b>Preregister before running</b> (the <span class="la-term" data-term="protocolo-congelado">frozen protocol</span> from chapter 25): evaluation set, metrics, acceptance thresholds and number of samples. Without it you end up picking the checkpoint “that did best on the last benchmark I looked at,” the trap in section 4.</li>
+    <li><b>Confidence intervals on everything.</b> With 400 pairs, a 50% win rate has a 95% CI of ≈ ±4.9 points. Differences smaller than that are noise.</li>
+    <li><b>Measure the baseline noise.</b> Run the base itself twice (different seeds or batches) and compute the metric between the two runs: it's the <span class="la-term" data-term="nulo-stock">stock-vs-stock null</span> of the KLD in the GLM recipe (“near-tie tokens flip between identical runs”). An effect smaller than that noise doesn't exist.</li>
+  </ol>
+  <figure class="la-fig" id="fig-eixos" data-title="The four-axis dashboard">
+    <div class="la-fig-stage" style="height:400px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Five <b>illustrative</b> candidates go through the same preregistered gates. On each axis, the green band is the passing region, the diamond is the estimate and the whisker is the 95% CI. On the target axis, the hollow circle is the <i>raw</i> win rate, with no length control. On drift, the bars use a log scale (nats/token). The gates are the lab's (section 9); each candidate's numbers are made up to show typical failure patterns.</figcaption>
+  </figure>
+  <p>Step through the five candidates. The <b>verbose DPO</b> has the highest raw win rate of all and fails the target gate: almost all of its advantage came from length. The <b>SFT that forgot</b> is great in the domain and loses 7 points of IFEval. The one with <b>eroded safety</b> was trained only on benign data and still started complying with harmful requests. The <b>RL with a gamed reward</b> barely scrapes through regression and only really shows up on the target and drift axes. In every case, a single number would tell the wrong story.</p>
+  <div class="la-callout analogy"><b class="t">Analogy: the post-surgery checkup</b><p>You had knee surgery. Checking whether it bends is the target axis. But the doctor also takes your blood pressure (regression), tests your reflexes (safety) and checks whether the anesthesia messed with anything it shouldn't have (drift), always against your exams from before, done at the same lab. An exam from a different machine produces “changes” that are just equipment differences: that's the different chat template.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Win rate: the duel scoreboard and its margin of error</h2>
+  <p>The most direct measure of the target axis is <span class="la-term" data-term="julgamento-pareado">paired judgment</span>. For each prompt \(x\) in the evaluation set, generate one response from candidate \(A\) and one from baseline \(B\). A judge, human or LLM, returns \(A \succ B\), \(B \succ A\) or a tie. The win rate is the fraction of duels won, with a tie worth half a point:</p>
+  <div class="la-eq">
+    \[ \mathrm{WR}(A\,|\,B) = \frac{W + \tfrac12 T}{W + L + T} \]
+    <ul class="la-eq-legend">
+      <li>\(W\): prompts where the judge preferred \(A\)</li>
+      <li>\(L\): prompts where it preferred \(B\)</li>
+      <li>\(T\): ties (half a point to each side, the AlpacaEval and Arena-Hard convention)</li>
+      <li>also report \(W/L/T\) separately: 50% with 0 ties and 50% with 80% ties are different stories</li>
+    </ul>
+  </div>
+  <p>Why paired? Because the same prompt goes to both models. The prompt's difficulty, which is the largest source of variation in an evaluation, affects both sides equally and cancels out in the duel. It's the same logic as the A/B/A in <a data-ch="benchmarking">chapter 45</a>: compare what changed while holding everything else fixed.</p>
+  <h3>How many prompts?</h3>
+  <p>Each prompt is a loaded coin with probability \(p\) of landing on “A wins.” By the normal approximation, the <span class="la-term" data-term="erro-padrao">standard error</span> of the win rate and the number of prompts for a half-width \(E\) are:</p>
+  <div class="la-eq">
+    \[ \mathrm{SE}(\widehat{\mathrm{WR}}) \approx \sqrt{\frac{p(1-p)}{n}}, \qquad \mathrm{CI}_{95\%} \approx \widehat{\mathrm{WR}} \pm 1.96\,\mathrm{SE}, \qquad n \approx \frac{z^2\,p(1-p)}{E^2} \]
+    <ul class="la-eq-legend">
+      <li>\(p\): true win rate (the worst case is \(p = 0.5\))</li>
+      <li>\(n\): number of prompts (judged pairs)</li>
+      <li>\(z = 1.96\): normal quantile for 95%</li>
+      <li>\(E\): desired half-width of the interval</li>
+    </ul>
+  </div>
+  <p>At \(p = 0.5\): with \(n = 100\), the 95% CI is ±9.8 points; with 400, ±4.9; with 1,000, ±3.1. For \(E = 5\) points, \(n \approx 1.96^2 \times 0.25 / 0.05^2 \approx 384\). To separate 55% from 50% comfortably, you need about <b>400 to 800 prompts</b>. Ties reduce the variance a little, so these numbers are conservative.</p>
+  <h3>Bootstrap: the interval without a formula</h3>
+  <p>For the length-controlled win rate, the difference between two candidates or Bradley–Terry scores, there is no comfortable closed-form formula. The <span class="la-term" data-term="bootstrap-ic">bootstrap</span> handles all of them with the same trick: treat your sample of prompts as the population and resample from it.</p>
+  <ol class="la-steps">
+    <li><b>Per-prompt results.</b> You have \(n\) values \(y_i \in \{0, \tfrac12, 1\}\).</li>
+    <li><b>Resample.</b> Draw \(n\) indices <i>with replacement</i>. Some prompts appear two or three times, others not at all (on average, a fraction \(\approx 1/e \approx 37\%\) is left out).</li>
+    <li><b>Recompute</b> the statistic (WR, WR-LC, difference…) on this fake sample.</li>
+    <li><b>Repeat</b> \(B = 2{,}000\) times and take the 2.5% and 97.5% percentiles of the replicates: \(\mathrm{CI}_{95\%} = [\,Q_{0.025},\ Q_{0.975}\,]\).</li>
+    <li><b>To compare two candidates</b> evaluated on the same prompts, resample <b>pairs</b>: the same drawn index applies to both.</li>
+  </ol>
+  <figure class="la-fig" id="fig-bootstrap" data-title="Live bootstrap">
+    <div class="la-fig-stage" style="height:420px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>In the grid, the \(n\) prompts: win (mint), tie (amber), loss (pink). On each replicate, the drawn prompts light up; the dimmed ones were left out, and the little dot in the center marks those drawn more than once. In the other panel, the histogram of WR replicates grows up to 2,000; the amber band is the 95% percentile CI, the lavender bracket is the normal approximation and the pink line marks 50%. Data simulated from the chosen “true WR.”</figcaption>
+  </figure>
+  <p>Play with \(n = 100\) and a true WR of 56%. Click “new experiment” several times: the observed WR jumps between ~47% and ~65%, and the interval crosses 50% most of the time. Now go up to 800 prompts. The histogram narrows and the interval pulls away from 50%. The effect was the same. The sample was just too small to see it.</p>
+  <p>When there are no ties, the <span class="la-term" data-term="intervalo-de-wilson">Wilson interval</span> is a better analytic alternative than the normal one for small \(n\) or for \(p\) near 0 or 1:</p>
+  <div class="la-eq">
+    \[ \mathrm{CI}_{\text{Wilson}} = \frac{\hat p + \frac{z^2}{2n} \pm z\sqrt{\frac{\hat p(1-\hat p)}{n} + \frac{z^2}{4n^2}}}{1 + \frac{z^2}{n}} \]
+    <ul class="la-eq-legend">
+      <li>\(\hat p\): observed fraction of wins</li>
+      <li>\(z = 1.96\); the \(z^2\) terms pull the center toward 0.5 and avoid impossible intervals (below 0 or above 1)</li>
+    </ul>
+  </div>
+  <div class="la-callout deep"><b class="t">Going deeper: why resample prompts and not verdicts?</b><p>The unit of chance is the <i>prompt</i>. The two judge calls for the same prompt (section 3) aren't independent, and neither are several responses to the same prompt with different seeds. Resample prompts, carrying along everything that belongs to each one (a <i>cluster</i> bootstrap). Resampling loose verdicts pretends there is more information than there is and artificially shrinks the interval.</p></div>
+  <div class="la-callout tip"><b class="t">In the lab</b><p>The recommended domain test has <b>300 to 500 questions</b> about terms that never appeared in training, which gives a CI of ±4 to ±6 points on the win rate. Split train and test <b>by term</b>, not by row. If the same concept shows up on both sides, the test measures memorization.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>The judge is a model too: LLM-as-judge and its biases</h2>
+  <p>Judging 800 pairs by hand is expensive. The alternative is <span class="la-term" data-term="llm-as-judge">LLM-as-judge</span>: a strong model reads the question and both answers and picks one. The founding work (Zheng and colleagues, NeurIPS 2023) showed that strong judges such as GPT-4 reach <b>over 80% agreement</b> with human preferences, the same level of agreement humans have with each other. It also cataloged the biases that come along: the judge is a language model conditioned on a text, and everything in that text, including the order and the length of the answers, factors in.</p>
+  <table>
+    <thead><tr><th>Bias</th><th>Evidence</th><th>Mitigation</th></tr></thead>
+    <tbody>
+      <tr><td><span class="la-term" data-term="vies-de-posicao"><b>Position</b></span></td><td>Wang and colleagues (2023): with ChatGPT as the judge, just by reordering the answers, Vicuna-13B “beat” ChatGPT on 66 of 80 questions</td><td>judge in both orders; ask for evidence before the score; send ambiguous cases to humans</td></tr>
+      <tr><td><span class="la-term" data-term="vies-de-verbosidade"><b>Verbosity and style</b></span></td><td>judges and humans reward long, formatted answers; LMArena concluded that length is the dominant style factor</td><td>length control by regression (section 5); a rubric that penalizes padding</td></tr>
+      <tr><td><span class="la-term" data-term="autopreferencia"><b>Self-preference</b></span></td><td>Panickssery, Bowman and Feng (2024): the evaluator scores its own answers higher, even when humans consider them equivalent; the strength of the bias grows linearly with the model's ability to recognize itself</td><td>a judge from a different family; a panel of disjoint families</td></tr>
+      <tr><td><b>Limited reasoning</b></td><td>the judge gets math and code items wrong that it can't solve itself</td><td>a judge with a reference answer in the prompt, or rule-based checking</td></tr>
+    </tbody>
+  </table>
+  <p>Why does order matter? One interpretation: the verdict is a token conditioned on a text in which one answer comes before the other, and small reading asymmetries turn into a systematic push to one side, which doesn't depend on quality and therefore cancels out across both orders.</p>
+  <p>The practical rule is simple. Make two calls per pair, \((A, B)\) and \((B, A)\). If the judge picks the same <i>model</i> in both, the verdict stands. If it picks the same <i>position</i> in both, that is, if it changes its mind when the answers swap places, count a <b>tie</b>. That's what the lab's judging script does, with an explicit rubric and a request for a short justification before the verdict:</p>
+  <pre data-lang="python"><code>RUBRIC = ("Compare answers A and B to the question. Criteria, in order: (1) technical correctness, "
+          "(2) answers exactly what was asked, (3) correct numbers/units, (4) concision. "
+          "Ignore length and formatting. Explain in at most 3 sentences and end with 'VERDICT: A', "
+          "'VERDICT: B' or 'VERDICT: TIE'.")
+
+def compare(q, a, b):            # +1 a wins, -1 b wins, 0 tie/inconsistent
+    v1, v2 = verdict(q, a, b), verdict(q, b, a)
+    if v1 == "A" and v2 == "B": return 1
+    if v1 == "B" and v2 == "A": return -1
+    return 0</code></pre>
+  <h3>A panel of judges from different families</h3>
+  <p>A large judge is expensive and carries the biases of its family. The PoLL <span class="la-term" data-term="painel-de-juizes">panel of judges</span> (Verga and colleagues, 2024) replaces the single judge with several smaller models from <b>disjoint families</b>, with a majority vote. Across 3 settings and 6 datasets, the panel showed less intra-model bias and was more than seven times cheaper than one large judge. The biases of different families don't all point the same way and, in the vote, they tend to dilute.</p>
+  <p>Module 1 already hands you such a panel for free: the three recipes serve, on the same two DGX Sparks (OpenAI API on port 8888), three distinct families: <code>GLM-5.3-Flash-EXL3</code> <span class="la-rb glm"></span>, <code>qwen3.8-flash-next</code> <span class="la-rb qwen"></span> and <code>deepseek-v4-flash-vision-exp</code> <span class="la-rb ds"></span>. The exclusion rule: drop from the panel the family of the <b>teacher</b> that generated the training data, because the student learned to sound like it, and that of the <b>student</b>.</p>
+  <div class="la-inrecipe" data-recipe="ds"><div class="la-inrecipe-h"><span class="la-rb ds"></span><span class="k">The lab's impartial judge</span><code>JUDGE = "deepseek-v4-flash-vision-exp"</code></div><div class="la-inrecipe-b"><p>In the chapter 63 lab, the teacher is GLM and the student is Qwen3.8-27B, a relative of Qwen3.8-Flash-Next. Of the three recipes, the only impartial family is <b>DeepSeek</b>. If you want a panel, use GLM and Qwen-Flash-Next as secondary judges and report their agreement with DeepSeek separately. If the judge always “prefers” the fine-tuned model, suspect self-preference or position bias first.</p></div></div>
+  <figure class="la-fig" id="fig-juiz" data-title="The judges' courtroom">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Each round judges one pair (candidate × base). The cards swap places when the mode uses two orders; the speech bubbles show the <i>position</i> chosen in each order (lavender = it was the candidate). The scoreboard panel compares the running tally (up to 400 pairs) with the true WR (mint line) and the expected WR under these biases (hollow diamond). The bias model is <b>illustrative</b>: the judge picks the <i>candidate</i> with probability \(\sigma(\Delta q + b_{\text{len}} + b_{\text{self}} \pm b_{\text{pos}})\), with + when the candidate is in position A and − when it is in B.</figcaption>
+  </figure>
+  <p>Start with equal quality (true WR 50%) and position bias 1.0. With a single order, the candidate always appears first and “wins” ~73% of the duels: a pure artifact. With two orders, the push shows up in both directions and becomes a tie, and the score returns to 50%. The math is exact: with \(+b\) favoring the first position, the candidate wins with \(\sigma(\Delta q + b)\) when it comes first and \(\sigma(\Delta q - b)\) when it comes second, and the expected value across both orders, \(\tfrac12[\sigma(\Delta q+b) + \sigma(\Delta q-b)]\), is exactly 0.5 when \(\Delta q = 0\). Now make the candidate 100% longer. Swapping positions does <b>not</b> fix it, because the verbosity bias pushes toward the same model in both orders. Then turn on the judge from the teacher's family. The panel dilutes self-preference, because only one of the three judges is biased (in the example, from ~67% to ~62%, against a real 50%), but doesn't eliminate it: that's why the lab's rule is to <b>exclude</b> the teacher's family, not dilute it. When the judge becomes a reward source (RLAIF, <a data-ch="constitutional-ai">ch. 60</a>; Self-Rewarding, <a data-ch="self-play-debate">ch. 61</a>), these biases stop merely distorting the measurement and start being optimized.</p>
+  <h3>Calibrate the judge against humans</h3>
+  <p>Before trusting the judge on a new task, also send ~10% of the pairs to a human and compute <span class="la-term" data-term="kappa-de-cohen">Cohen's κ</span>, the chance-corrected agreement:</p>
+  <div class="la-eq">
+    \[ \kappa = \frac{p_o - p_e}{1 - p_e} \]
+    <ul class="la-eq-legend">
+      <li>\(p_o\): fraction of pairs on which judge and human agree</li>
+      <li>\(p_e\): agreement expected by chance, given each label's frequencies for the two raters</li>
+      <li>\(\kappa = 1\): perfect agreement; \(\kappa = 0\): nothing beyond chance</li>
+    </ul>
+  </div>
+  <p>If \(\kappa\) falls below ~0.4, the judge isn't fit for that task. That threshold is a common “moderate agreement” convention, a recommendation rather than a sourced number. For math and code, prefer a judge with a reference answer in the prompt or, better yet, rule-based verification (section 6).</p>
+</section>
+
+<section class="la-sec">
+  <h2>From duel to ranking: Bradley–Terry, Elo and the leaderboard illusion</h2>
+  <p>The win rate compares two models. In a real project you have several checkpoints: the base, the SFT, two DPOs with different \(\beta\), the quantized version. Judge pairs across them and fit the <span class="la-term" data-term="bradley-terry">Bradley–Terry</span> model, the same one that trains the reward model in <a data-ch="preferencias-reward-models">chapter 53</a>. There it gave a score to each <i>response</i>. Here it gives a score to each <i>model</i>:</p>
+  <div class="la-eq">
+    \[ P(i \succ j) = \sigma(s_i - s_j), \qquad \ell(s) = \sum_{\text{duels}} \Big[\, y\log\sigma(s_a-s_b) + (1-y)\log\sigma(s_b-s_a) \Big], \qquad R_i = C + \frac{400}{\ln 10}\,s_i \]
+    <ul class="la-eq-legend">
+      <li>\(s_i\): latent strength of model \(i\); only differences matter, so fix \(s_{\text{base}} = 0\); the letter is \(s\), not \(\beta\), because \(\beta\) is already the strength of DPO's KL anchor (section 9)</li>
+      <li>\(\sigma\): logistic sigmoid</li>
+      <li>\(y\): 1 if \(a\) won the duel, 0 if it lost, ½ for a tie (or use the Davidson model for ties)</li>
+      <li>\(\ell\): log-likelihood, maximized over <i>all</i> duels at once</li>
+      <li>\(R_i\): Elo-like scale; \(400/\ln 10 \approx 173.7\), so a 400-point difference = 10-to-1 odds; the lab script uses \(C = 1000\) for the base</li>
+    </ul>
+  </div>
+  <p>Classic chess <span class="la-term" data-term="elo">Elo</span> does something else: it updates the scores <i>online</i>, duel by duel, with \(R_a \leftarrow R_a + K(S - E_a)\) and \(E_a = 1/(1 + 10^{(R_b-R_a)/400})\). The result depends on the <b>order</b> of the duels and on the \(K\) factor, and recent duels weigh more. That makes sense for players who change over time, not for frozen checkpoints. That's why <span class="la-term" data-term="chatbot-arena">Chatbot Arena</span> (now LMArena) uses maximum-likelihood Bradley–Terry over all battles and only <i>reports</i> the result on an Elo-like scale.</p>
+  <figure class="la-fig" id="fig-bt" data-title="Online Elo × Bradley–Terry">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Five <b>illustrative</b> checkpoints duel 800 times; each duel's outcome is drawn from fixed true strengths. The matrix shows the fraction of wins of the row over the column. The thin lines show online Elo over the battles (wide screens only). In the bottom panel, the diamond is Bradley–Terry (base = 1000) and the hollow circle is online Elo, shifted to have the same mean; the gray ticks mark the true strengths. After each complete round, the figure replays <i>the same</i> 800 battles in a different order (or click “shuffle the order”): BT ends up identical, online Elo doesn't (the × marks are the final Elos of the previous orders).</figcaption>
+  </figure>
+  <p>Let the figure shuffle a few times, or click the button yourself, and raise \(K\). The × marks spread out: the online Elo of the same checkpoint, with the same battles, moves by dozens of points depending on the order. The BT diamond doesn't budge, because the likelihood is a sum over duels and a sum doesn't depend on order.</p>
+  <h3>How the public arena evolved</h3>
+  <p>The 2024 Chatbot Arena paper reported more than 240,000 human votes in anonymous battles. Three later changes matter for the lab:</p>
+  <dl class="la-kv">
+    <dt>May 16, 2025</dt><dd><span class="la-term" data-term="controle-de-estilo">Style control</span> (BT regression with style covariates, introduced in August 2024) becomes the default in the text and vision arenas. Secondary source: search results.</dd>
+    <dt>Jul 23, 2025</dt><dd>CIs move from the bootstrap to the central limit theorem for M-estimators.</dd>
+    <dt>Dec 18, 2025</dt><dd>The methodology becomes the open package <code>arena-rank</code> (Apache-2.0): Bradley–Terry with covariates and closed-form CIs. You can use it in the lab.</dd>
+  </dl>
+  <p>Style control is a logistic regression with covariates: \(\operatorname{logit} P(i \succ j) = s_i - s_j + \gamma^\top(f_i - f_j)\), where \(f\) gathers normalized length and the number of headers, lists and bold spans. The ranking publishes the \(s\) with \(\gamma\) fitted, that is, it answers “who would win if both wrote in the same style?” Keep this idea in mind, because it comes back in section 5.</p>
+  <h3>The leaderboard illusion</h3>
+  <p>“The Leaderboard Illusion” (Singh and colleagues, 2025) documented that some providers privately test many variants before a launch (≈ <b>27 Meta variants</b> before Llama-4) and publish only the best one, as well as a data asymmetry (Google ≈ 19.2% and OpenAI ≈ 20.4% of the Arena data, versus ≈ 29.7% for 83 open-weight models combined).</p>
+  <p>The statistical mechanism behind the first criticism is the <span class="la-term" data-term="maldicao-do-vencedor">winner's curse</span>. Every measurement has noise. If you measure 27 equally good variants and publish the top-scoring one, you publish the luckiest one. The expected maximum of \(N\) independent normals grows with \(N\), and that “gain” is pure selected noise.</p>
+  <figure class="la-fig" id="fig-loteria" data-title="The variant lottery">
+    <div class="la-fig-stage" style="height:400px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>All \(N\) variants have <b>the same</b> true skill (dashed line). Each one is measured with noise of standard deviation \(\sigma \approx 173.7 \times 2/\sqrt{n_{\text{votes}}}\) points (an approximation of the error of a BT score near a 50% win rate). The champion gets the crown and goes to the public leaderboard. In “re-measure” mode, it is evaluated again with fresh votes and the luck disappears. The histogram accumulates the published values over the cycles. <b>Illustrative</b> simulation.</figcaption>
+  </figure>
+  <p>With 27 variants and 1,000 votes each, the published champion lands, on average, ~22 points above the truth without having improved at all (\(\sigma \approx 11\) points times \(\mathbb{E}[\max] \approx 2.0\) for 27 normals). The lesson applies to your lab: testing 20 checkpoints against the same 200 prompts and reporting the best one is exactly this mechanism. Keep a <span class="la-term" data-term="conjunto-de-selecao">selection set</span>, where you choose hyperparameters and checkpoints, separate from a <b>reporting set</b>, which you look at only once, at the end.</p>
+</section>
+
+<section class="la-sec">
+  <h2>Length and style: AlpacaEval-LC, Arena-Hard and MT-Bench</h2>
+  <p>Long, well-formatted answers look more complete, and judges, human and LLM alike, fall for it. The bias exists on the training side too: Singhal and colleagues (2023) decomposed PPO's reward gain and found that, in two of the scenarios studied, <b>70 to 90%</b> of the improvement came from length alone (<a data-ch="ppo-rlhf">chapter 55</a>). DPO also exploits verbosity, which is why LN-DPO and SimPO exist (<a data-ch="ipo-kto-simpo">chapter 58</a>). In evaluation, the antidote is statistical: estimate how much of the score comes from length and discount it.</p>
+  <h3>AlpacaEval 2 and the length-controlled win rate</h3>
+  <p><span class="la-term" data-term="alpacaeval">AlpacaEval 2</span> has 805 instructions and the default baseline <code>gpt4_turbo</code>; it costs less than US$10 and runs in under 3 minutes. The length-controlled version, <span class="la-term" data-term="wr-lc">WR-LC</span>, fits a generalized linear (logistic) model that predicts the annotator's preference from the model's identity, the length difference and the instruction's difficulty. The WR-LC is that model's prediction <b>with the length difference set to zero</b>, averaged over the instructions. This raised the Spearman correlation with Chatbot Arena from 0.94 to 0.98. The lab's simplified version, with your judge and your domain set:</p>
+  <div class="la-eq">
+    \[ \operatorname{logit} P(y = 1 \mid x) = \theta + \varphi\,\tanh\!\Big(\frac{\Delta\ell(x)}{\sigma_{\Delta\ell}}\Big), \qquad \Delta\ell = \ell_{\text{cand}} - \ell_{\text{base}}, \qquad \mathrm{WR}_{\text{LC}} = 100\cdot\sigma(\theta) \]
+    <ul class="la-eq-legend">
+      <li>\(y\): the pair's verdict (1 = candidate wins; a tie enters as a soft label of 0.5)</li>
+      <li>\(\Delta\ell\): length difference in tokens between the two answers</li>
+      <li>\(\sigma_{\Delta\ell}\): standard deviation of \(\Delta\ell\) over the set; the \(\tanh\) caps the effect of gigantic answers</li>
+      <li>\(\varphi\): how much the judge rewards length (0 = not at all)</li>
+      <li>\(\theta\): the candidate's advantage <i>at equal length</i>; \(\sigma(\theta)\) is the counterfactual \(\Delta\ell = 0\)</li>
+      <li>the AlpacaEval-LC paper adds a per-instruction difficulty term, \((\psi_m - \psi_b)\gamma_x\)</li>
+    </ul>
+  </div>
+  <figure class="la-fig" id="fig-lc" data-title="Discounting the verbosity">
+    <div class="la-fig-stage" style="height:420px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Each dot is a pair: on the x axis, how many more tokens the candidate wrote than the base; at the top, candidate wins; at the bottom, losses. The curve is the logistic regression being fitted by Newton's method, one iteration at a time. The bright dot at \(\Delta\ell = 0\) is the WR-LC; the dashed pink line is the raw WR. <b>Illustrative</b> data, generated with the chosen verbosity bias.</figcaption>
+  </figure>
+  <p>Leave the real quality at 50%, the candidate writing 200 more tokens and the verbosity bias at 1.2. The raw WR goes above 60%, but the WR-LC stays near 50%: the candidate isn't better, it's longer. Set the bias to zero and the two numbers coincide. The regression separates the two things because it uses the <i>variation</i> of \(\Delta\ell\) across pairs: the pairs where the candidate wrote little show how the judge decides without the length push. But it assumes that length, by itself, isn't quality. If in your domain longer answers really are more complete, WR-LC discounts real merit. And if almost every pair has the same \(\Delta\ell\), \(\theta\) and \(\varphi\) become confounded (the bootstrap CI blows up). Read the two numbers together and reread samples.</p>
+  <div class="la-callout math"><b class="t">How the curve is fitted</b><p>With \(p_i = \sigma(\theta + \varphi x_i)\) and \(x_i = \tanh(\Delta\ell_i/\sigma_{\Delta\ell})\), the fit maximizes the log-likelihood \(\ell(\theta,\varphi) = \sum_i \big[y_i \log p_i + (1-y_i)\log(1-p_i)\big]\), which is concave: it has a single maximum. The gradient is \(g = \sum_i (y_i - p_i)\,(1, x_i)\) and the Hessian is \(H = -\sum_i p_i(1-p_i)\,(1, x_i)(1, x_i)^\top\). The Newton step, \(w \leftarrow w - H^{-1} g\) with \(w = (\theta, \varphi)\), approximates \(\ell\) by a parabola and jumps to its top. It's the IRLS (iteratively reweighted least squares) of GLMs and converges in ~5 iterations; the figure animates one at a time. The tie's soft label \(y = 0.5\) works because cross-entropy is linear in \(y\): a tie is worth half a win plus half a loss. It's the same likelihood as the Bradley–Terry in <a data-ch="preferencias-reward-models">chapter 53</a>, with one extra covariate.</p></div>
+  <p>The authors themselves warn that the length bias shrinks but doesn't vanish and that high-stakes decisions require humans. Since the official AlpacaEval depends on a paid annotator (GPT-4 Turbo), the lab reuses the idea with the local judge:</p>
+  <pre data-lang="python"><code># wr_lc.py — WR with a bootstrap CI and length-controlled WR
+import json, sys, numpy as np
+from scipy.optimize import minimize
+rows = [json.loads(l) for l in open(sys.argv[1])]   # judge JSONL: {"y": 1|0|0.5, "len_c": …, "len_b": …}
+y = np.array([r["y"] for r in rows]); d = np.array([r["len_c"] - r["len_b"] for r in rows], float)
+rng = np.random.default_rng(0)
+boot = [y[rng.integers(0, len(y), len(y))].mean() for _ in range(2000)]
+print(f"WR = {100*y.mean():.1f}%  95% CI [{100*np.percentile(boot,2.5):.1f}, {100*np.percentile(boot,97.5):.1f}]")
+x = np.tanh(d / (d.std() + 1e-9))
+def nll(w):                                     # fractional y (0, 0.5, 1) = cross-entropy with a soft label
+    z = w[0] + w[1] * x; p = 1 / (1 + np.exp(-z))
+    return -np.sum(y * np.log(p + 1e-12) + (1 - y) * np.log(1 - p + 1e-12))
+w = minimize(nll, np.zeros(2)).x
+print(f"WR-LC = {100/(1+np.exp(-w[0])):.1f}%  (length coef. φ = {w[1]:.3f})")</code></pre>
+  <h3>Arena-Hard-Auto and MT-Bench</h3>
+  <p><span class="la-term" data-term="arena-hard">Arena-Hard-Auto</span> v0.1 gathered 500 hard prompts distilled from Chatbot Arena (the BenchBuilder pipeline), with 3× more separation between models than MT-Bench, 98.6% correlation with human rankings and a cost of US$20. v2.0 has 750 prompts (500 new real queries + 250 creative-writing ones), Gemini-2.5 as the official judge (or GPT-4.1, or an ensemble) and style control in <code>show_result.py --control-features</code>; the pipeline accepts OpenAI-API-compatible servers such as vLLM. With a local judge, it gives you an “out-of-domain” number to catch conversational-quality regression, which isn't comparable to the leaderboard, because the judge is different.</p>
+  <p><span class="la-term" data-term="mt-bench">MT-Bench</span> has 80 <b>two-turn</b> questions in 8 categories, scored 1 to 10 by a strong judge. It's saturated and judge-sensitive, but it still catches <b>multi-turn</b> regression: the SFT that broke the second turn because all of its data had a single turn.</p>
+</section>
+
+<section class="la-sec">
+  <h2>Don't break what worked: regression and verifiable benchmarks</h2>
+  <p>The alignment tax has a technical name, forgetting, and it comes in doses. “LoRA Learns Less and Forgets Less” (2024) showed that, on code and math, LoRA lags well behind full fine-tuning but better preserves out-of-domain performance (full fine-tuning learns perturbations of 10 to 100× higher rank). “LoRA Without Regret” (Thinking Machines, September 2025) refined the picture: LoRA matches full fine-tuning when applied to <b>all</b> matrices and with an LR ≈ 10× higher (<a data-ch="treino-memoria-lora">chapter 51</a>). Moral: how much you forget depends on how you trained, and only the fixed battery shows it.</p>
+  <h3>Instructions: IFEval and IFBench</h3>
+  <p><span class="la-term" data-term="ifeval">IFEval</span> has 25 types of code-verifiable instructions (word counts, JSON, no commas…) in ~500 prompts (541 rows in <code>google/IFEval</code>). Metrics: <code>prompt_level_strict_acc</code>, <code>inst_level_strict_acc</code> and the <code>loose</code> versions; lm-eval's <code>ifeval</code> task generates up to 1,280 tokens, 0-shot. It's the cheap detector of the most common regression: domain SFT teaches the style of the data and the model stops obeying “answer in 3 bullet points.” Its successor, IFBench, already shows up in 2026 model cards (<code>nvidia/Qwen3.8-27B-NVFP4</code>: 80.07 in BF16, 78.93 in NVFP4).</p>
+  <h3>Math: GSM8K, MATH and AIME</h3>
+  <p><span class="la-term" data-term="gsm8k">GSM8K</span> has 1,319 test problems (7,473 for training) and is saturated at the frontier: chapter 25 cites Qwen3.8-Flash-Next at 97.27% (1,283/1,319). Use it as a regression test, with the tasks <code>gsm8k</code> (5-shot), <code>gsm8k_cot_llama</code> (8-shot) or <code>gsm8k_cot_zeroshot</code>. The section 9 gates use GSM8K Platinum, a revised version of the test without the ambiguous or mislabeled items (description to be checked: the source only cites lm-eval's <code>gsm8k_platinum_cot_llama</code> task). MATH-500, a subset of MATH's 5,000 test problems, is saturated too. <span class="la-term" data-term="aime">AIME</span> has 30 problems per year; lm-eval ships <code>aime24</code> and <code>aime25</code> (0-shot, <code>max_gen_toks: 32768</code>), and the 2026 exams are in <code>MathArena/aime_2026</code> and <code>MathArena/hmmt_feb_2026</code>. With 30 items, each question is worth 3.3 points. Report pass@1 <b>averaged over k samples</b> at the model's recommended temperature, not a single greedy run. And use the same verifier in evaluation and in RL: TRL's <code>accuracy_reward</code> uses <code>math_verify</code> (LaTeX parsing, with priority to <code>\boxed{}</code>); with different verifiers, you optimize one thing and measure another.</p>
+  <h3>Code and agents</h3>
+  <p>In code, HumanEval (164 Python functions with tests) and HumanEval+ are saturated and serve only for regression, with lm-eval's <code>humaneval_instruct</code> and <code>humaneval_plus</code> tasks (which require <code>--confirm_run_unsafe_code</code>). What still separates models (LiveCodeBench with a date window, <span class="la-term" data-term="swe-bench">SWE-bench</span> Pro and Terminal-Bench) is in the table in section 7. For tools, <span class="la-term" data-term="bfcl">BFCL</span> V4 (updated on April 12, 2026) covers non-live calls, enterprise/OSS functions, multi-turn and agentic web search; the overall score is the <i>unweighted</i> average of the subcategories. <span class="la-term" data-term="tau2-bench">τ²-bench</span> (v1.0.1, July 2026) simulates customer service with a <b>user simulator</b> and tools on both sides, in the <code>airline</code>, <code>retail</code>, <code>telecom</code> and <code>banking_knowledge</code> domains. If your SFT touched tool calling, run a BFCL subset and 20 to 50 <code>retail</code> tasks with <code>--num-trials 4</code>, always with the <b>same parser</b> vLLM will use in production (<code>--tool-call-parser qwen3_xml</code> in the RedHatAI cards for Qwen3.8-27B; <a data-ch="api-tools-estruturado">chapter 34</a> explains why the parser is part of the model).</p>
+  <p>Agents call for a different metric. <span class="la-term" data-term="pass-at-k">pass@k</span> asks “does it work at least once in k tries?” <span class="la-term" data-term="pass-hat-k">pass^k</span> asks “does it work <i>every time</i>, across all k tries?”, which is the right question for an agent that will serve customers:</p>
+  <div class="la-eq">
+    \[ \text{pass@}k = \mathbb{E}_{\text{problems}}\!\left[1 - \frac{\binom{n-c}{k}}{\binom{n}{k}}\right], \qquad \text{pass}^k = \mathbb{E}_{\text{tasks}}\!\left[\frac{\binom{c}{k}}{\binom{n}{k}}\right] \]
+    <ul class="la-eq-legend">
+      <li>\(n\): samples generated per problem; \(c\): how many are correct</li>
+      <li>pass@k (Chen and colleagues, 2021): unbiased estimator of “at least one of k is correct”</li>
+      <li>pass^k (Yao and colleagues, 2024, τ-bench): “all k are correct”; \(\text{pass}^1 = \text{pass@}1\), and pass^k falls with k</li>
+    </ul>
+  </div>
+  <p>A task the agent gets right 80% of the time, with independent attempts, has pass@4 = \(1 - 0.2^4 \approx 0.998\) and pass^4 = \(0.8^4 \approx 0.41\). The same agent “solves almost everything” and “fails more than half of the customers who come back four times.”</p>
+  <h3>The fixed battery and the paired test</h3>
+  <p>The regression battery proposed for the lab: full IFEval, full GSM8K (0-shot CoT), AIME 2025 or 2026 (k = 4 samples), HumanEval-instruct, MMLU-Pro (stratified sample of ~1,000), a BFCL subset, XSTest and KL on generic text. Run it on the base and on each candidate and report Δ with a CI. For per-item binary metrics, use <span class="la-term" data-term="mcnemar">McNemar's test</span>, which looks only at the items that <i>changed</i>:</p>
+  <div class="la-eq">
+    \[ \chi^2 = \frac{\big(|b - c| - 1\big)^2}{b + c} \quad (1 \text{ degree of freedom}) \]
+    <ul class="la-eq-legend">
+      <li>\(b\): items right on the base and wrong on the candidate (what you <i>lost</i>)</li>
+      <li>\(c\): items wrong on the base and right on the candidate (what you <i>gained</i>)</li>
+      <li>the \(-1\) is the continuity correction; for small \(b + c\), use the exact binomial test</li>
+      <li>items that both get right or both get wrong carry no information about the difference</li>
+    </ul>
+  </div>
+  <figure class="la-fig" id="fig-mcnemar" data-title="McNemar: the regression hidden in the average">
+    <div class="la-fig-stage" style="height:430px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>500 <b>illustrative</b> items from a regression battery; the base gets 78% right. Each cell is an item: mint = both right, gray = both wrong, red = was right and became wrong (\(b\)), lavender = was wrong and became right (\(c\)). The 2×2 table counts the four groups. The intervals panel shows the same accuracy Δ with two intervals: treating the samples as independent (wide) and pairing the items (narrow).</figcaption>
+  </figure>
+  <p>With \(b = 20\) and \(c = 5\), accuracy drops from 78% to 75%. Treating the two evaluations as independent samples, the CI of the difference runs from about −8 to +2 points and crosses zero: “inconclusive.” Paired, \(\chi^2 = (15-1)^2/25 = 7.84\) and \(p \approx 0.005\): a real regression. Pairing wins because most of the variance across items is difficulty, and difficulty is the same for both models. It cancels out, as in the paired win rate.</p>
+  <h3>Running the battery: lm-evaluation-harness pointed at vLLM</h3>
+  <p><span class="la-term" data-term="lm-eval-harness">lm-evaluation-harness</span> (0.4.13) talks to the same server that goes to production. For <b>generative</b> tasks (IFEval, GSM8K-CoT, AIME, HumanEval-instruct), use the chat endpoint:</p>
+  <pre data-lang="bash"><code>lm_eval --model local-chat-completions \
+  --model_args model=q38-sft,base_url=http://SPARK_A:8000/v1/chat/completions,num_concurrent=16,max_retries=3,tokenized_requests=False \
+  --apply_chat_template --tasks ifeval,gsm8k_cot_zeroshot,aime25 \
+  --log_samples --output_path results/q38-sft</code></pre>
+  <ul>
+    <li>Log-likelihood and multiple-choice tasks (MMLU, ARC…) do <b>not</b> work on chat-completions: use <code>--model local-completions</code> (endpoint <code>/v1/completions</code>) with <code>--apply_chat_template</code>.</li>
+    <li>The direct <code>vllm</code> backend accepts an adapter: <code>--model vllm --model_args pretrained=Qwen/Qwen3.8-27B,tensor_parallel_size=1,lora_local_path=adapters/q38-sft,max_lora_rank=32,enable_thinking=False</code>. The wrapper turns on <code>enable_lora</code> by itself when it receives <code>lora_local_path</code>.</li>
+    <li>On the Mac, <code>mlx_lm.evaluate</code> is an lm-eval wrapper, but it <b>doesn't have</b> <code>--adapter-path</code>: evaluate the merged model, or serve with <code>mlx_lm.server --adapter-path</code> and use <code>local-chat-completions</code>.</li>
+    <li>Record <b>all</b> samples (<code>--log_samples</code>) so you can reread them when a number looks strange.</li>
+    <li>Alternative: <code>inspect-ai</code> 0.3.273 (UK AISI), good for agentic and safety evaluations with a sandbox.</li>
+  </ul>
+</section>
+
+<section class="la-sec">
+  <h2>Benchmarks age: saturation and contamination</h2>
+  <p>Every benchmark is born hard, becomes popular, saturates and sometimes rots. Saturating is natural: when every competent model scores 95%, the test stops separating models and is only good for catching regression. Rotting is worse: it's <span class="la-term" data-term="contaminacao">contamination</span>, when test items leak into training and the score starts measuring memory. It comes in three ways:</p>
+  <ol class="la-steps">
+    <li><b>Pretraining.</b> The benchmark is on the web and made it into the base model's trillions of tokens.</li>
+    <li><b>You.</b> When you generate synthetic data with a teacher that saw the benchmark, or when you scrape the web. If you ask the teacher to “generate math problems similar to these,” it may hand back near-copies of GSM8K that it memorized.</li>
+    <li><b>Selection.</b> Choosing a checkpoint or hyperparameter by looking at the test set. No item leaked, but the decision did (the winner's curse from section 4).</li>
+  </ol>
+  <p>The evidence is concrete. GSM1k (Zhang and colleagues, 2024) wrote new problems in the GSM8K style and saw drops of up to 8%, whole families with signs of overfitting and a relationship (Spearman \(r^2 = 0.36\)) between a model's probability of generating GSM8K examples and the size of its drop. MathArena evaluates competitions <b>on the day they come out</b> and found “strong signs of contamination in AIME 2024”. For 2026, use AIME 2026 and HMMT February 2026, not AIME 2024.</p>
+  <p>This matters for claims of <i>absolute</i> capability. For <i>regression</i> (Δ base × candidate), pretraining contamination weighs on both sides and cancels out in the pairing; that's why the battery still accepts AIME 2025. What invalidates the Δ is your SFT containing evaluation items, hence the decontamination below.</p>
+  <h3>How to detect it</h3>
+  <ul>
+    <li><span class="la-term" data-term="descontaminacao-ngramas"><b>N-gram overlap</b></span> between training and evaluation, on normalized text. Checking 8- to 13-grams is common practice; the exact threshold varies across technical reports, and 13 follows, as far as we know, the practice popularized by the GPT-3 report (not verified in the sources).</li>
+    <li><span class="la-term" data-term="min-k-prob"><b>Min-K% Prob</b></span> (Shi and colleagues): texts seen in training have fewer “surprise words.” The method gained 7.4% over previous ones on WikiMIA.</li>
+    <li><b>Dated sets</b> (LiveCodeBench, MathArena, the year's competitions) and fresh parallel sets (GSM1k).</li>
+    <li><b>Canary strings</b> embedded in evaluation datasets: if the model completes the string, it has seen the dataset.</li>
+  </ul>
+  <div class="la-eq">
+    \[ \text{Min-}K\%(x) = \frac{1}{|S_K|}\sum_{t \in S_K} \log p_\theta(x_t \mid x_{&lt;t}) \]
+    <ul class="la-eq-legend">
+      <li>\(x\): the suspect text, read with teacher forcing</li>
+      <li>\(\log p_\theta(x_t \mid x_{&lt;t})\): the log-probability the model gives each real token</li>
+      <li>\(S_K\): the \(K\%\) tokens with the lowest log-prob (the biggest surprises)</li>
+      <li>high score (barely negative) = not even the worst surprises are surprising = the text was likely seen</li>
+    </ul>
+  </div>
+  <figure class="la-fig" id="fig-contam" data-title="Hunting for contamination">
+    <div class="la-fig-stage" style="height:420px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption><b>N-grams:</b> a window of \(N\) words slides along the training example generated by the teacher; if some \(N\)-gram also exists in the test item, the window turns red and the example is removed. Switch between copy, light paraphrase and heavy paraphrase, and change \(N\). <b>Min-K%:</b> per-token \(\log p\) bars for a memorized text and an unseen one; the \(K\%\) most surprising tokens of each blink, and the score is their average. <b>Illustrative</b> texts and values.</figcaption>
+  </figure>
+  <p>The n-gram detector catches the near-copy with any \(N\) and the light paraphrase only with \(N \le 10\). Lowering \(N\) catches more, but also produces false positives on common phrases (“how much did she spend in total”). The heavy paraphrase gets past all of them: it's the same question in different words, and no lexical method can see it. That's why <i>dated</i> sets are the strongest defense: a problem written after the model's cutoff can't have leaked into pretraining.</p>
+  <p>In the lab, run decontamination of your SFT and DPO set <b>against every evaluation set</b> (domain, IFEval, GSM8K, AIME, HumanEval…) before training. The support script removes from training every item that shares a normalized 13-gram with any evaluation set; for short, one-line questions, complement it with approximate similarity (MinHash) and with a same-glossary-term check between train and test.</p>
+  <h3>What still discriminates in 2026</h3>
+  <p>MMLU, GSM8K, HumanEval and MATH-500 are saturated. The Artificial Analysis index (v4.3.2, 10 evaluations) already treats MMLU-Pro, AIME 2025, MATH-500, LiveCodeBench and old Terminal-Bench variants as “legacy.” What separates frontier models today:</p>
+  <table>
+    <thead><tr><th>Benchmark</th><th>Measures</th><th>Status in 2026</th></tr></thead>
+    <tbody>
+      <tr><td>Humanity’s Last Exam (HLE)</td><td>frontier, multidisciplinary questions</td><td>in the AA v4.3.2 index: 2,158 questions, pass@1 with an equality checker</td></tr>
+      <tr><td>GPQA Diamond</td><td>graduate-level science</td><td>still discriminates; Qwen3.8-27B: 89.2 (card) / 88.92 in BF16 (NVIDIA card)</td></tr>
+      <tr><td>LiveCodeBench</td><td>competitive programming with a <b>date window</b> (pick problems from after the model's cutoff)</td><td>active; the Qwen3.8-27B card reports 90.3</td></tr>
+      <tr><td>SWE-bench Pro / Pro Verified</td><td>patches in real repositories; Pro Verified (arXiv 2609.08149, September 2026) fixes leakage of solutions and tests</td><td>replaced Verified (500), abandoned by OpenAI in February 2026 over defective tests (secondary source, not verified); Qwen3.8-27B: 61.7 on Pro</td></tr>
+      <tr><td>Terminal-Bench 4.0, τ²-bench, BFCL V4</td><td>agents, terminal and tools</td><td>active; AA uses 66 Terminal-Bench tasks, pass@1 over 3 repetitions</td></tr>
+      <tr><td>ARC-AGI-3</td><td><b>interactive</b> benchmark (games: skill acquisition and efficiency)</td><td>ARC Prize 2026 on Kaggle; scores not verified</td></tr>
+      <tr><td>MathArena (AIME 2026, HMMT February 2026)</td><td>contamination-free math</td><td>verified datasets; aggregator scores, not verified</td></tr>
+    </tbody>
+  </table>
+  <p>For <b>your</b> 4 to 27B model post-trained at home, the frontier benchmarks (HLE, ARC-AGI-3, SWE-bench Pro) are expensive and barely sensitive to a domain SFT. The useful dashboard is IFEval/IFBench + GSM8K/AIME 2025-26 + HumanEval/LiveCodeBench + a BFCL/τ² subset + XSTest + domain win rate + KL.</p>
+</section>
+
+<section class="la-sec">
+  <h2>Safety in both directions</h2>
+  <p>A model can fail at safety in two opposite ways. It can <span class="la-term" data-term="sobre-recusa">refuse too much</span> (“how do I kill a process in Linux?” → “I can't help with violence”) or it can <b>comply with what it shouldn't</b>. Post-training can push it to either side, and evaluation has to measure both. The benchmarks are the ones <a data-ch="constitutional-ai">chapter 60</a> used to measure CAI:</p>
+  <table>
+    <thead><tr><th>Benchmark</th><th>Content</th><th>Measures</th></tr></thead>
+    <tbody>
+      <tr><td><span class="la-term" data-term="xstest"><b>XSTest</b></span></td><td><b>250 safe prompts</b> (10 types) that a calibrated model shouldn't refuse + 200 unsafe contrast prompts</td><td>over-refusal (“exaggerated safety”)</td></tr>
+      <tr><td>OR-Bench</td><td>a large set of “seemingly toxic” prompts</td><td>over-refusal at scale</td></tr>
+      <tr><td><span class="la-term" data-term="harmbench"><b>HarmBench</b></span></td><td>standardized framework: 18 red-teaming methods × 33 LLMs and defenses</td><td>attack success rate (ASR), with a classifier</td></tr>
+      <tr><td><span class="la-term" data-term="strongreject"><b>StrongREJECT</b></span></td><td>prompts that require specific harmful information + an evaluator that measures the response's <b>usefulness</b></td><td>“useful” undue compliance</td></tr>
+      <tr><td>JailbreakBench</td><td>standardized behaviors and attack artifacts</td><td>jailbreak robustness</td></tr>
+    </tbody>
+  </table>
+  <p>Prefer the StrongREJECT score to a binary ASR: jailbreaks that break through the refusal tend to <b>degrade capability</b>, and counting “didn't refuse” as a success overestimates the real danger.</p>
+  <h3>Three findings anyone doing post-training should know</h3>
+  <p><b>Fine-tuning erodes alignment.</b> Qi and colleagues (2023) broke GPT-3.5 Turbo's safeguards with <b>10 adversarial examples, for less than US$0.20</b>, through the fine-tuning API. They also showed that even <b>benign</b> data degrades safety, “though to a lesser extent”. Consequence: every domain SFT needs the safety axis in its battery, even without any “dangerous” data.</p>
+  <p><b>DPO can misalign by accident.</b> During DPO, the probability of the <i>preferred</i> response often falls along with that of the rejected one; what rises is the margin (<a data-ch="dpo">chapter 57</a>). When the pairs have similar embeddings (measured by the <span class="la-term" data-term="ches">CHES</span> score), the freed-up mass can migrate to responses with the opposite meaning. This is <span class="la-term" data-term="deslocamento-de-verossimilhanca">likelihood displacement</span>. In the paper's example, training to <i>refuse</i> reduced Llama-3-8B-Instruct's refusal rate from 74.4% to 33.4%. The diagnosis shows up in the training metrics: <code>logps/chosen</code> falling while <code>rewards/margins</code> rises (section 9).</p>
+  <p><b>Refusal is (almost) a direction.</b> Arditi and colleagues showed, across 13 open chat models of up to 72B, that refusal is mediated by a one-dimensional subspace: erasing the direction turns refusal off, and adding it triggers refusals on harmless prompts. It's the basis of <span class="la-term" data-term="abliteracao">abliteration</span> in <a data-ch="abliteracao">chapter 19</a>. In evaluation, it becomes the <span class="la-term" data-term="sonda-de-recusa">refusal probe</span>: estimate the <span class="la-term" data-term="direcao-de-recusa">refusal direction</span> \(\hat r\) on the <b>base</b>, project the residual activations (middle-to-late layers) of harmful and harmless prompts onto it, and compare before and after fine-tuning. A large drop in separation anticipates, cheaply and deterministically, the safety regression that StrongREJECT or HarmBench would show (an inference from the verified facts, not a published result).</p>
+  <figure class="la-fig" id="fig-seguranca" data-title="The refusal balance">
+    <div class="la-fig-stage" style="height:430px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>On the plane, x = undue refusal on safe prompts (XSTest-style) and y = undue compliance on harmful prompts (StrongREJECT-style). The ideal corner is the bottom left; the dashed rectangle is the lab's gate around the base. Pick an intervention and watch the model travel. In the probe panel, the curves are the projections of the activations onto \(\hat r\) (estimated on the base) for harmless (mint) and harmful (pink) prompts: dashed = before, filled = after. <b>Illustrative</b> positions and curves.</figcaption>
+  </figure>
+  <p>Benign SFT moves only a little, but upward. The 10 adversarial examples and abliteration end up in the “loose” corner, and with abliteration the two probe curves collapse to zero, because the direction was removed from the residual stream. Overdone safety post-training runs off to the right: it refuses too much, and the harmless curve slides toward the harmful one. Both mistakes become evaluation failures if you measure only one axis.</p>
+  <div class="la-callout danger"><b class="t">Responsible use</b><p>Abliteration doesn't replace safety evaluation: the GLM recipe <span class="la-rb glm"></span> itself records “KLD not measured with ablit.” In an abliterated or post-trained model, the four axes remain mandatory, and removing refusals without governance is a policy decision, not an engineering one: document who may use the model and for what. Abliterating <i>after</i> post-training requires re-estimating \(\hat r\) on the new model, because the direction changes with the fine-tune.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Drift and reward hacking: KL as a budget</h2>
+  <p>RLHF and DPO optimize reward while tied to an anchor (<a data-ch="ppo-rlhf">chapter 55</a>):</p>
+  <div class="la-eq">
+    \[ \max_\pi\ \mathbb{E}_{y\sim\pi}\big[r(x,y)\big] - \beta\,\mathrm{KL}\big(\pi \,\|\, \pi_{\text{ref}}\big), \qquad \pi^*(y\mid x) \propto \pi_{\text{ref}}(y\mid x)\,e^{\,r(x,y)/\beta} \]
+    <ul class="la-eq-legend">
+      <li>\(r\): reward (reward model, verifier or implicit reward)</li>
+      <li>\(\beta\): strength of the <span class="la-term" data-term="ancora-kl">KL anchor</span>; high \(\beta\) = small change</li>
+      <li>\(\pi_{\text{ref}}\): reference model, usually the SFT</li>
+      <li>\(\pi^*\): optimal policy: \(\pi_{\text{ref}}\) exponentially reweighted by the reward; that's where DPO gets its implicit reward \(\hat r = \beta\log(\pi/\pi_{\text{ref}})\), TRL's <code>rewards/*</code> metrics</li>
+    </ul>
+  </div>
+  <p>The realized KL is therefore the <b>budget spent</b> by post-training: how far the model moved away from the reference to buy reward. In practice it's estimated by sampling, on the tokens generated by the policy itself, with the per-token ratio \(\rho = \pi_{\text{ref}}(y_t)/\pi_\theta(y_t)\) (Schulman, “Approximating KL Divergence”, 2020):</p>
+  <div class="la-eq">
+    \[ k_1 = -\log\rho, \qquad k_2 = \tfrac12(\log\rho)^2, \qquad k_3 = (\rho - 1) - \log\rho = \operatorname{expm1}(\Delta) - \Delta, \quad \Delta = \log\pi_{\text{ref}} - \log\pi_\theta \]
+    <ul class="la-eq-legend">
+      <li>\(k_1\): unbiased, high variance, can be negative on a single sample</li>
+      <li>\(k_2\): biased, low variance</li>
+      <li>\(k_3\): unbiased and always \(\ge 0\); it's the one GRPO uses (DeepSeekMath)</li>
+      <li>example: \(\Delta = +0.5\) gives \(k_1 = -0.5\), \(k_2 = 0.125\), \(k_3 \approx 0.149\)</li>
+    </ul>
+  </div>
+  <p><code>mlx-lm-lora</code> implements exactly <code>expm1(log_ref − log_policy) − (log_ref − log_policy)</code>, with the log-ratio capped at 20, and reports in <code>kl_clip_ratio</code> how often the cap was hit.</p>
+  <div class="la-callout deep"><b class="t">Two rulers of “how much it changed”</b><p><b>(a)</b> \(\mathrm{KL}(\pi_\theta\|\pi_{\text{ref}})\) estimated with \(k_1\) or \(k_3\) on the tokens the <i>policy itself</i> generates. It's what the RLHF objective penalizes and what TRL's <code>kl</code> metric logs, and it depends on what the policy chose to write. <b>(b)</b> \(\mathrm{KL}(\pi_{\text{ref}}\|\pi_{\text{ft}})\) computed over the whole distribution, at each position of a <i>fixed</i> text, with teacher forcing. This one is comparable across candidates and with chapter 25, and it's the one the gates use. Since \(\mathrm{KL}(P\|Q) \ne \mathrm{KL}(Q\|P)\) and the measured texts are different, the two numbers aren't interchangeable: always report the direction and the text you measured on.</p></div>
+  <h3>Goodhart, measured: over-optimization</h3>
+  <p>“When a measure becomes a target, it ceases to be a good measure” (<span class="la-term" data-term="lei-de-goodhart">Goodhart's law</span>). The reward model is a learned <i>proxy</i>, and optimizing it too hard exploits its errors: that's <span class="la-term" data-term="reward-hacking">reward hacking</span>. Gao, Schulman and Hilton (2022) measured this in a synthetic experiment. A large RM (6B) played the role of the “human” (the <i>gold</i> RM) and labeled pairs to train <i>proxy</i> RMs from 3M to 3B; the policies were optimized against the proxy and evaluated by the gold one. The <b>true</b> reward rises and then <b>falls</b>, and the curves follow simple shapes in the distance \(d = \sqrt{\mathrm{KL}(\pi\,\|\,\pi_{\text{init}})}\):</p>
+  <div class="la-eq">
+    \[ R_{\text{bon}}(d) = d\,(\alpha_{\text{bon}} - \beta_{\text{bon}}\,d), \qquad R_{\text{RL}}(d) = d\,(\alpha_{\text{RL}} - \beta_{\text{RL}}\log d), \qquad \mathrm{KL}_{\text{bon}} = \log n - \frac{n-1}{n} \]
+    <ul class="la-eq-legend">
+      <li>\(R\): <i>gold</i> reward, with \(R(0) = 0\)</li>
+      <li>\(\alpha, \beta\): fitted coefficients; they depend on the proxy RM's size and on the data (not to be confused with the anchor's \(\beta\))</li>
+      <li>bon = <span class="la-term" data-term="best-of-n">best-of-\(n\)</span>: generate \(n\) responses and keep the one with the highest proxy score; the KL comes from the analytic formula, an upper bound that is nearly exact for long responses without ties (<a data-ch="awr-contrastivo">chapter 59</a>): n = 64 → ≤ 3.17 nats; n = 1,000 → ≤ 5.91; n = 60,000 → ≤ 10.00</li>
+      <li>peaks: best-of-n at \(d^* = \alpha/2\beta\); RL at \(d^* = e^{\alpha/\beta - 1}\)</li>
+    </ul>
+  </div>
+  <figure class="la-fig" id="fig-goodhart" data-title="The KL leash and the Goodhart curve">
+    <div class="la-fig-stage" style="height:430px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>x axis: \(d = \sqrt{\mathrm{KL}}\) (the top ticks show KL in nats). The lavender curve is the proxy the optimizer sees; the mint one is Gao and colleagues' gold reward, with <b>illustrative</b> coefficients (\(\alpha_{\text{bon}} = 1\), \(\beta_{\text{bon}} = 0.25\); \(\alpha_{\text{RL}} = 0.5\), \(\beta_{\text{RL}} = 0.2\)); the faded mint one is the other optimizer's gold, on the same axis. In RL mode, the leash is the penalty \(\beta_{\text{KL}}\,d^2\): the robot stops where the proxy's marginal gain equals the KL cost. In best-of-n mode, \(n\) sets \(d\) through the analytic formula (an upper bound). The proxy \(0.9\,d^{0.75}\) is a toy model.</figcaption>
+  </figure>
+  <p>Loosen the leash and the robot overshoots the peak: the proxy keeps rising and the gold falls, quickly in best-of-n and slowly in RL (the shape has a \(\log d\)). With the illustrative coefficients, the best-of-n peak sits at \(d = 2\) (KL = 4 nats) and the RL one at \(d = e^{1.5} \approx 4.5\) (KL ≈ 20 nats), with a lower maximum gold (≈ 0.90 versus 1.0): RL spent 5× more KL to reach a lower peak. Near \(d = 0\) the RL shape has an infinite slope, and the authors themselves warn that it probably doesn't hold there. Hence Gao and colleagues' two lessons for evaluation. First: since RL “consumes” much more KL than best-of-n for the same gain, <b>KL is no good for comparing how much optimization different methods did</b>. Second: in their setup, the KL penalty had an effect similar to early stopping; it didn't improve the gold × KL frontier.</p>
+  <h3>The signs in the training logs</h3>
+  <p>You don't have a gold RM, but you do have the metrics the TRL trainers log. The table is your reward-hacking dashboard (exact metric names):</p>
+  <table>
+    <thead><tr><th>Algorithm</th><th>Metric</th><th>Normal</th><th>Suspicious</th><th>Likely reading</th></tr></thead>
+    <tbody>
+      <tr><td>SFT</td><td><code>loss</code> vs <code>eval_loss</code></td><td>both fall</td><td>train ↓, eval ↑</td><td>overfitting: fewer epochs or a lower LR</td></tr>
+      <tr><td>SFT</td><td><code>mean_token_accuracy</code></td><td>rises slowly</td><td>~1.0 early</td><td>memorization or duplicated data</td></tr>
+      <tr><td>DPO</td><td><code>rewards/accuracies</code></td><td>0.6–0.8</td><td>→ 1.0 quickly</td><td>easy pairs or an exploited length bias</td></tr>
+      <tr><td>DPO</td><td><code>rewards/margins</code></td><td>rises</td><td>rises while <code>logps/chosen</code> plummets</td><td>likelihood displacement: ↑β, NLL on the preferred responses, filter pairs</td></tr>
+      <tr><td>DPO</td><td>mean length</td><td>stable</td><td>grows</td><td>verbosity exploitation</td></tr>
+      <tr><td>GRPO</td><td><code>reward</code></td><td>rises</td><td>rises with <code>completions/mean_length</code> exploding</td><td>length or format hacking</td></tr>
+      <tr><td>GRPO</td><td><code>frac_reward_zero_std</code></td><td>&lt; ~0.5</td><td>→ 1</td><td>groups all right or all wrong: no signal</td></tr>
+      <tr><td>GRPO</td><td><code>entropy</code></td><td>falls slowly</td><td>collapses early</td><td>entropy collapse</td></tr>
+      <tr><td>GRPO</td><td><code>kl</code></td><td>only appears with <code>beta&gt;0</code></td><td>grows nonstop</td><td>policy drifting away: ↑beta or stop</td></tr>
+      <tr><td>GRPO+vLLM</td><td><code>sampling/importance_sampling_ratio/*</code></td><td>~1</td><td>far from 1</td><td>training × inference mismatch (dtype, kernels)</td></tr>
+    </tbody>
+  </table>
+  <p>In RL with a verifiable reward, beyond the metrics, <b>read samples</b> (<code>log_completions=True</code>). The typical hacks: printing several <code>\boxed{}</code> boxes, repeating the problem statement, leaving the answer only inside <code>&lt;think&gt;</code>. Test the verifier against adversarial answers <i>before</i> training. A domain reward that only checks “the number appears in the answer” gets gamed by listing several numbers.</p>
+  <h3>Two KLDs you must not confuse</h3>
+  <table>
+    <thead><tr><th>Question</th><th>P (reference)</th><th>Q (candidate)</th><th>Expected</th></tr></thead>
+    <tbody>
+      <tr><td>What did post-training change?</td><td>original BF16 base</td><td>fine-tuned BF16 (merge or base + adapter)</td><td>generic text: small; domain: large (that's the intended effect)</td></tr>
+      <tr><td>How much damage did quantization do?</td><td><b>fine-tuned BF16 (merge)</b></td><td>quantized fine-tune</td><td>on the order of what the same format does to the base</td></tr>
+      <tr><td>Does the adapter work on a quantized base?</td><td>BF16 base + LoRA</td><td>quantized base + LoRA</td><td>≈ KLD of the quantized base alone</td></tr>
+    </tbody>
+  </table>
+  <p>In all three rows, use \(\mathrm{KL}(P\|Q) = \sum_v p(v)\big(\log p(v) - \log q(v)\big)\) per position, with teacher forcing, averaged over positions, and also report the median, p90, the PPL of both and <span class="la-term" data-term="top-1-agreement">top-1 agreement</span>. The most common mistake is measuring quantization against the original base: then you mix desired drift with damage. To calibrate your expectations, use the Module 1 anchors <span class="la-rb glm"></span>: on GLM-5.3-Flash, with 51,175 positions, the KLD against the reference model was 0.013723 nats for EXL3 K6, 0.024555 for the served 4 bpw EXL3, 0.024629 for the official FP8 on the same stack (0.020615 was measured on another stack and is not comparable) and 0.060535 for NVFP4. An NVFP4 of your fine-tune far above what the official NVFP4 does to the base, measured with the same script, points to bad calibration.</p>
+  <p>There's also a free drift signal: speculation's <span class="la-term" data-term="taxa-de-aceitacao">acceptance rate</span>. Qwen3.8-27B's <span class="la-term" data-term="mtp">MTP</span> head (<code>mtp_num_hidden_layers: 1</code>) was trained to predict the <b>base</b>. After a fine-tune that didn't train the MTP, acceptance tends to fall in proportion to the drift, the same phenomenon the GLM recipe's canary uses to detect a broken model (acceptance ~0). Compare per-position acceptance before and after with <code>--per-request-spec-decode-metrics</code> (vLLM 0.29+), as in <a data-ch="especulacao-fundamentos">chapter 35</a> (the effect is an inference; its magnitude was not measured).</p>
+  <h3>The gates, together</h3>
+  <p>Everything converges on a table you write <b>before</b> looking at any result. The suggested gates for the lab (a recommendation; adjust them before running):</p>
+  <table class="la-params">
+    <thead><tr><th>Axis</th><th>Measure</th><th>Suggested gate</th></tr></thead>
+    <tbody>
+      <tr><td>Target</td><td>WR and WR-LC vs base on the domain test (judge from another family, two orders), bootstrap 95% CI</td><td>lower bound of the WR-LC CI &gt; 50% and WR-LC ≥ 60%</td></tr>
+      <tr><td>Target</td><td>numeric accuracy in the domain (1% relative tolerance)</td><td>↑ vs base, CI not crossing zero</td></tr>
+      <tr><td>Regression</td><td>IFEval (<code>prompt_level_strict_acc</code>), GSM8K Platinum, AIME 2025 (2 seeds), thinking and non-thinking</td><td>Δ ≥ −2 pp (IFEval, GSM8K) and AIME Δ within the CI</td></tr>
+      <tr><td>Regression</td><td>BFCL (non-live + multi-turn) or τ² <code>retail</code>, 20 tasks × 4 attempts</td><td>Δ within the CI</td></tr>
+      <tr><td>Safety</td><td>XSTest: refusal on the 250 safe prompts; StrongREJECT (subset): mean score</td><td>refusal on safe prompts doesn't rise &gt; 2 pp; StrongREJECT score doesn't rise</td></tr>
+      <tr><td>Drift</td><td>KL(base‖candidate) per position, teacher-forced, on generic text (e.g., 200 windows of 2,048 tokens) and in the domain; mean length</td><td>report; investigate if the generic KL is ≫ that of the previous SFT</td></tr>
+      <tr><td>Speed</td><td>per-position MTP acceptance (base vs candidate)</td><td>report (it affects serving cost)</td></tr>
+    </tbody>
+  </table>
+  <p>Watch out for multiple comparisons. With \(k\) independent gates at 95%, the chance of at least one false alarm is \(1 - 0.95^k\), ≈ 30% for \(k = 7\). Use Holm–Bonferroni or preregister the rule “failed a gate → rerun with more samples before rejecting.”</p>
+  <p>Logistics matter too: the judges (the Module 1 recipes) and the candidates compete for the same two Sparks. The order that works: (1) serve the candidates and <b>generate and record</b> all responses (domain, XSTest, StrongREJECT, optional Arena-Hard v2); (2) run the verifiable tasks with lm-eval against the same servers; (3) tear everything down, bring up the judge recipe and judge the recorded responses. Same seed and same sampling for base and candidate; report mean ± CI across seeds (RedHatAI uses 3, and 8 for AIME). An adapter is only valid on the base it was trained on. After quantizing, repeat the battery <b>on the quantized model</b>: RedHatAI publishes a “recovery” between 98.27% and 100.88% for the NVFP4 of the Qwen3.8-27B base, the level to aim for.</p>
+  <p>With the four axes measured, the intervals computed and the gates decided in advance, all that's left is to run it. <a data-ch="receita-pos-treino">Chapter 63</a> puts together the full recipe: post-train on the Mac and on the two Sparks, evaluate with this battery, merge, re-quantize, measure the two KLDs and serve the result with the same vLLM from Module 1.</p>
+</section>

@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Latent Atlas — from neuron to cluster</title>
+  <meta name="description" content="Latent Atlas — plataforma para AI Researchers / a platform for AI researchers: ML, Transformers, MoE architectures, quantization, vLLM and distributed inference, with interactive figures and a copilot.">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='28' fill='none' stroke='%233FF49B' stroke-width='5' stroke-dasharray='10 6'/%3E%3Cellipse cx='32' cy='32' rx='20' ry='8' fill='none' stroke='%23BE8EFD' stroke-width='4'/%3E%3Ccircle cx='32' cy='32' r='7' fill='%233FF49B'/%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Oswald:wght@400;500;600;700&family=Poppins:ital,wght@0,300;0,400;0,500;0,600;0,700;1,400&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css" integrity="sha384-nB0miv6/jRmo5UMMR1wu3Gz6NLsoTkbqJghGIsx//Rlm+ZU03BU6SQNC66uf4l5+" crossorigin="anonymous">
+  <link rel="stylesheet" href="assets/css/core.css">
+  <link rel="stylesheet" href="assets/css/components.css">
+  <link rel="stylesheet" href="assets/css/copilot.css">
+  <link rel="stylesheet" href="assets/css/mlx.css">
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js" integrity="sha384-7zkQWkzuo3B5mTepMUcHkMB5jZaolc2xDwL6VFqjFALcbeS9Ggm/Yr2r3Dy4lfFg" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js" integrity="sha384-43gviWU0YVjaDtb/GhzOouOXtZMP/7XUzwPTstBeZFe/+rCMvRwr4yROQP43s0Xk" crossorigin="anonymous"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+</head>
+<body>
+  <div id="la-app"><noscript>Latent Atlas needs JavaScript enabled.</noscript></div>
+  <div id="la-copilot-root"></div>
+
+  <script src="assets/js/i18n.js"></script>
+  <script src="assets/js/core.js"></script>
+  <script src="assets/js/viz.js"></script>
+  <script src="assets/js/num.js"></script>
+  <script src="assets/js/copilot.js"></script>
+  <script src="data/mlx-models.js"></script>
+  <script src="assets/js/mlx.js"></script>
+  <script src="data/manifest.js"></script>
+  <script>
+    /* dados e capítulos do idioma ativo (en = padrão, sufixo .en; pt só quando escolhido no botão PT ou com ?lang=pt) */
+    (function () {
+      var sfx = LA.lang === 'en' ? '.en' : '';
+      var bundle = window.LA_BUNDLE_OVERRIDE || ('dist/chapters' + sfx + '.bundle.js');
+      document.write('<script src="data/glossary' + sfx + '.js"><\/script>' +
+        '<script src="data/catalog' + sfx + '.js"><\/script>' +
+        '<script src="' + bundle + '"><\/script>');
+    })();
+  </script>
+  <script>LA.boot();</script>
+</body>
+</html>

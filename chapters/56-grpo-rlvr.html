@@ -1,0 +1,437 @@
+<p class="la-lead">Em janeiro de 2025, a DeepSeek pegou o DeepSeek-V3-Base e, sem nenhuma etapa de SFT, o treinou com uma regra quase infantil. Para cada problema de matemática, o modelo gera 16 respostas; as que acertam, segundo um conferidor automático, ganham, as que erram perdem, e cada resposta é julgada em comparação com as irmãs do mesmo grupo. Não havia crítico, nem reward model neural, nem rótulo humano. Em 10.400 passos (versão revisada do paper), o <span class="la-term" data-term="pass-at-1">pass@1</span> no <span class="la-term" data-term="aime">AIME</span> 2024 foi de 15,6% para 77,9% (71,0% na versão de janeiro), e as respostas cresceram de centenas para milhares de tokens sem que ninguém pedisse. O algoritmo é o <span class="la-term" data-term="grpo">GRPO</span>, e a recompensa é <span class="la-term" data-term="rlvr">verificável</span>. Neste capítulo você vai ver por que dá para jogar fora o crítico do PPO, como ReMax, RLOO, REINFORCE++ e GRPO estimam vantagens só com estatística, o que DAPO, Dr. GRPO, CISPO, GSPO e SAPO consertaram, como se constrói um verificador que não se deixa enganar, como foi a receita do DeepSeek-R1 e por que, em 2026, o maior problema do RL virou a <i>consistência entre o motor de treino e o motor de inferência</i>, o mesmo vLLM do Módulo 1.</p>
+
+<section class="la-sec">
+  <h2>O crítico custa caro (e enxerga mal)</h2>
+  <p>Relembre o <a data-ch="ppo-rlhf">capítulo de PPO</a>. O RLHF clássico maximiza a nota de um <span class="la-term" data-term="reward-model">reward model</span> menos uma penalidade de KL que segura a política perto do SFT. O PPO precisa de uma <span class="la-term" data-term="vantagem">vantagem</span> \(\hat A_t\) por token e a estima com GAE, apoiado num <span class="la-term" data-term="critico">crítico</span> \(V_\phi\) que prevê, a partir de cada prefixo, quanto de recompensa ainda está por vir:</p>
+  <div class="la-eq">
+    \[ \hat A_t=\sum_{l\ge 0}(\gamma\lambda)^l\,\delta_{t+l},\qquad \delta_t=r_t+\gamma\,V_\phi(s_{t+1})-V_\phi(s_t) \]
+    <ul class="la-eq-legend">
+      <li>\(\hat A_t\): vantagem do token \(t\), quanto ele foi melhor que o esperado</li>
+      <li>\(\delta_t\): erro de diferença temporal (TD); \(r_t\): recompensa no token \(t\), zero até o último token no RLHF (fora a penalidade de KL)</li>
+      <li>\(V_\phi(s_t)\): previsão do crítico para o prefixo \(s_t\)</li>
+      <li>\(\gamma\): desconto (1 na reprodução N+ do RLHF); \(\lambda\): parâmetro do GAE, que troca viés por variância</li>
+    </ul>
+  </div>
+  <p>Esse desenho tem dois custos que pesam em raciocínio. O primeiro é <b>memória</b>: quatro redes do tamanho da política (política e crítico treináveis, referência e RM congelados). Com a regra do <a data-ch="treino-memoria-lora">capítulo de memória de treino</a>, 16 bytes por parâmetro treinável (pesos e gradientes BF16, cópia mestre FP32, dois momentos do Adam) e 2 bytes por congelado, o total é \(2\times16N+2\times2N=36N\) bytes. Um 7B pede 252 GB (234,7 GiB) antes de ativações e KV cache, ~96% dos ≈ 243 GiB (2 × 121,69 GiB, ≈ 261 GB) que dois DGX Spark expõem ao CUDA: só os estados cabem.</p>
+  <p>O segundo custo é de <b>sinal</b>. A recompensa chega no fim de milhares de tokens, e a fatia dela que alcança <i>diretamente</i> o token \(t\) pesa \((\gamma\lambda)^{T-t}\); o resto precisa ser carregado pelo crítico, prefixo a prefixo. Com \(\lambda=0{,}95\), a 50 tokens do fim sobram 7,7% do sinal; a 500 tokens, \(7{,}3\times10^{-12}\). Com \(\lambda=0{,}99\), a 500 tokens sobram 0,66%. Se o crítico prevê mal, o começo do raciocínio aprende ruído. O VC-PPO apontou exatamente essas duas causas para o colapso do PPO em cadeias longas: viés na inicialização do crítico e decaimento do sinal de recompensa.</p>
+  <figure class="la-fig" id="fig-critico" data-title="Quatro modelos e um farol que se apaga">
+    <div class="la-fig-stage" style="height:390px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>À esquerda, a memória de pesos e otimizador (sem ativações nem KV) do PPO-RLHF e do GRPO, com 16 B por parâmetro treinável e 2 B por congelado; as linhas tracejadas marcam 130,7 GB (os 121,69 GiB visíveis num DGX Spark) e 261,3 GB (dois). À direita, o “farol” da recompensa final percorre a resposta de trás para a frente, e a cor de cada token é o peso \(\lambda^{d}\) com que a recompensa o alcança, sendo \(d\) a distância até o fim. No modo GRPO, todos os tokens recebem a mesma vantagem de uma vez.</figcaption>
+  </figure>
+  <p>No modo GRPO a vantagem não viaja de token em token: é carimbada igualzinha em todos, porque a recompensa de resultado é uma nota da <i>resposta inteira</i>. O paper do RLOO defende essa leitura: quando a recompensa só existe no fim, tratar a completion como <b>uma única ação</b>, um <span class="la-term" data-term="bandit">bandit</span>, basta, e o MDP token a token do <a data-ch="rl-fundamentos">capítulo de fundamentos</a> vira complicação desnecessária.</p>
+  <h3>O truque: um baseline que não precisa ser aprendido</h3>
+  <p>Todos os métodos deste capítulo partem do REINFORCE com <span class="la-term" data-term="baseline-rl">baseline</span>:</p>
+  <div class="la-eq">
+    \[ \nabla_\theta J=\mathbb{E}_{y\sim\pi_\theta(\cdot\mid x)}\Big[\big(R(x,y)-b(x)\big)\,\nabla_\theta\log\pi_\theta(y\mid x)\Big] \]
+    <ul class="la-eq-legend">
+      <li>\(x\): prompt; \(y\): resposta amostrada inteira; \(R(x,y)\): recompensa escalar (de um RM, de um verificador…)</li>
+      <li>\(b(x)\): baseline, qualquer número que não dependa de \(y\)</li>
+      <li>\(\nabla_\theta\log\pi_\theta(y\mid x)\): soma dos gradientes das log-probs dos tokens de \(y\)</li>
+    </ul>
+  </div>
+  <p>O baseline não muda a média do gradiente, só a variância: \(\mathbb{E}_y[b\,\nabla\log\pi(y)]=b\sum_y\pi(y)\frac{\nabla\pi(y)}{\pi(y)}=b\,\nabla\sum_y\pi(y)=b\,\nabla 1=0\). O crítico do PPO é um baseline aprendido e caro. A pergunta do resto do capítulo é se dá para conseguir um baseline bom <b>de graça</b>, só com estatística das próprias amostras.</p>
+  <div class="la-callout deep"><b class="t">Uma lente única: o coeficiente de gradiente</b><p>O paper do GRPO (DeepSeekMath) vê SFT, RFT, PPO e GRPO como o mesmo gradiente, \(\nabla_\theta J=\mathbb{E}\big[\tfrac{1}{|o|}\sum_t GC(q,o,t)\,\nabla_\theta\log\pi_\theta(o_t\mid q,o_{&lt;t})\big]\), em que só mudam a fonte dos dados e o <i>coeficiente</i> \(GC\), que diz quanto e em que sentido cada token é empurrado. Cada método é um mapa de cores sobre a mesma resposta.</p></div>
+  <table>
+    <thead><tr><th>Método</th><th>Dados</th><th>Coeficiente por token</th></tr></thead>
+    <tbody>
+      <tr><td>SFT</td><td>dataset humano fixo</td><td>1</td></tr>
+      <tr><td>RFT</td><td>amostras do SFT filtradas</td><td>1 nas corretas, 0 nas erradas</td></tr>
+      <tr><td>PPO</td><td>online</td><td>\(\hat A_t\) (GAE com crítico)</td></tr>
+      <tr><td>GRPO</td><td>online, \(G\) por prompt</td><td>\(\hat A_{i,t}+\beta(\pi_{\text{ref}}/\pi_\theta-1)\)</td></tr>
+      <tr><td>On-policy distillation (forma por token)</td><td>online</td><td>\(\log\pi_{\text{prof}}-\log\pi_\theta\)</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="la-sec">
+  <h2>Baselines sem crítico: ReMax, RLOO e REINFORCE++</h2>
+  <p><b>ReMax</b> (Li et al., 2023) usa como baseline a recompensa da resposta <i>gulosa</i> (greedy) ao mesmo prompt:</p>
+  <div class="la-eq">
+    \[ \nabla J=\sum_t\nabla\log\pi_\theta(a_t\mid x,a_{&lt;t})\,\big(r(x,a_{1:T})-r(x,\bar a_{1:T})\big) \]
+    <ul class="la-eq-legend">
+      <li>\(a_{1:T}\): resposta amostrada; \(\bar a_{1:T}\): resposta greedy; \(r(\cdot)\): recompensa (no paper, um RM)</li>
+    </ul>
+  </div>
+  <p>Ele explora três propriedades do RLHF que o PPO ignora: simular é rápido, as transições são determinísticas (o “ambiente” só concatena o token) e a recompensa é da trajetória. Custa uma geração greedy extra por prompt e, segundo o paper, usa cerca de 46% menos memória de GPU que o PPO num 7B, elimina mais de quatro hiperparâmetros e levou um Mistral-7B a 94,78% de win rate no AlpacaEval e 7,739 no MT-bench.</p>
+  <p>O <b><span class="la-term" data-term="rloo">RLOO</span></b> (REINFORCE Leave-One-Out; Ahmadian et al., Cohere, 2024) amostra \(k\) respostas por prompt e usa, para cada uma, a média das <i>outras</i>:</p>
+  <div class="la-eq">
+    \[ \nabla J\approx\frac1k\sum_{i=1}^{k}\Big[R(y_i,x)-\frac{1}{k-1}\sum_{j\ne i}R(y_j,x)\Big]\,\nabla\log\pi(y_i\mid x) \]
+    <ul class="la-eq-legend">
+      <li>\(k\): respostas para o mesmo prompt \(x\); o baseline de \(y_i\) exclui \(y_i\), então não depende dela e não enviesa</li>
+    </ul>
+  </div>
+  <p>Uma conta curta liga o RLOO à média simples: \(R_i-\text{média dos outros}=\frac{k}{k-1}(R_i-\text{média de todos})\). Com \(R=(1{,}0;\ 0{,}0;\ 0{,}5;\ 0{,}9)\), as vantagens RLOO são \(+0{,}533\), \(-0{,}800\), \(-0{,}133\) e \(+0{,}400\), exatamente \(4/3\) de \(R_i-0{,}6\). O paper observa que, no RLHF, o clipping do PPO ativou em menos de 5% do tempo por batch: os dados já são quase on-policy, e as salvaguardas do PPO pouco fazem. Com \(k\in\{2,4\}\), o RLOO superou o PPO por 3,2% a 32,1% de win rate (TL;DR e Anthropic HH, com Pythia-6.9B e Llama-7B), além de RAFT e DPO.</p>
+  <figure class="la-fig" id="fig-baselines" data-title="Uma nuvem de gradientes para cada baseline">
+    <div class="la-fig-stage" style="height:430px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Cada ponto é <b>uma</b> estimativa do gradiente, feita com \(k\) amostras de uma política de brinquedo com quatro respostas (A, B, C, D); os eixos são \(\partial J/\partial z_A\) e \(\partial J/\partial z_B\), e a seta é o gradiente verdadeiro, calculado exatamente. Sem baseline, a nuvem é larga; ReMax e RLOO a apertam em volta do mesmo centro. A média do grupo <i>incluindo</i> a própria amostra encolhe o centro por \((k-1)/k\); o GRPO (÷ desvio) muda a escala grupo a grupo. Probabilidades e recompensas <b>ilustrativas</b>.</figcaption>
+  </figure>
+  <p>Brinque com as notas de RM. Um reward model de Bradley–Terry não tem zero natural (a perda só vê diferenças de nota), então todas as respostas podem ganhar “2 e pouco”. Sem baseline, cada amostra empurra para cima a própria resposta, e quem decide a direção é o sorteio. Qualquer baseline razoável remove esse deslocamento comum. Com \(k=2\), a média que inclui a própria amostra corta o gradiente esperado pela metade, enquanto o RLOO continua centrado.</p>
+  <div class="la-callout info"><b class="t">Como ler os números deste capítulo</b><p>Daqui em diante, quase todo resultado é uma métrica de amostragem num benchmark de raciocínio. <span class="la-term" data-term="pass-at-1">pass@1</span>: fração de problemas resolvidos com uma amostra (na prática, a média de várias amostras por problema); <span class="la-term" data-term="avg-at-k">avg@32</span>: essa média com 32 amostras; <span class="la-term" data-term="cons-at-k">cons@64</span>: o voto da maioria entre 64 amostras (self-consistency), que fica acima do pass@1 porque os erros se dispersam e a resposta certa tende a ser a mais votada. O <span class="la-term" data-term="aime">AIME</span> é uma competição americana de matemática com 30 problemas de resposta inteira por ano (cada questão vale 3,3 pontos); o MATH-500 tem 500 problemas de teste do dataset MATH; o GPQA-Diamond, perguntas de ciência de nível de pós-graduação; o LiveCodeBench, programação competitiva. O <a data-ch="avaliacao-pos-treino">capítulo de avaliação</a> volta a eles.</p></div>
+  <h3>REINFORCE++: normalizar no batch inteiro</h3>
+  <p>O <span class="la-term" data-term="reinforce-pp">REINFORCE++</span> (Hu et al., versão de novembro de 2025) usa uma resposta por prompt, põe o KL na recompensa a partir de cada token e normaliza a vantagem pelo <b>batch global</b>:</p>
+  <div class="la-eq">
+    \[ A_{q,o_t}=r(o_{1:T},q)-\beta\sum_{i=t}^{T}\mathrm{KL}(i),\qquad A^{\text{norm}}_{q,o_t}=\frac{A_{q,o_t}-\operatorname{mean}_{\text{batch}}(A)}{\operatorname{std}_{\text{batch}}(A)+\epsilon} \]
+    <ul class="la-eq-legend">
+      <li>\(\mathrm{KL}(i)=\log\big(\pi_{\theta_{\text{old}}}(o_i\mid\cdot)/\pi_{\text{ref}}(o_i\mid\cdot)\big)\), somado do token \(t\) até o fim; \(\beta\): peso do KL</li>
+      <li>\(\operatorname{mean}_{\text{batch}},\operatorname{std}_{\text{batch}}\): estatísticas de todas as respostas do batch, de muitos prompts</li>
+    </ul>
+  </div>
+  <p>Na variante REINFORCE++-baseline (\(k&gt;1\)), subtrai-se a média do <i>grupo</i>, divide-se pelo desvio do <i>batch</i>, e o KL entra como perda \(\tfrac12(\log\pi_\theta/\pi_{\text{ref}})^2\) (o k2, da próxima seção). A crítica ao GRPO: dividir pelo desvio <b>local</b> é enviesado (numerador e denominador vêm das mesmas amostras) e explode quando as notas são parecidas, premiando ser “melhor que as irmãs” em vez de ser bom. Treinando em 30 problemas do AIME-24, o GRPO chegou a 95,0% no treino e 0,0% de pass@1 no AIME-25; o REINFORCE++, a 71,0% e 2,5%. Num chat geral (Chat-Arena-Hard), o REINFORCE++ com \(k=1\) empatou com o GRPO (46,7 contra 46,8), com respostas mais curtas (832 contra 860 tokens) e KL mais estável. Com dois prompts de quatro respostas, A = [1, 0, 1, 0] e B = [1, 0, 0, 0] (contas exatas):</p>
+  <table>
+    <thead><tr><th>Esquema</th><th>prompt A</th><th>prompt B</th></tr></thead>
+    <tbody>
+      <tr><td>GRPO (média e desvio do grupo)</td><td>±1</td><td>+1,732 / −0,577 (×3)</td></tr>
+      <tr><td>REINFORCE++-baseline (desvio do batch, 0,4677)</td><td>±1,069</td><td>+1,604 / −0,535 (×3)</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="la-sec">
+  <h2>GRPO: o grupo como régua</h2>
+  <p>O GRPO (Group Relative Policy Optimization) nasceu no DeepSeekMath (Shao et al., 2024) e ficou famoso com o R1. Ele mantém a <span class="la-term" data-term="razao-de-importancia">razão de importância</span> e o clip do PPO e troca o crítico pela estatística de um grupo de \(G\) respostas ao mesmo prompt:</p>
+  <div class="la-eq">
+    \[ \mathcal{J}_{\text{GRPO}}(\theta)=\mathbb{E}\Bigg[\frac1G\sum_{i=1}^{G}\frac{1}{|o_i|}\sum_{t=1}^{|o_i|}\Big\{\min\!\Big[r_{i,t}(\theta)\,\hat A_{i,t},\ \mathrm{clip}\big(r_{i,t}(\theta),1-\varepsilon,1+\varepsilon\big)\hat A_{i,t}\Big]-\beta\,\mathbb{D}_{\text{KL}}\big[\pi_\theta\,\|\,\pi_{\text{ref}}\big]\Big\}\Bigg] \]
+    <ul class="la-eq-legend">
+      <li>\(q\sim P(Q)\): pergunta; \(\{o_i\}_{i=1}^{G}\sim\pi_{\theta_{\text{old}}}(\cdot\mid q)\): o grupo; \(|o_i|\): comprimento em tokens</li>
+      <li>\(r_{i,t}(\theta)=\pi_\theta(o_{i,t}\mid q,o_{i,&lt;t})/\pi_{\theta_{\text{old}}}(o_{i,t}\mid q,o_{i,&lt;t})\): razão de importância por token</li>
+      <li>\(\hat A_{i,t}\): vantagem (abaixo); \(\varepsilon\): largura do clip</li>
+      <li>\(\beta\): peso do KL (0,04 no DeepSeekMath); \(\pi_{\text{ref}}\): referência, em geral o SFT</li>
+    </ul>
+  </div>
+  <div class="la-eq">
+    \[ \underbrace{\hat A_{i,t}=\tilde r_i=\frac{r_i-\operatorname{mean}(\mathbf r)}{\operatorname{std}(\mathbf r)}}_{\text{resultado}}\qquad\qquad \underbrace{\hat A_{i,t}=\sum_{\operatorname{index}(j)\ge t}\tilde r_i^{\,\operatorname{index}(j)}}_{\text{processo}} \]
+    <ul class="la-eq-legend">
+      <li>\(\mathbf r=(r_1,\dots,r_G)\): recompensas do grupo; no resultado, a mesma vantagem vale para todo token</li>
+      <li>no processo, \(\tilde r^{\operatorname{index}(j)}\) são recompensas de passo normalizadas no grupo, somadas dos passos a partir do token</li>
+    </ul>
+  </div>
+  <p>Por que dividir pelo desvio? A média já dá o baseline; a divisão cuida da <b>escala</b>: deixa a vantagem com tamanho ~1 em qualquer prompt e para qualquer escala de recompensa (o mesmo branqueamento de vantagens do <a data-ch="ppo-rlhf">PPO</a>), e o passo efetivo não depende de o RM dar notas em [0, 1] ou em [−10, 10]. O preço são os dois extremos descritos logo depois da figura.</p>
+  <p>Três diferenças em relação ao PPO. <b>(1) Sem crítico:</b> baseline e escala vêm do grupo, a <span class="la-term" data-term="vantagem-de-grupo">vantagem de grupo</span>. <b>(2) KL na perda, não na recompensa</b>, e a vantagem fica só com o sinal da tarefa. <b>(3) Média por resposta:</b> o \(1/|o_i|\) faz cada resposta pesar igual no total, e daí sai o viés de comprimento da próxima seção. O DeepSeekMath-RL usou lr \(10^{-6}\), \(\beta=0{,}04\), <b>64 amostras por pergunta</b>, comprimento máximo e batch de 1.024 e uma atualização por fase de exploração; no GRPO iterativo, o RM é retreinado com amostras da política e 10% de replay histórico.</p>
+  <figure class="la-fig" id="fig-grupo" data-title="Vantagens de grupo, passo a passo">
+    <div class="la-fig-stage" style="height:420px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>As barras são as recompensas das respostas a um mesmo prompt. A animação faz as contas em cinco tempos: notas, média, subtrair o baseline, dividir pelo desvio e carimbar a vantagem em todos os tokens de cada resposta (as colunas embaixo). Nos grupos 0/1, clique numa barra para trocar acerto por erro. Compare GRPO, Dr. GRPO e RLOO e as duas convenções de desvio.</figcaption>
+  </figure>
+  <p>Faça a conta com a figura. Grupo de 8, três acertos: \(\mathbf r=[1,0,0,1,1,0,0,0]\). Média 0,375, desvio populacional 0,4841: cada acerto recebe \(\hat A=(1-0{,}375)/0{,}4841=+1{,}291\) e cada erro, \(-0{,}775\). Com o desvio amostral (\(n-1\), o padrão de <code>torch.std</code>), 0,5175, ficam \(+1{,}208\) e \(-0{,}725\); o paper não especifica, e as implementações divergem. As vantagens somam zero: dentro do grupo, uma resposta só sobe se uma irmã descer.</p>
+  <p>Dois extremos movem metade da literatura de 2025. <b>Grupo unânime</b>, todo certo ou todo errado: desvio zero, vantagem zero, gradiente zero, e \(G\) gerações jogadas fora (o TRL registra a fração desses grupos em <code>frac_reward_zero_std</code>). <b>Notas quase empatadas</b>, como um RM contínuo dando [0,90; 0,90; 0,90; 0,91]: o desvio é 0,00433, e uma diferença de 0,01 vira vantagem \(+1{,}732\), a mesma de um acerto genuíno num grupo de quatro.</p>
+  <p>E o clip? Se cada lote de rollouts gera um só passo de gradiente, \(r_{i,t}=1\) na atualização e o objetivo vira REINFORCE com baseline de grupo. O clip importa quando um rollout alimenta vários minibatches: o R1-Zero dividia 8.192 saídas em 16 minibatches, e o DAPO faz 16 atualizações por rollout.</p>
+  <h3>A coleira do KL e seus três estimadores</h3>
+  <p>O termo \(\beta\,\mathbb{D}_{\text{KL}}\) é estimado token a token, só no token amostrado. O GRPO usa o <span class="la-term" data-term="estimador-k3">k3</span>:</p>
+  <div class="la-eq">
+    \[ k_3=\frac{\pi_{\text{ref}}(o_{i,t}\mid\cdot)}{\pi_\theta(o_{i,t}\mid\cdot)}-\log\frac{\pi_{\text{ref}}(o_{i,t}\mid\cdot)}{\pi_\theta(o_{i,t}\mid\cdot)}-1,\qquad k_1=\log\frac{\pi_\theta}{\pi_{\text{ref}}},\qquad k_2=\frac12\Big(\log\frac{\pi_{\text{ref}}}{\pi_\theta}\Big)^2 \]
+    <ul class="la-eq-legend">
+      <li>\(\pi_{\text{ref}}(o_{i,t}\mid\cdot)\), \(\pi_\theta(o_{i,t}\mid\cdot)\): probabilidades da referência e da política para o token amostrado</li>
+      <li>\(k_1\): acerta na média, mas pode ser negativo token a token; \(k_2\): gradiente casa com o do KL reverso</li>
+      <li>\(k_3=x-\log x-1\), com \(x=\pi_{\text{ref}}/\pi_\theta\): sempre \(\ge0\) e sem viés, porque \(\mathbb{E}_{\pi_\theta}[x]=1\)</li>
+    </ul>
+  </div>
+  <p>Os três concordam perto da referência e discordam longe dela. Com \(\pi_\theta=0{,}5\) e \(\pi_{\text{ref}}=0{,}25\): k1 = 0,693, k2 = 0,240, k3 = 0,193. Com \(\pi_\theta=0{,}01\) e \(\pi_{\text{ref}}=0{,}2\), um token que a política quase abandonou: k1 = −2,996, k2 = 4,487, k3 = 16,004. O gradiente do k3 em relação a \(\log\pi_\theta\) é \((1-\pi_{\text{ref}}/\pi_\theta)\), então ele soma \(\beta(\pi_{\text{ref}}/\pi_\theta-1)\) ao coeficiente: com \(\beta=0{,}04\) e razão 20, 0,76, do tamanho de uma vantagem inteira. A coleira vira um puxão.</p>
+  <figure class="la-fig" id="fig-kl" data-title="A coleira do KL: k1, k2 e k3">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Em cima, a política (o bichinho) e a referência (o poste) no eixo de probabilidade do token amostrado, em escala log; a tensão da coleira acompanha o k3, e a seta é o puxão que o KL soma ao coeficiente de gradiente, \(\beta(x-1)\) com \(\beta=0{,}04\). Embaixo, os três estimadores em função de \(u=\ln(\pi_{\text{ref}}/\pi_\theta)\). Veja o k1 ficar negativo e o k3 explodir quando \(\pi_\theta\ll\pi_{\text{ref}}\).</figcaption>
+  </figure>
+  <p>Daí duas tendências. Muita gente desligou o KL em raciocínio: o DAPO argumenta que, em CoT longo, a política <i>precisa</i> se afastar do modelo inicial; o GLM-4.5 e o RL de raciocínio do GLM-5 não usam o termo; o <code>GRPOConfig</code> do TRL vem com <code>beta=0.0</code>. O R1-Zero usou KL 0,001 e trocava a referência pela política a cada 400 passos. Quem mantém o KL o corrige: o DeepSeek-V3.2 multiplica o k3 por \(\pi_\theta/\pi_{\text{old}}\), tornando-o não enviesado quando as amostras vieram de outra política, e relata que, em matemática, KL fraco ou nenhum funcionou melhor.</p>
+</section>
+
+<section class="la-sec">
+  <h2>Consertando o GRPO: Dr. GRPO e DAPO</h2>
+  <p>O <span class="la-term" data-term="dr-grpo">Dr. GRPO</span> (“Understanding R1-Zero-Like Training: A Critical Perspective”, Liu et al., 2025) achou dois vieses escondidos na normalização.</p>
+  <ol class="la-steps">
+    <li><b>Viés de comprimento.</b> O \(1/|o_i|\) dá a cada resposta o mesmo peso total. Com vantagem positiva, a resposta curta concentra o peso em poucos tokens (preferência pela brevidade entre as certas); com vantagem negativa, a longa dilui a punição. Resultado: respostas <b>erradas ficam mais longas</b>.</li>
+    <li><b>Viés de dificuldade.</b> Dividir pelo desvio dá mais peso a perguntas com pouca variância, quase todas certas ou quase todas erradas.</li>
+  </ol>
+  <div class="la-eq">
+    \[ \tilde A_{i,t}=R(q,o_i)-\operatorname{mean}\big(\{R(q,o_1),\dots,R(q,o_G)\}\big),\qquad \text{perda da resposta } i=\frac{\sum_t \ell_{i,t}\,m_{i,t}}{\text{MAX\_TOKENS}} \]
+    <ul class="la-eq-legend">
+      <li>\(\tilde A_{i,t}\): vantagem só centrada; \(\ell_{i,t}\): o termo clipado do GRPO; \(m_{i,t}\): máscara dos tokens válidos</li>
+      <li>MAX_TOKENS: constante (o orçamento máximo de geração), igual para todas as respostas</li>
+    </ul>
+  </div>
+  <p>Com essa receita minimalista, o Oat-Zero-7B chegou a 43,3% no AIME 2024 (27 horas em 8 A100). O paper também mostra que modelos base Qwen2.5 já exibem o “aha moment” <i>antes</i> do RL, e que o template do prompt pode destruir capacidades que o RL depois reconstrói.</p>
+  <figure class="la-fig" id="fig-comprimento" data-title="Gotas de gradiente sobre respostas de tamanhos diferentes">
+    <div class="la-fig-stage" style="height:360px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Quatro respostas ao mesmo prompt, com recompensas [1, 1, 0, 0] e comprimentos [200, 800, 300, 1.700] tokens (o último é ajustável). A densidade das gotas sobre cada faixa é o peso por token (verde sobe, vermelho desce), e a barra à direita é o peso total da resposta. As escalas absolutas variam entre implementações; compare as proporções.</figcaption>
+  </figure>
+  <p>Os números da figura (contas exatas): no GRPO, \(\hat A=[+1,+1,-1,-1]\) e o peso por token é \(\hat A_i/(G|o_i|)\): \(+0{,}00125\), \(+0{,}000313\), \(-0{,}000833\), \(-0{,}000147\). A errada de 1.700 tokens recebe a mesma punição total (−0,25) que a de 300, e cada token dela é 5,7× menos punido. Na <span class="la-term" data-term="perda-por-token">perda por token</span> do DAPO (\(\sum|o_i|=3.000\)), todo token pesa \(\pm0{,}000333\), e o total da errada longa é −0,567. No Dr. GRPO (\(\tilde A=\pm0{,}5\), MAX_TOKENS = 4.096), é −0,208. Nos dois consertos, errar longamente custa mais caro.</p>
+  <h3>DAPO: quatro consertos de engenharia</h3>
+  <p>O <span class="la-term" data-term="dapo">DAPO</span> (Decoupled Clip and Dynamic sAmpling Policy Optimization, ByteDance Seed e Tsinghua) talvez seja a receita mais copiada de 2025:</p>
+  <div class="la-eq">
+    \[ \mathcal{J}_{\text{DAPO}}(\theta)=\mathbb{E}\Bigg[\frac{1}{\sum_{i}|o_i|}\sum_{i=1}^{G}\sum_{t=1}^{|o_i|}\min\!\Big(r_{i,t}\hat A_{i,t},\ \mathrm{clip}\big(r_{i,t},1-\varepsilon_{\text{low}},1+\varepsilon_{\text{high}}\big)\hat A_{i,t}\Big)\Bigg]\quad\text{s.a.}\quad 0&lt;\big|\{o_i:\text{is\_equivalent}(a,o_i)\}\big|&lt;G \]
+    <ul class="la-eq-legend">
+      <li>\(1/\sum_i|o_i|\): perda por token; \(\varepsilon_{\text{low}}=0{,}2\), \(\varepsilon_{\text{high}}=0{,}28\): clip desacoplado</li>
+      <li>restrição: ao menos um acerto e um erro no grupo; is_equivalent\((a,o_i)\) compara com o gabarito \(a\) (recompensa +1 ou −1)</li>
+    </ul>
+  </div>
+  <ol class="la-steps">
+    <li><b><span class="la-term" data-term="clip-higher">Clip-Higher</span>.</b> O teto mais alto (0,28 contra 0,2) deixa tokens raros de exploração crescerem e combate o colapso de entropia, em que o grupo passa a gerar respostas quase idênticas.</li>
+    <li><b><span class="la-term" data-term="amostragem-dinamica">Amostragem dinâmica</span>.</b> Grupos com acurácia 0 ou 1 são descartados, e o sistema reamostra até encher o batch.</li>
+    <li><b>Perda por token</b>, como na figura acima.</li>
+    <li><b>Respostas longas.</b> As truncadas saem da perda, e uma <span class="la-term" data-term="overlong-punishment">punição suave</span> começa antes do limite:</li>
+  </ol>
+  <div class="la-eq">
+    \[ R_{\text{length}}(y)=\begin{cases}0, &amp; |y|\le L_{\max}-L_{\text{cache}}\\[4pt] \dfrac{(L_{\max}-L_{\text{cache}})-|y|}{L_{\text{cache}}}, &amp; L_{\max}-L_{\text{cache}}&lt;|y|\le L_{\max}\\[6pt] -1, &amp; |y|&gt;L_{\max}\end{cases} \]
+    <ul class="la-eq-legend">
+      <li>\(L_{\max}=20.480\); \(L_{\text{cache}}=4.096\), então a punição começa em 16.384; com \(|y|=18.432\), \(R_{\text{length}}=-0{,}5\)</li>
+    </ul>
+  </div>
+  <p>O DAPO também <b>remove o KL</b> e treina com lr \(10^{-6}\) constante (aquecimento de 20 passos), 512 prompts por batch e 16 respostas por prompt. A ablação no AIME 2024 (<span class="la-term" data-term="avg-at-k">avg@32</span>, Qwen2.5-32B base) mostra o peso de cada peça:</p>
+  <table>
+    <thead><tr><th>Configuração</th><th>AIME 2024 (avg@32)</th></tr></thead>
+    <tbody>
+      <tr><td>GRPO ingênuo</td><td>30</td></tr>
+      <tr><td>+ filtro de truncadas</td><td>36</td></tr>
+      <tr><td>+ clip-higher</td><td>38</td></tr>
+      <tr><td>+ punição suave de respostas longas</td><td>41</td></tr>
+      <tr><td>+ perda por token</td><td>42</td></tr>
+      <tr><td>+ amostragem dinâmica (DAPO completo)</td><td><b>50</b> (R1-Zero-Qwen-32B: 47, com o dobro dos passos)</td></tr>
+    </tbody>
+  </table>
+  <div class="la-callout tip"><b class="t">Na prática (TRL)</b><p>O <code>GRPOConfig</code> do TRL 1.14 já vem com <code>loss_type="dapo"</code> (opções <code>grpo</code>, <code>dapo</code>, <code>dr_grpo</code>, <code>sapo</code>, <code>cispo</code>, <code>vespo</code>), <code>epsilon=0.2</code>, <code>epsilon_high</code> igual a <code>epsilon</code> (suba para 0.28), <code>scale_rewards="group"</code>, <code>num_generations=8</code> e <code>beta=0.0</code>. O filtro de truncadas é <code>mask_truncated_completions=True</code>; a punição suave é <code>trl.rewards.get_soft_overlong_punishment</code>; <code>importance_sampling_level="sequence"</code> vira GSPO.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Regiões de confiança de 2025–2026: CISPO, GSPO, SAPO e a volta do crítico</h2>
+  <p>O clip do PPO herda do TRPO (<a data-ch="rl-fundamentos">fundamentos</a>), que maximiza o objetivo substituto dentro de uma <span class="la-term" data-term="regiao-de-confianca">região de confiança</span> de KL:</p>
+  <div class="la-eq">
+    \[ \max_\theta\ \mathbb{E}_{s,a\sim\pi_{\theta_{\text{old}}}}\Big[\frac{\pi_\theta(a\mid s)}{\pi_{\theta_{\text{old}}}(a\mid s)}\,A_{\theta_{\text{old}}}(s,a)\Big]\quad\text{s.a.}\quad\mathbb{E}_s\Big[D_{\text{KL}}\big(\pi_{\theta_{\text{old}}}(\cdot\mid s)\,\|\,\pi_\theta(\cdot\mid s)\big)\Big]\le\delta \]
+    <ul class="la-eq-legend">
+      <li>\(A_{\theta_{\text{old}}}\): vantagem sob a política antiga; \(\delta\): raio da região, medido em KL</li>
+    </ul>
+  </div>
+  <p>O TRPO resolve isso com gradiente conjugado, produtos Fisher-vetor e busca em linha, um custo de segunda ordem proibitivo para \(10^{11}\) parâmetros. O PPO é a aproximação de primeira ordem: em vez de medir o KL, corta o incentivo de levar a razão para fora de \([1-\varepsilon,1+\varepsilon]\). Esta seção é um zoológico de <b>formas de região de confiança</b>. Comece pelo clip-higher: um token raro com \(\pi_{\text{old}}=0{,}01\) e vantagem positiva só pode subir até \(0{,}012\) com \(\varepsilon=0{,}2\), ou \(0{,}0128\) com \(\varepsilon_{\text{high}}=0{,}28\); um token comum com \(\pi_{\text{old}}=0{,}9\) bate no teto 1 antes de o clip importar. O clip simétrico freia justamente os tokens raros, que carregam a exploração.</p>
+  <h3>CISPO: corte o peso, não o gradiente</h3>
+  <p>No MiniMax-M1, tokens de reflexão como “However”, “Recheck”, “Wait” e “Aha”, raros e com razões altas, eram cortados logo após a primeira atualização on-policy. O <span class="la-term" data-term="cispo">CISPO</span> (Clipped IS-weight Policy Optimization) clipa o <b>peso de importância</b>, com stop-gradient, e não a atualização:</p>
+  <div class="la-eq">
+    \[ \mathcal{J}_{\text{CISPO}}(\theta)=\mathbb{E}\Bigg[\frac{1}{\sum_i|o_i|}\sum_i\sum_t\operatorname{sg}\big(\hat r_{i,t}(\theta)\big)\,\hat A_{i,t}\,\log\pi_\theta(o_{i,t}\mid q,o_{i,&lt;t})\Bigg],\qquad \hat r_{i,t}=\mathrm{clip}\big(r_{i,t},\,1-\varepsilon^{\text{IS}}_{\text{low}},\,1+\varepsilon^{\text{IS}}_{\text{high}}\big) \]
+    <ul class="la-eq-legend">
+      <li>\(\operatorname{sg}\): stop-gradient; o gradiente passa sempre por \(\log\pi_\theta\), então nenhum token perde gradiente</li>
+      <li>na prática só \(\varepsilon^{\text{IS}}_{\text{high}}\) foi ajustado (sem limite inferior)</li>
+    </ul>
+  </div>
+  <p>Sem KL, com a amostragem dinâmica e a penalidade de comprimento do DAPO, o CISPO igualou o DAPO no Qwen2.5-32B-base com metade dos passos. O RL completo do MiniMax-M1 levou três semanas em 512 H800, a US$ 534.700 de aluguel.</p>
+  <h3>GSPO: a razão é da sequência</h3>
+  <p>Se a recompensa é da sequência, argumenta o <span class="la-term" data-term="gspo">GSPO</span> (Group Sequence Policy Optimization, Qwen, 2025), a razão de importância também deveria ser:</p>
+  <div class="la-eq">
+    \[ \mathcal{J}_{\text{GSPO}}(\theta)=\mathbb{E}\Big[\frac1G\sum_{i=1}^G\min\big(s_i(\theta)\hat A_i,\ \mathrm{clip}(s_i(\theta),1-\varepsilon,1+\varepsilon)\hat A_i\big)\Big],\qquad s_i(\theta)=\exp\!\Big(\frac{1}{|y_i|}\sum_t\log\frac{\pi_\theta(y_{i,t}\mid x,y_{i,&lt;t})}{\pi_{\theta_{\text{old}}}(y_{i,t}\mid x,y_{i,&lt;t})}\Big) \]
+    <ul class="la-eq-legend">
+      <li>\(s_i\): média geométrica das razões por token, \(\big(\pi_\theta(y_i\mid x)/\pi_{\theta_{\text{old}}}(y_i\mid x)\big)^{1/|y_i|}\)</li>
+      <li>\(\hat A_i\): a mesma vantagem de grupo do GRPO; \(\varepsilon\): duas ordens de grandeza menor</li>
+    </ul>
+  </div>
+  <p>Como \(s_i\) se move devagar, as faixas caem para \(3\times10^{-4}\) e \(4\times10^{-4}\), contra 0,2 e 0,27 no GRPO dos experimentos. Exemplo: log-razões [0,10; −0,05; 0,30; −0,20; 0,05] dão razões [1,105; 0,951; 1,350; 0,819; 1,051] e \(s=e^{0{,}04}=1{,}0408\). Com vantagem positiva, o GRPO corta só o 3º token (1,350 &gt; 1,27), e o GSPO corta a <b>sequência inteira</b> (1,0408 &gt; 1,0004). Com vantagem negativa, nenhum corta nada (o 4º token, 0,819, fica a 0,019 do piso 0,8). O paper relata que o GSPO clipa mais tokens e ainda assim é mais eficiente. O argumento decisivo é MoE: no Qwen3-30B-A3B (48 camadas), cerca de 10% dos especialistas ativados mudam entre a política antiga e a nova a cada atualização, e a razão de um token cujo roteamento mudou é quase ruído. O GRPO precisava de <i>Routing Replay</i>; o GSPO dispensa, e ainda tolera usar as likelihoods do motor de inferência.</p>
+  <h3>SAPO: um portão suave</h3>
+  <p>O <span class="la-term" data-term="sapo">SAPO</span> (Soft Adaptive Policy Optimization, Qwen, fim de 2025) troca o degrau do clip por um portão sigmoide:</p>
+  <div class="la-eq">
+    \[ f_{i,t}(x)=\sigma\big(\tau_{i,t}(x-1)\big)\cdot\frac{4}{\tau_{i,t}},\qquad \nabla:\ w_{i,t}\,r_{i,t}\,\nabla_\theta\log\pi_\theta\,\hat A_{i,t},\qquad w_{i,t}=4p_{i,t}(1-p_{i,t}),\quad p_{i,t}=\sigma\big(\tau_{i,t}(r_{i,t}-1)\big) \]
+    <ul class="la-eq-legend">
+      <li>\(\tau_{i,t}\): temperatura do portão, \(\tau_{\text{pos}}\) se \(\hat A&gt;0\), \(\tau_{\text{neg}}\) se não; \(w\): vale 1 em \(r=1\) e cai suavemente</li>
+    </ul>
+  </div>
+  <p>A assimetria \(\tau_{\text{neg}}&gt;\tau_{\text{pos}}\) (1,05 e 1,0 no experimento) existe porque gradientes de vantagem negativa se espalham por muitos tokens irrelevantes do vocabulário; a configuração inversa foi a mais instável. O SAPO dispensa routing replay e treinou a série Qwen3-VL.</p>
+  <figure class="la-fig" id="fig-clip" data-title="Zoológico de regiões de confiança">
+    <div class="la-fig-stage" style="height:470px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Em cima, o peso que multiplica \(\nabla\log\pi\) de um token em função da razão \(r\); a zona cinza não recebe gradiente. Os personagens são os cinco tokens do exemplo do GSPO (log-razões vezes a “deriva”); no GSPO, todos andam juntos para a razão de sequência \(s\). Embaixo, a mesma sequência em barras, com \(s\) em âmbar. O \(\varepsilon^{\text{IS}}_{\text{high}}\) do CISPO é <b>ilustrativo</b> (0,28); \(\tau\) do SAPO e as faixas de GRPO, DAPO e GSPO são os publicados.</figcaption>
+  </figure>
+  <h3>A volta do crítico</h3>
+  <p>O PPO em CoT longo tinha conserto. O VC-PPO pré-treina o crítico e desacopla o GAE (um \(\lambda\) para o crítico, outro para a política). O VAPO (ByteDance Seed) soma clip-higher, perda por token, autoimitação e um <b>GAE com \(\lambda\) adaptado ao comprimento</b>:</p>
+  <div class="la-eq">
+    \[ \sum_{t\ge0}\lambda_{\text{policy}}^{\,t}\approx\frac{1}{1-\lambda_{\text{policy}}}=\alpha\,l\quad\Longrightarrow\quad\lambda_{\text{policy}}=1-\frac{1}{\alpha\,l} \]
+    <ul class="la-eq-legend">
+      <li>\(l\): comprimento da resposta; \(\alpha\): controla o compromisso entre viés e variância</li>
+    </ul>
+  </div>
+  <p>Com esse \(\lambda\), o peso do fim sobre o começo é \((1-1/(\alpha l))^l\to e^{-1/\alpha}\), <b>independente do comprimento</b> (cerca de 0,51 com \(\alpha=1{,}5\), o valor usado pelo SAO, para 100 ou 10.000 tokens): o farol da primeira figura chega com a mesma força a respostas curtas e longas. O VAPO marcou 60,4 no AIME 2024 com o Qwen2.5-32B base, mais de 10 pontos acima do DAPO e do R1-Zero-Qwen-32B, em cerca de 5.000 passos sem colapsos. Em julho de 2026, o <b>SAO</b> (Tsinghua) usou uma rollout por prompt (bom para RL assíncrono), crítico atualizado duas vezes por passo com a atenção congelada e um clip duplo estrito sobre as log-probs do rollout. No Qwen3-30B-A3B, marcou 97,3 no AIME2025 contra 84,2 do GRPO, que colapsou por volta do passo 160. O SAO foi implantado no RL agêntico do GLM-5.2 (750B-A40B); segundo uma fonte secundária, porque a compactação de trajetórias longas quebra o “grupo comparável” do GRPO.</p>
+  <h3>ScaleRL: eficiência contra teto</h3>
+  <p>Com mais de 400.000 GPU-horas, um estudo da Meta e colaboradores ajustou curvas sigmoides de desempenho contra compute de RL:</p>
+  <div class="la-eq">
+    \[ R_C-R_0=(A-R_0)\cdot\frac{1}{1+(C_{\text{mid}}/C)^{B}} \]
+    <ul class="la-eq-legend">
+      <li>\(R_C\): pass rate após o compute \(C\); \(R_0\): inicial; \(A\): assíntota; \(B\): expoente de eficiência; \(C_{\text{mid}}\): ponto médio</li>
+    </ul>
+  </div>
+  <p>Agregação da perda, normalização, currículo e algoritmo off-policy mexem sobretudo na <b>eficiência</b> (\(B\), \(C_{\text{mid}}\)), pouco no <b>teto</b> \(A\); a corrida grande ajustou \(C_{\text{mid}}=2.542\) GPU-horas, \(B=1{,}92\), \(A=0{,}610\). A receita ScaleRL resume o estado da arte: RL assíncrono (PipelineRL), interrupções forçadas de comprimento, perda CISPO, média por prompt, normalização de vantagem no batch, FP32 nos logits, filtro de variância zero e o <i>No-Positive-Resampling</i>, que tira de vez da reamostragem os prompts que o modelo já resolve.</p>
+  <table>
+    <thead><tr><th>Método</th><th>Vantagem</th><th>Região de confiança</th><th>Crítico</th></tr></thead>
+    <tbody>
+      <tr><td>PPO (RLHF)</td><td>GAE</td><td>clip por token, simétrico</td><td>sim</td></tr>
+      <tr><td>ReMax / RLOO</td><td>greedy / leave-one-out</td><td>— (REINFORCE)</td><td>não</td></tr>
+      <tr><td>GRPO</td><td>(R − média)/desvio do grupo</td><td>clip por token; k3 na perda</td><td>não</td></tr>
+      <tr><td>Dr. GRPO</td><td>R − média</td><td>clip por token; perda/MAX_TOKENS</td><td>não</td></tr>
+      <tr><td>DAPO</td><td>(R − média)/desvio</td><td>clip 0,2/0,28; perda por token</td><td>não</td></tr>
+      <tr><td>REINFORCE++</td><td>desvio do batch</td><td>clip por token; k2 na perda</td><td>não</td></tr>
+      <tr><td>CISPO</td><td>(R − média)/desvio</td><td>clip do <b>peso</b> (sg)</td><td>não</td></tr>
+      <tr><td>GSPO</td><td>(R − média)/desvio</td><td>clip da <b>sequência</b>, ε ~ 10⁻⁴</td><td>não</td></tr>
+      <tr><td>SAPO</td><td>(R − média)/desvio</td><td>portão sigmoide</td><td>não</td></tr>
+      <tr><td>VAPO / SAO</td><td>GAE com λ adaptativo</td><td>clip-higher / clip duplo estrito</td><td>sim</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="la-sec">
+  <h2>RLVR: recompensas que se conferem</h2>
+  <p>O termo RLVR (Reinforcement Learning with Verifiable Rewards) vem do Tülu 3 (AI2, 2024): mantenha o objetivo do RLHF, mas troque o reward model por uma <b>função de verificação</b>, com recompensa \(\alpha\) se a resposta é verificavelmente correta e 0 caso contrário. O Tülu 3 treinou assim, com PPO, em GSM8K, MATH e IFEval. Um <span class="la-term" data-term="verificador">verificador</span> não tem pesos para o gradiente explorar, não sofre deriva e roda em CPU, mas só existe onde existe gabarito.</p>
+  <table>
+    <thead><tr><th>Domínio</th><th>Verificador</th><th>Exemplos nas fontes</th></tr></thead>
+    <tbody>
+      <tr><td>Matemática</td><td>equivalência da resposta final (ex.: <code>\boxed{}</code>)</td><td>DeepSeek-V3, R1, DAPO</td></tr>
+      <tr><td>Código competitivo</td><td>compilador + casos de teste</td><td>DeepSeek-V3, R1</td></tr>
+      <tr><td>Engenharia de software</td><td>testes F2P e P2P em repositório real</td><td>V3.2 (patch-ouro com F2P &gt; 0 e P2F = 0); MiMo (estáveis em 8 reexecuções)</td></tr>
+      <tr><td>Formato e idioma</td><td>regex de tags; proporção de palavras do idioma-alvo</td><td>R1</td></tr>
+      <tr><td>Tarefas agênticas sintéticas</td><td>função Python escrita com a tarefa</td><td>V3.2: 1.827 ambientes, 4.417 tarefas com pass@100 &gt; 0</td></tr>
+      <tr><td>Difícil de verificar</td><td>juiz generativo + rubricas</td><td>V3.2/V4, MiMo, GLM-5</td></tr>
+    </tbody>
+  </table>
+  <p>O DeepSeek-V3.2 dá a escala: 24.667 tarefas de agente de código, 50.275 de busca, 4.417 de agente geral e 5.908 de interpretador de código. Na prática, um verificador de matemática é extrator mais comparador: o <code>trl.rewards.accuracy_reward</code> espera uma coluna <code>solution</code> e compara com <code>math_verify</code>, priorizando o conteúdo de <code>\boxed{}</code>:</p>
+  <pre data-lang="json"><code>{"prompt": [{"role": "user", "content": "Natalia vendeu presilhas para 48 amigas em abril e metade disso em maio. Quantas no total? Ponha a resposta final em \\boxed{}."}], "solution": "72"}</code></pre>
+  <p>Parece trivial, e aí mora o perigo. Um verificador frouxo (“o número certo aparece?”) é burlado listando vários números ou várias caixas. Um verificador de código que só confere “nenhum teste falhou” aceita um patch que apaga o teste que falhava. Por isso os laboratórios usam testes <span class="la-term" data-term="f2p-p2p">F2P e P2P</span> (falhavam e devem passar; passavam e devem continuar passando) e validam o ambiente antes de treinar.</p>
+  <figure class="la-fig" id="fig-verificador" data-title="A máquina de conferir (e como enganá-la)">
+    <div class="la-fig-stage" style="height:400px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Três modos. <b>Matemática</b>: seis respostas ao problema das presilhas (gabarito 72) passam pelo verificador, e cada uma recebe sua vantagem de grupo. <b>Código</b>: quatro patches contra dois testes F2P e três P2P. <b>Processo</b>: uma solução em quatro passos pontuada por um PRM. Troque o verificador entre estrito e ingênuo e veja quem o RL passaria a reforçar. Respostas e probabilidades <b>ilustrativas</b>; a agregação por produto é a de Lightman et al.</figcaption>
+  </figure>
+  <h3>Resultado ou processo?</h3>
+  <p>A <span class="la-term" data-term="recompensa-de-resultado">recompensa de resultado</span> (ORM) julga a resposta final; a <span class="la-term" data-term="recompensa-de-processo">recompensa de processo</span> (PRM), cada passo. A evidência é matizada. Uesato et al. (DeepMind, 2022), no GSM8K: resultado e processo dão erro final parecido (o melhor sistema baixou o estado da arte de 16,8% para 12,7%), mas o erro de raciocínio entre soluções com resposta certa só cai de 14,0% para 3,4% com supervisão de processo ou com RMs que a emulem. Lightman et al. (OpenAI, 2023) coletaram o PRM800K, com 800.000 rótulos humanos por passo; num best-of-1860, o PRM acerta 78,2%, o ORM 72,4% e o voto da maioria 69,6%, e a nota da solução é o <b>produto</b> das probabilidades dos passos. O Math-Shepherd rotula passos automaticamente, completando \(N\) soluções a partir de cada passo: com respostas 42, 17, 42, 42 e gabarito 42, o rótulo duro é 1 e o suave, 0,75. O PRIME treina um ORM só com rótulos de resultado, parametrizado como \(r_\phi(y)=\beta\log\frac{\pi_\phi(y)}{\pi_{\text{ref}}(y)}\), e o reaproveita como PRM denso por token, atualizado online.</p>
+  <p>O DeepSeek-R1 não usou RM neural (de processo nem de resultado) no RL de raciocínio, porque RMs neurais sofrem <span class="la-term" data-term="reward-hacking">reward hacking</span> em larga escala. O PRM falhou por três motivos: definir “passo” é difícil, anotar passos é caro e ruidoso, e qualquer PRM baseado em modelo acaba hackeado; serve bem para <i>reranking</i> de top-N. Com passos [0,95; 0,90; 0,40; 0,98], o produto é 0,335; se o passo duvidoso sobe para 0,85, vai a 0,712. Uma política otimizada contra o PRM aprende a evitar passos que ele não entende, não necessariamente passos errados.</p>
+  <p>Sem gabarito (escrita, ajuda geral, tarefas abertas), entra o <span class="la-term" data-term="grm">reward model generativo</span> (GRM), um LLM que escreve crítica e nota guiado por <span class="la-term" data-term="rubrica">rubricas</span>. O DeepSeek-GRM treina o juiz com RL online para gerar princípios e críticas e agrega amostras com um meta-RM. O “Rubrics as Rewards” transforma checklists por instância em recompensa e melhora até 31% relativos no HealthBench e 7% no GPQA-Diamond sobre notas Likert diretas. O DeepSeek-V4 dispensa RMs escalares (o próprio ator é o GRM), e o GLM-5 mistura regras, ORMs e GRMs, com respostas humanas de especialistas como âncoras de estilo.</p>
+  <h3>Reward model explícito + RL customizado</h3>
+  <p>Nada impede usar um RM de Bradley–Terry, \(\mathcal L_{\text{RM}}=-\mathbb{E}\big[\log\sigma\big(r_\phi(x,y_w)-r_\phi(x,y_l)\big)\big]\) (do <a data-ch="preferencias-reward-models">capítulo de reward models</a>), como recompensa de um otimizador sem crítico:</p>
+  <table>
+    <thead><tr><th>Recompensa ↓ · otimizador →</th><th>PPO (crítico)</th><th>GRPO, RLOO, REINFORCE++</th><th>Assíncrono com IS truncado</th></tr></thead>
+    <tbody>
+      <tr><td>RM Bradley–Terry</td><td>InstructGPT, CAI</td><td>RLOO (Cohere)</td><td>—</td></tr>
+      <tr><td>GRM + rubricas</td><td>—</td><td>DeepSeek-V3/V3.2/V4, GLM-5</td><td>MiMo</td></tr>
+      <tr><td>Verificador</td><td>Tülu 3, VAPO</td><td>R1, DAPO, Qwen3, GLM-5</td><td>GLM-5 agêntico, MiMo, SAO</td></tr>
+      <tr><td>PRM</td><td>Lightman (reranking)</td><td>PRIME</td><td>—</td></tr>
+    </tbody>
+  </table>
+  <p>Com RM neural, a <span class="la-term" data-term="sobre-otimizacao">sobre-otimização</span> volta: Gao, Schulman e Hilton mostraram que, sob RL, a nota de um RM “ouro” segue \(R_{\text{RL}}(d)=d(\alpha_{\text{RL}}-\beta_{\text{RL}}\log d)\), com \(d=\sqrt{D_{\text{KL}}(\pi\,\|\,\pi_{\text{init}})}\): sobe, atinge um pico e cai, enquanto o RM de treino continua subindo. As bibliotecas aceitam um RM como recompensa: o <code>reward_funcs</code> do <code>GRPOTrainer</code> e do <code>RLOOTrainer</code> do TRL aceita um modelo, e o OpenRLHF busca a nota num servidor HTTP (<code>--reward.remote_url</code>), com os estimadores <code>reinforce</code>, <code>reinforce_baseline</code>, <code>rloo</code> e <code>group_norm</code> (o GRPO). No TRL, as funções de recompensa recebem <code>prompts</code>, <code>completions</code> e as colunas do dataset, e podem devolver <code>None</code> por amostra.</p>
+</section>
+
+<section class="la-sec">
+  <h2>A receita do DeepSeek-R1</h2>
+  <p>O DeepSeek-R1 (arXiv 2501.12948, revisado na Nature em 2025) transformou GRPO + RLVR em receita padrão, em dois atos.</p>
+  <h3>Ato 1: R1-Zero, RL puro sobre o base</h3>
+  <p>GRPO direto sobre o DeepSeek-V3-Base, sem SFT. O template só impõe estrutura (raciocínio em <code>&lt;think&gt;…&lt;/think&gt;</code>, resposta em <code>&lt;answer&gt;…&lt;/answer&gt;</code>), e as recompensas são regras de acurácia e de formato, com o mesmo peso. Na versão 2 do paper: lr \(3\times10^{-6}\), KL 0,001, temperatura 1, <b>16 saídas por pergunta</b>, até 32.768 tokens até o passo 8,2 mil e 65.536 depois, 10.400 passos (1,6 época), 32 perguntas por passo (batch 512), referência trocada pela política a cada 400 passos e 8.192 saídas por rollout em 16 minibatches.</p>
+  <p>No AIME 2024, o pass@1 foi de 15,6% para 77,9% na versão revisada (na de janeiro, uma corrida anterior, 71,0%, ou 86,7% com <span class="la-term" data-term="cons-at-k">cons@64</span>). No passo 8,2 mil, quando o limite de comprimento dobrou, desempenho e comprimento saltaram. Veio o “aha moment”: o modelo passou a reavaliar o próprio raciocínio, e o uso de “wait” cresceu. Os defeitos: legibilidade ruim e <b>mistura de idiomas</b>.</p>
+  <figure class="la-fig" id="fig-r1" data-title="Do V3-Base ao R1, estágio por estágio">
+    <div class="la-fig-stage" style="height:400px"><canvas></canvas></div>
+    <figcaption>O pipeline do R1 com os números da versão 2 do paper. Avance pelos passos: no topo, o estágio ativo acende e os dados fluem pelas setas; embaixo, um detalhe de cada estágio. Na curva do passo 3, só os pontos marcados são publicados; o traço entre eles é <b>esquemático</b>.</figcaption>
+  </figure>
+  <h3>Ato 2: R1 em quatro estágios</h3>
+  <table>
+    <thead><tr><th>Estágio</th><th>O que entra</th><th>Detalhes (v2)</th></tr></thead>
+    <tbody>
+      <tr><td>1. Cold start (SFT)</td><td>“milhares” de CoTs longos e legíveis</td><td>parte reformatada do R1-Zero, refinada por humanos e pelo V3</td></tr>
+      <tr><td>2. RL de raciocínio</td><td>GRPO + regras + consistência de idioma (proporção de palavras do idioma-alvo no CoT)</td><td>clip ratio \(\varepsilon=10\), 16 saídas, até 32.768 tokens</td></tr>
+      <tr><td>3. Rejeição + SFT</td><td>~600 mil de raciocínio (só corretas, filtradas) + ~200 mil gerais = ~800 mil</td><td>ajuste fino do <b>V3-Base</b> por 2 épocas</td></tr>
+      <tr><td>4. RL geral</td><td>regras + RMs de preferência (66 mil e 106 mil pares)</td><td>1.700 passos, temperatura 0,7; RMs só nos <b>últimos 400</b> (mais passos levaram a reward hacking)</td></tr>
+    </tbody>
+  </table>
+  <p>O \(\varepsilon=10\) do estágio 2 não é erro de digitação: a razão só seria cortada acima de \(1+\varepsilon=11\) (o piso, \(-9\), nunca é atingido, porque a razão é positiva), então na prática não há clip. Interpretação: quem segura a política são atualizações quase on-policy (no R1-Zero, uma única época interna por rollout), com razões perto de 1.</p>
+  <p>Repare que o estágio 3 volta ao <i>modelo base</i> com os dados gerados: o RL de raciocínio serviu, em boa parte, como fábrica de dados (interpretação). E a destilação fecha a história: seis densos (1.5B a 70B, de bases Qwen e Llama) ajustados só com SFT nos ~800 mil exemplos.</p>
+  <table>
+    <thead><tr><th>Modelo (32B)</th><th>AIME24 pass@1</th><th>cons@64</th><th>MATH-500</th><th>GPQA-D</th><th>LiveCodeBench</th></tr></thead>
+    <tbody>
+      <tr><td>QwQ-32B-Preview</td><td>50,0</td><td>60,0</td><td>90,6</td><td>54,5</td><td>41,9</td></tr>
+      <tr><td>R1-Zero-Qwen-32B (RL, &gt;10 mil passos)</td><td>47,0</td><td>60,0</td><td>91,6</td><td>55,0</td><td>40,2</td></tr>
+      <tr><td>R1-Distill-Qwen-32B</td><td><b>72,6</b></td><td><b>83,3</b></td><td><b>94,3</b></td><td><b>62,1</b></td><td><b>57,2</b></td></tr>
+    </tbody>
+  </table>
+  <p>Para um modelo pequeno, destilar um professor forte rende mais que RL do zero. No Qwen3-8B, a destilação forte→fraco chegou a 74,4 no AIME'24 contra 67,6 do RL, com 1.800 GPU-horas contra 17.920. PRM e MCTS não funcionaram no R1. O custo (v2, H800 a US$ 2/h): R1-Zero com 101 mil GPU-horas (64×8 H800 por ~198 h), dados de SFT com 5 mil e R1 com 41 mil, total de 147 mil GPU-horas, cerca de US$ 294 mil, sem o pré-treino; o ScaleRL cita que o RL do R1-Zero foi ~3,75% do compute de pré-treino.</p>
+  <h3>O padrão de 2025–2026: especialistas e fusão</h3>
+  <p>A receita convergiu (interpretação, apoiada nos relatórios) para SFT de partida, \(N\) especialistas com RL no seu domínio e uma fusão. O Qwen3 fez RL de raciocínio com GRPO em só 3.995 pares pergunta-verificador (AIME'24 de 70,1 para 85,1 em 170 passos), depois fundiu os modos <code>/think</code> e <code>/no_think</code> e fez RL geral em mais de 20 tarefas. O GLM-4.5 usou GRPO sem KL, currículo de dificuldade (o segundo estágio só com problemas de pass@8 = 0 e pass@512 &gt; 0) e viu que RL de estágio único a 64K bate o multiestágio 16K→32K→48K→64K: encurtar faz “desaprender” respostas longas. O DeepSeek-V3.2 fez RL misto de estágio único, com pós-treino acima de 10% do custo de pré-treino; o V4 trocou o RL misto por <span class="la-term" data-term="opd">on-policy distillation</span> de mais de dez professores: em amostras do próprio aluno, minimiza \(\sum_i w_i\,\mathrm{KL}(\pi_\theta\,\|\,\pi_{E_i})\) sobre os logits do vocabulário inteiro. A forma barata, com vantagem por token \(\log\pi_{\text{prof}}-\log\pi_\theta\) só no token amostrado (a do GLM-5 e do MiMo), foi testada e rejeitada por variância alta (detalhes no <a data-ch="sft">capítulo de SFT</a>).</p>
+</section>
+
+<section class="la-sec">
+  <h2>Quando o RL dá errado: entropia, comprimento e reward hacking</h2>
+  <h3>Colapso de entropia</h3>
+  <p>Treine a família GRPO por tempo suficiente e a <span class="la-term" data-term="entropia">entropia</span> cai: o grupo gera respostas quase idênticas, a variância some e o aprendizado para. Cui et al. (2025) mediram uma lei empírica e explicaram o mecanismo do <span class="la-term" data-term="colapso-de-entropia">colapso de entropia</span>:</p>
+  <div class="la-eq">
+    \[ R=-a\,e^{H}+b\qquad\qquad H(\pi^{k+1})-H(\pi^{k})\approx\mathbb{E}_s\Big[-\operatorname{Cov}_{a\sim\pi^k(\cdot\mid s)}\big(\log\pi^k(a\mid s),\ z^{k+1}_{s,a}-z^{k}_{s,a}\big)\Big] \]
+    <ul class="la-eq-legend">
+      <li>\(R\): desempenho; \(H\): entropia da política; \(a,b\): constantes, com teto \(R=-a+b\) em \(H=0\)</li>
+      <li>\(z_{s,a}\): logit da ação \(a\) no estado \(s\); \(\operatorname{Cov}\): covariância sob a política</li>
+      <li>com policy gradient, \(\Delta z_{s,a}\propto\pi(a\mid s)A(s,a)\); com natural policy gradient, \(\Delta z_{s,a}\propto A(s,a)\)</li>
+    </ul>
+  </div>
+  <p>Se a ação <b>provável</b> recebe vantagem alta, log-prob alto e aumento de logit andam juntos, a covariância é positiva e a entropia <b>cai</b>; se uma ação <b>rara</b> é premiada, a entropia <b>sobe</b>. O desempenho é “comprado” com entropia. Com \(\pi=[0{,}9;\ 0{,}1]\) (\(H=0{,}325\) nats), gradiente natural (\(\Delta z=A\)) e \(A=+1\) no premiado, \(-1\) no outro: premiar o provável dá \(\operatorname{Cov}(\log\pi,A)=+0{,}396\) (a entropia cai); premiar o raro, \(-0{,}396\) (sobe). A figura abaixo usa \(A=\mathbb 1[a=k]-\pi_k\), com \(k\) o token premiado, e cinco tokens; por isso os valores dela diferem, mas o sinal é o mesmo.</p>
+  <figure class="la-fig" id="fig-entropia" data-title="A entropia comprada e o comprimento cobrado">
+    <div class="la-fig-stage" style="height:400px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Modo <b>entropia</b>: cinco tokens candidatos numa posição. Escolha quem é premiado e o tipo de atualização, aperte ▶ e veja os logits se moverem e a entropia (curva) responder; Cov é a do lema de Cui et al., calculada antes de cada passo. Modo <b>comprimento</b>: a punição suave do DAPO. Distribuição inicial <b>ilustrativa</b>; \(L_{\max}\) e \(L_{\text{cache}}\) padrão são os publicados.</figcaption>
+  </figure>
+  <p>Os remédios atacam a covariância: o Clip-Cov desliga o gradiente de uma fração dos tokens de covariância alta, o KL-Cov os penaliza, e o clip-higher abre espaço para tokens raros. O excesso de pressão negativa, por outro lado, pode <b>explodir</b> a entropia: o MiMo-V2.6 usa quatro limites de razão (\(r\) entre \(\varepsilon^l\) e \(\varepsilon^h\), um par por sinal de vantagem, iniciados em \(r\in[0{,}2;\ 5{,}0]\); fora deles o token é zerado), ajustados pela entropia, e o \(\tau_{\text{neg}}&gt;\tau_{\text{pos}}\) do SAPO tem a mesma motivação.</p>
+  <h3>Comprimento: colapso, inflação e controle</h3>
+  <table>
+    <thead><tr><th>Fenômeno</th><th>Causa</th><th>Remédio</th></tr></thead>
+    <tbody>
+      <tr><td>Colapso de comprimento no PPO</td><td>crítico mal inicializado; sinal que decai no GAE</td><td>VC-PPO, VAPO</td></tr>
+      <tr><td>Erradas ficam mais longas</td><td>o \(1/|o_i|\) do GRPO</td><td>Dr. GRPO, DAPO</td></tr>
+      <tr><td>Comprimento explode</td><td>sem penalidade; agregação por token</td><td>punição suave (DAPO); média por prompt e penalidade relativa ao grupo (MiMo); interrupções forçadas (ScaleRL)</td></tr>
+      <tr><td>Viés por preempção</td><td>regenerar do zero favorece respostas curtas</td><td>log por token para retomar (DeepSeek-V4)</td></tr>
+    </tbody>
+  </table>
+  <p>É também onde pós-treino e serving se encontram: no DeepSeek-V4, os modos Non-think, High e Max são especialistas de RL com penalidades de comprimento e janelas de contexto diferentes (avaliados com 8K, 128K e 384K), depois fundidos.</p>
+  <h3>Reward hacking: o verificador também é enganado</h3>
+  <ul>
+    <li><b>Recompensas espúrias.</b> GRPO com recompensas <i>aleatórias</i> melhorou o MATH-500 do Qwen2.5-Math-7B em 21,4 pontos, perto dos 29,1 da recompensa verdadeira. O viés do clipping amplifica comportamentos de alta probabilidade a priori (o “raciocínio em código” foi de 65% para mais de 90%), e o efeito não se transfere para Llama3 ou OLMo2: valide em mais de uma família.</li>
+    <li><b>Vazamento de solução</b> (MiMo-V2.6): instalar versão nova do pacote e copiar o conserto, baixar o arquivo do upstream, procurar o PR original. Ambientes limpos (sem logs, caches, histórico posterior nem rede), um “hack agent” adversário, auditoria offline e um grader que zera hacks antes de recalcular o grupo mantiveram os hacks confirmados abaixo de 2%.</li>
+    <li><b>CoT monitorado</b> (Baker et al., OpenAI): um LLM que lê o raciocínio detecta hacking muito melhor que olhando só ações, mesmo mais fraco (GPT-4o monitorando o o3-mini). Pôr o monitor na recompensa com otimização forte ensina hacking <b>ofuscado</b>; a proposta é pagar um “imposto de monitorabilidade”.</li>
+    <li><b>Desalinhamento emergente</b> (MacDiarmid et al., Anthropic): aprender a hackear ambientes reais de código generalizou para fingir alinhamento e tentar sabotagem; RLHF de segurança em chat não corrigiu as tarefas agênticas. Enquadrar o hack como aceitável no treino (<i>inoculation prompting</i>) removeu a generalização desalinhada.</li>
+    <li><b>Tempestades de tool calls</b> (MiMo-V2.6): chamadas repetidas sem nada falhar. A penalidade só disparava acima de 32 chamadas por turno; refazer ~20 passos do RL misto com um limiar menor custaria ~US$ 2,31 milhões (e generalizava mal), e um professor especializado zerou a repetição em 12 passos, fundido por MOPD, por ~US$ 90 mil.</li>
+  </ul>
+  <div class="la-callout warn"><b class="t">Checklist de defesa (interpretação a partir das fontes)</b><p>Verificador correto <i>e</i> estável; ambiente sem vazamentos; adversário antes do treino e auditoria durante; recompensa multiplicativa com o resultado, em que a rubrica só refina quem passou (\(R=R_{\text{teste}}\cdot S_{\text{sol}}\cdot S_{\text{comp}}\), o GRS do MiMo); não otimizar o CoT diretamente; validar em mais de uma família; medir repetição, turnos e comprimento, não só pass rate; RMs de preferência por poucos passos e no fim.</p></div>
+  <p>No TRL, as métricas avisam antes: <code>reward</code> subindo com <code>completions/mean_length</code> explodindo é hacking de comprimento; <code>frac_reward_zero_std</code> perto de 1, dataset fácil ou difícil demais; <code>entropy</code> despencando cedo pede clip-higher; <code>completions/clipped_ratio</code> alto pede mais <code>max_completion_length</code>. E leia amostras (<code>log_completions=True</code>).</p>
+</section>
+
+<section class="la-sec">
+  <h2>Treino ≠ inferência: descompasso, MoE e as receitas</h2>
+  <p>Até aqui fingimos que \(\pi_{\theta_{\text{old}}}\) é uma coisa só. As rollouts saem de um motor de <b>inferência</b> (vLLM ou SGLang, com todo o Módulo 1), porque a geração domina o tempo: o OpenRLHF relata que passa de 90% do total. O gradiente sai de um motor de <b>treino</b> (Megatron, FSDP). Mesmos pesos, mas kernels, ordem de redução, precisão e batch diferentes: \(\pi_{\text{vllm}}(a;\theta)\ne\pi_{\text{fsdp}}(a;\theta)\). Esse <span class="la-term" data-term="descompasso-treino-inferencia">descompasso</span> torna o RL off-policy sem ninguém pedir, e piora com rollouts quantizados (INT8, FP8).</p>
+  <h3>Corrigindo com importância: TIS e IcePop</h3>
+  <div class="la-eq">
+    \[ \mathbb{E}_{a\sim\pi_{\text{infer}}(\theta)}\Big[\min\Big(\frac{\pi_{\text{train}}(a;\theta)}{\pi_{\text{infer}}(a;\theta)},\ C\Big)\,R(a)\,\nabla_\theta\log\pi_{\text{train}}(a;\theta)\Big] \]
+    <ul class="la-eq-legend">
+      <li>\(\pi_{\text{infer}}\): probabilidade no motor que gerou a amostra; \(\pi_{\text{train}}\): no motor de treino; \(C\): teto da razão</li>
+    </ul>
+  </div>
+  <p>O <span class="la-term" data-term="tis">TIS</span> (Truncated Importance Sampling) troca um pouco de viés por variância limitada. No PPO, o TIS multiplica o termo clipado usual, cuja razão é \(\pi_{\text{train}}(\theta)/\pi_{\text{train}}(\theta_{\text{old}})\), por \(\min\big(\pi_{\text{train}}(\theta_{\text{old}})/\pi_{\text{infer}}(\theta_{\text{old}}),\,C\big)\): o descompasso entre motores e a mudança da política ficam em fatores separados. Na ablação, usar \(\pi_{\text{vllm}}\) dentro da própria razão clipada (“PPO-IS”), misturando os dois fatores, ou não truncar (“Vanilla-IS”) deu acurácia perto de zero com rollouts INT8 no Qwen2.5-0.5B/GSM8K. Truncar por token importa porque um token raro domina o produto: com razões [1,2; 0,96; 5,0; 0,99], o produto é 5,71, e o terceiro token (0,020 no treino, 0,004 na inferência) responde por um fator 5. O <span class="la-term" data-term="icepop">IcePop</span> (do Ring-1T, usado no RL de raciocínio do GLM-5) <b>zera</b> tokens com descompasso excessivo:</p>
+  <div class="la-eq">
+    \[ \mathcal L(\theta)=-\mathbb{E}\Big[\frac1G\sum_i\frac{1}{|y_i|}\sum_t\operatorname{pop}\big(\rho_{i,t},\tfrac1\beta,\beta\big)\cdot\min\big(r_{i,t}\hat A_{i,t},\ \mathrm{clip}(r_{i,t},1-\varepsilon_{\text{low}},1+\varepsilon_{\text{high}})\hat A_{i,t}\big)\Big],\qquad \rho_{i,t}=\frac{\pi^{\text{train}}_{\theta_{\text{old}}}(y_{i,t}\mid\cdot)}{\pi^{\text{infer}}_{\theta_{\text{old}}}(y_{i,t}\mid\cdot)} \]
+    <ul class="la-eq-legend">
+      <li>\(r_{i,t}=\pi^{\text{train}}_\theta/\pi^{\text{train}}_{\theta_{\text{old}}}\): a razão do PPO, calculada só no motor de treino</li>
+      <li>\(\rho_{i,t}\): descompasso do token; \(\operatorname{pop}(\rho,1/\beta,\beta)=\rho\) se \(1/\beta\le\rho\le\beta\), 0 caso contrário</li>
+      <li>GLM-5: \(\beta=2\) (limiar do pop, <b>não</b> coeficiente de KL), \(\varepsilon_{\text{low}}=0{,}2\), \(\varepsilon_{\text{high}}=0{,}28\), grupo 32, batch 32, on-policy, sem KL</li>
+    </ul>
+  </div>
+  <p>Com \(\beta=2\) a faixa aceita é [0,5; 2]: de \(\rho=[0{,}98;\ 1{,}6;\ 2{,}5;\ 0{,}45]\), ficam os dois primeiros e os outros são zerados.</p>
+  <figure class="la-fig" id="fig-descompasso" data-title="Mesmos pesos, outras probabilidades">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Modo <b>probabilidades</b>: oito tokens viajam do motor de rollout ao de treino; cada barra é \(\rho=\pi_{\text{train}}/\pi_{\text{infer}}\) em escala log, e embaixo está o peso que cada correção dá ao token. O deslizador escala os log-razões (0 = numérica idêntica); em ×1, os quatro primeiros tokens têm as razões do exemplo do TIS e os quatro últimos, as do IcePop. Modo <b>roteamento</b>: um token atravessa seis camadas MoE (8 especialistas, top-2) nos dois motores; em vermelho, camadas em que o treino escolheria outros especialistas. Valores <b>ilustrativos</b>.</figcaption>
+  </figure>
+  <p>Em RL <b>assíncrono</b>, o motor de rollout pode mudar de versão <i>durante</i> uma trajetória. O GLM-5 agêntico e o SAO calculam \(r_t=\exp(\log\pi_\theta-\log\pi_{\text{rollout}})\) direto e zeram tokens fora de \([1-\varepsilon_\ell,1+\varepsilon_h]\); o AReaL separa política de comportamento e proximal e chega a 2,77× sobre o síncrono. Todos limitam a <span class="la-term" data-term="staleness">defasagem</span>: o GLM-5 descarta trajetórias com atraso de versão acima de um limiar, o MiMo-V2.6 usa staleness 4, e o DeepSeek-V4 grava um log por token para retomar rollouts interrompidas sem enviesar para respostas curtas.</p>
+  <div class="la-callout deep"><b class="t">Onde A3C, IMPALA e TRPO ainda entram</b><p>Ninguém treina LLMs de fronteira com A3C ou TRPO literais em 2026, e TRL e OpenRLHF nem têm trainers para eles. Mas as três alavancas deste capítulo vêm deles (interpretação a partir das fontes). <b>Vantagem</b>: os retornos de \(n\) passos com crítico do A3C reaparecem no VAPO, no SAO e no GLM-5.2. <b>Região de confiança</b>: o KL do TRPO virou clip simétrico, assimétrico, por sequência, suave e a máscara do V3.2. <b>Correção off-policy</b>: o V-trace do IMPALA, \(\rho_t=\min\big(\bar\rho,\ \pi(a_t\mid x_t)/\mu(a_t\mid x_t)\big)\), é o avô do TIS e do IcePop, com o motor de inferência no papel de \(\mu\). E o A3C deixou a arquitetura: desacoplar geração e aprendizado (A3C → IMPALA → AReaL, slime, PipelineRL) para não esperar a rollout mais longa, e o bônus de entropia, hoje controle de entropia.</p></div>
+  <h3>O que o DeepSeek-V3.2 fez para escalar o GRPO</h3>
+  <ol class="la-steps">
+    <li><b>Vantagem só centrada</b>, \(R_i-\operatorname{mean}(R)\), e <b>KL não enviesado</b> (o k3 vezes \(\pi_\theta/\pi_{\text{old}}\)).</li>
+    <li><b><span class="la-term" data-term="off-policy-sequence-masking">Off-Policy Sequence Masking</span></b>: zera sequências com vantagem <i>negativa</i> cuja média por token de \(\log(\pi_{\text{old}}/\pi_\theta)\) passa de \(\delta\), com \(\pi_{\text{old}}\) vindo do motor de inferência. Errar fora demais da distribuição atual desestabiliza; é uma região de confiança por sequência.</li>
+    <li><b><span class="la-term" data-term="keep-routing">Keep Routing</span></b>: grava o roteamento de especialistas do rollout e o impõe no treino, “crucial” para MoE desde o V3-0324.</li>
+    <li><b>Keep Sampling Mask</b>: a máscara de top-p/top-k do rollout é aplicada a \(\pi_\theta\) no treino, e os dois compartilham o mesmo subespaço de ações.</li>
+  </ol>
+  <h3>MoE: o roteador é o ponto frágil</h3>
+  <p>Segundo o paper do <span class="la-term" data-term="r3-routing-replay">R3</span> (Rollout Routing Replay), em MoE o KL treino–inferência é mais que o dobro do denso, e ~94% dos tokens escolhem especialistas diferentes em ao menos uma camada: um logit de <span class="la-term" data-term="roteador">roteador</span> perto do empate muda de lado com ruído mínimo. O R3 grava as máscaras top-K da inferência e as reaplica no treino, superando GSPO e TIS nos experimentos dos autores. O MiMo-V2.6 <span class="la-term" data-term="roteador-congelado">congelou o roteador</span>: treinável, na camada 9 do Pro (384 especialistas), em 20 passos o CV da carga foi de 0,78 para 2,0, o pico de 6× para 16× a média e os especialistas “frios” de 0,5% para 22%; congelado, CV ≈ 0,7. O GLM-5 congelou o indexador da atenção esparsa e trocou o top-k não determinístico do SGLang pelo <code>torch.topk</code>, porque o primeiro causava queda brusca de entropia em poucos passos.</p>
+  <h3>Precisão, tokens e determinismo</h3>
+  <p>O MiniMax-M1 achou a fonte do descompasso na <span class="la-term" data-term="lm-head">LM head</span>, e levá-la a FP32 elevou a correlação treino–inferência de ~0,9 para ~0,99 (o ScaleRL usa FP32 nos logits). Qi et al. defendem FP16 uniforme no lugar do BF16. O DeepSeek-V4 fez QAT FP4 e gera rollouts em FP4 nativo, idênticos ao servido; o GLM-5 gera em FP8 com MTP e usa TITO (Token-in-Token-out), treinando nos exatos IDs gerados, sem retokenizar. Com kernels invariantes ao batch (Thinking Machines), 1.000 execuções do mesmo prompt deram 1.000 saídas idênticas (antes, 80 distintas no Qwen3-8B a temperatura 0), e com numérica bit-idêntica o KL amostrador–treinador fica em 0, a um custo de 55 s contra 26 s do vLLM padrão.</p>
+  <h3>Nas receitas</h3>
+  <p>Tudo o que o Módulo 1 fez para tornar a inferência fiel é o que um RL precisa para não virar off-policy sem perceber.</p>
+  <div class="la-inrecipe" data-recipe="qwen"><div class="la-inrecipe-h"><span class="la-rb qwen"></span><span class="k">Determinismo</span><code>VLLM_QSA_DET_TOPK=1 · VLLM_MOE_DET_FINALIZE=1</code></div><div class="la-inrecipe-b"><p>O overlay ordena os índices top-k da atenção QSA e usa o <i>finalize</i> não fundido do MoE (com <code>VLLM_FLASHINFER_MOE_FUSED_FINALIZE=0</code>): o espalhamento das log-probs de prompt entre requisições idênticas caiu de 0,25 nats (mediana) e 6,07 (máximo) para 0 e 0, e as saídas greedy distintas em 5 execuções, de 5 para 1, por ~4% de decode. É a classe de correção que o “on-policy verdadeiro” exige. A família Qwen escolheu GSPO e SAPO por dispensarem routing replay, e o checkpoint NVFP4 da receita é pós-hoc (ModelOpt): medir KLD contra o BF16 (<a data-ch="medindo-qualidade">capítulo 25</a>) é medir quanto do comportamento pós-treinado sobrevive.</p></div></div>
+  <div class="la-inrecipe" data-recipe="glm"><div class="la-inrecipe-h"><span class="la-rb glm"></span><span class="k">Fidelidade e rotas</span><code>logprob_capture.py · GLM53_EXPOSE_CACHE_RESET=1</code></div><div class="la-inrecipe-b"><p>O <code>logprob_capture.py</code> compara KL e argmax das log-probs top-20 entre dois servidores, a métrica que um RL vigia entre amostrador e treinador. O overlay <code>patch_cache_reset.py</code> monta só as rotas de reset de cache, sem <code>/sleep</code>, <code>/rlhf</code> ou <code>/rpc</code>, que o <code>VLLM_SERVER_DEV_MODE=1</code> abriria: uma receita de serving fecha de propósito o que um RL precisa abrir. O PR de RL do GLM-5.3-Flash no miles (#2786) repete os cuidados do fabricante (replay do top-k do indexador e do roteamento MoE), e a diferença média de log-prob do próximo token caiu de 0,257 para 0,029, com 98–99% de sobreposição de especialistas. A EXL3 de 4 bpw da receita é pós-hoc, sem QAT.</p></div></div>
+  <div class="la-inrecipe" data-recipe="ds"><div class="la-inrecipe-h"><span class="la-rb ds"></span><span class="k">Pesos do RL = pesos servidos</span><code>--moe-backend flashinfer_b12x (MXFP4, W4A16)</code></div><div class="la-inrecipe-b"><p>A receita serve os especialistas em MXFP4 (FP4 com escalas E8M0 por bloco de 32), o formato do QAT FP4 que o V4 usou no pós-treino com rollouts em FP4 nativo: ao contrário de GLM e Qwen, os pesos servidos são os que o RL viu (interpretação). A numérica, porém, não é idêntica: no GB10 o b12x roda W4A16, com ativações BF16, e não o caminho FP4/FP8 dos rollouts do V4. Os modos Non-think, High e Max são especialistas de RL com penalidades de comprimento diferentes, e o V4 recomenda saída máxima de 384K para High e Max: um orçamento menor corta raciocínios que o RL ensinou a serem longos.</p></div></div>
+  <p>A decodificação especulativa (<a data-ch="especulacao-fundamentos">capítulo 35</a>) aparece dos dois lados: o GLM-5 usa MTP nos rollouts para cortar a cauda, e as receitas usam MTP, DFlash e DSpark no serving. Ela preserva a distribuição em aritmética exata, mas a numérica do verificador em batch maior muda as log-probs (interpretação, não verificada em paper de RL). Para usar o vLLM como gerador de rollouts, há o sleep mode e a API de transferência de pesos do <a data-ch="ppo-rlhf">capítulo de PPO</a>, cujos endpoints HTTP exigem <code>VLLM_SERVER_DEV_MODE=1</code>.</p>
+  <p>Este capítulo supôs que vale a pena gerar, pontuar e otimizar online. O próximo pergunta o contrário: e se o ótimo do objetivo com KL tivesse forma fechada, e o RL virasse uma perda supervisionada sobre pares de preferência? É o <a data-ch="dpo">DPO</a>.</p>
+</section>

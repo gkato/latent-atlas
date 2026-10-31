@@ -1,0 +1,434 @@
+<p class="la-lead">Lembra do modelo base do <a data-ch="pos-treino-mapa">capítulo 50</a>, que respondia a uma pergunta com outra pergunta? O <span class="la-term" data-term="sft">fine-tuning supervisionado</span> (SFT) é o primeiro remédio: você mostra ao modelo milhares de <span class="la-term" data-term="demonstracao">demonstrações</span> de como um assistente responde e o treina a imitá-las, com a mesma entropia cruzada do pré-treino. É o método menos glamoroso do pós-treino, e está em toda parte: os seis R1-Distill da DeepSeek são <i>só</i> SFT em ~800 mil exemplos, o LIMA alinhou um LLaMA-65B com 1.000, e a correção das tool calls repetidas do MiMo-V2.6, por destilação, custou ~US$ 90 mil contra ~US$ 2,31 milhões da alternativa por RL. Aqui você vai ver a perda e a máscara, o template como dado, o packing, as fontes de demonstrações, a destilação on-policy e o MOPD, as curvas, o esquecimento e as configurações reais.</p>
+
+<section class="la-sec">
+  <h2>Do completador ao assistente</h2>
+  <p>Um <span class="la-term" data-term="modelo-base">modelo base</span> saiu do pré-treino: previu o próximo token em trilhões de tokens (27 trilhões no MiMo-V2-Flash, mais de 32 trilhões no DeepSeek-V4). Ele sabe muito, mas só completa texto: não tem formato de conversa, não sabe quando parar, não segue instruções de forma confiável e não tem política de segurança. O <span class="la-term" data-term="pos-treino">pós-treino</span> quase sempre começa pelo SFT: pares (prompt, resposta) escritos por humanos ou por modelos mais fortes, renderizados no <span class="la-term" data-term="chat-template">chat template</span> do modelo, com a perda calculada só nos tokens que o assistente “fala”.</p>
+  <p>A mecânica é a do <a data-ch="aprender-com-dados">capítulo 1</a>: entropia cruzada, gradiente, otimizador. O que muda é o dado, e o efeito é desproporcional ao tamanho. O InstructGPT (2022) usou ~13 mil prompts de SFT (e ~33 mil para o modelo de recompensa, ~31 mil no PPO), e o seu modelo de 1,3B foi preferido ao GPT-3 de 175B. O LIMA levou a ideia ao extremo e propôs a <span class="la-term" data-term="alinhamento-superficial">hipótese do alinhamento superficial</span>: quase todo o conhecimento vem do pré-treino, e o pós-treino ensina sobretudo <i>formato e estilo</i>. Com 1.000 exemplos curados, as respostas do LIMA empataram ou venceram as do GPT-4 em 43% dos casos.</p>
+  <p>Arraste o progresso do treino e veja a massa de probabilidade sair de “continuar a lista de perguntas” e ir para “responder”.</p>
+  <figure class="la-fig" id="fig-base-sft" data-title="A massa de probabilidade muda de lugar">
+    <div class="la-fig-stage" style="height:430px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Em cima, a distribuição do próximo token logo depois de <code>&lt;|im_start|&gt;assistant</code>. A sombra é o modelo base; as barras cheias, o modelo no ponto escolhido do treino; os pontinhos são massa de probabilidade migrando. No meio, uma amostra do modelo nesse ponto. Embaixo, a demonstração “A capital da França é Paris.” em <span class="la-term" data-term="teacher-forcing">teacher forcing</span>: a probabilidade de cada token e a sua perda \(-\ln p\). Probabilidades e amostras <b>ilustrativas</b>.</figcaption>
+  </figure>
+  <p>Repare em três coisas. A perda média despenca, e é o número que o otimizador vê. A amostra muda de regime cedo: o favorito troca de “Qual” para “A” muito antes de a perda chegar ao fim. E, nesta figura de brinquedo, o modelo aprende a responder antes de aprender a <i>parar</i>: por um bom trecho, responde certo e emenda um turno do usuário. Parar só se aprende se o token de fim de turno estiver na perda (seção 3).</p>
+  <h3>Por que todo método começa aqui</h3>
+  <p>Quase todo o resto do Módulo 2 pressupõe um checkpoint SFT (o mapa está no <a data-ch="pos-treino-mapa">capítulo 50</a>; aqui revemos só o que depende dele). No RLHF, ele é o ponto de partida da política e a âncora do KL (\(\pi_{\text{ref}}\)); no DPO, a referência costuma ser ele. No DeepSeek-R1, um SFT de cold start com alguns milhares de cadeias de pensamento vem antes do RL; o R1-Zero, que pulou essa etapa, tinha legibilidade ruim e misturava idiomas. No MOPD, professores e aluno nascem do mesmo SFT. E há um argumento de informação (<i>LoRA Without Regret</i>): um episódio de policy gradient dá \(O(1)\) bits, uma vantagem escalar; um exemplo de SFT dá \(O(\text{número de tokens})\) bits.</p>
+  <div class="la-callout analogy"><b class="t">Analogia: a semana de integração</b><p>O modelo base é um estagiário que leu a biblioteca inteira. Ele não precisa de aulas de física; precisa saber como a empresa responde um e-mail, quando assinar e quando parar de escrever. O SFT é a semana de integração com uma pasta de e-mails exemplares. Não ensina física: ensina a <i>forma</i> de entregar o que o estagiário já sabe, e por isso funciona com pouco material, desde que bom.</p></div>
+  <div class="la-callout recipe" data-recipe="qwen"><b class="t"><span class="la-rb qwen"></span> O que o pós-treino deixa para o servidor</b><p>Base, instruct e modelo de raciocínio têm os mesmos tensores, e tudo o que o Módulo 1 ensinou sobre servir vale para todos. Mas o pós-treino deixa marcas que o servidor precisa respeitar: o chat template, o <span class="la-term" data-term="reasoning-parser">parser de raciocínio</span>, a amostragem recomendada no <span class="la-term" data-term="generation-config">generation_config</span> (no Qwen3.8 em modo thinking, <code>temperature 1.0</code>, <code>top_p 0.95</code>, <code>top_k 20</code>) e os tokens de fim, <code>eos_token_id [248046, 248044]</code> (<code>&lt;|im_end|&gt;</code> e <code>&lt;|endoftext|&gt;</code>). Cada um desses detalhes nasceu num dado de treino.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>A perda: entropia cruzada só onde o assistente fala</h2>
+  <p>Escreva cada exemplo \(i\) como um prompt \(x_i\) (system, usuário, ferramentas, turnos anteriores) seguido da resposta \(y_i = (y_{i,1}, \dots, y_{i,T_i})\). O SFT é máxima verossimilhança da resposta dado o prompt, com a média tomada sobre os tokens que contam:</p>
+  <div class="la-eq">
+    \[ \mathcal L_{\text{SFT}}(\theta) \;=\; -\frac{1}{\sum_{i,t} m_{i,t}}\;\sum_{i}\sum_{t} m_{i,t}\,\log \pi_\theta\big(y_{i,t}\mid x_i,\, y_{i,&lt;t}\big) \]
+    <ul class="la-eq-legend">
+      <li>\(\theta\): os parâmetros treináveis (todos, ou só os de um adaptador LoRA)</li>
+      <li>\(i\): exemplo do lote acumulado (todos os micro-lotes e dispositivos)</li>
+      <li>\(t\): posição dentro da sequência renderizada</li>
+      <li>\(\pi_\theta(\cdot\mid\ldots)\): a distribuição do próximo token, softmax dos logits</li>
+      <li>\(y_{i,&lt;t}\): os tokens anteriores <i>do dataset</i>, não do modelo (teacher forcing)</li>
+      <li>\(m_{i,t}\in\{0,1\}\): a <span class="la-term" data-term="mascara-de-perda">máscara de perda</span>; 1 nos tokens do assistente</li>
+      <li>\(\sum m\): o número total de tokens de perda no lote</li>
+    </ul>
+  </div>
+  <p>Na implementação, o collator copia os <code>input_ids</code> para <code>labels</code> nas mesmas posições e escreve <code>-100</code> onde \(m=0\). O deslocamento de uma posição (a saída da posição \(t\) prevê o token \(t+1\)) acontece dentro da função de perda do modelo, que compara <code>logits[:, :-1]</code> com <code>labels[:, 1:]</code>. No HF/TRL, não desloque à mão: o modelo passaria a prever dois tokens à frente. O −100 é o <span class="la-term" data-term="ignore-index">ignore_index</span> da entropia cruzada do PyTorch: a posição não entra na soma nem no denominador. O gradiente é o do capítulo 1, \(\partial\ell/\partial z_v = p_v - \mathbb 1[v=y]\): o rótulo sobe com força \(1-p_y\), cada concorrente desce com a probabilidade que roubou, e linhas com −100 não produzem gradiente. A figura mostra a matriz de logits de uma conversa minúscula.</p>
+  <figure class="la-fig" id="fig-matriz-perda" data-title="A matriz da perda: logits, rótulos e máscara">
+    <div class="la-fig-stage" style="height:450px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Cada linha é uma posição da entrada (token à esquerda) e cada coluna, um token do vocabulário de brinquedo; a célula mostra \(\pi_\theta\) em %. O contorno marca o rótulo, que é o token seguinte. À direita, a perda \(-\ln p\) do rótulo (no computador, também o próprio rótulo), ou <code>-100</code> quando a posição está fora da máscara. As setas são o gradiente \(p - \mathbb 1[v=y]\) sobre os logits: menta sobe, rosa desce. “1 passo” aplica \(z \leftarrow z - \eta\,(p - \mathbb 1_y)\) direto nos logits de cada linha, uma simplificação: num modelo real o gradiente vai para pesos compartilhados. Valores <b>ilustrativos</b>.</figcaption>
+  </figure>
+  <p>Dê alguns passos com a máscara “só assistente” e veja que só as três linhas finais mudam. Com “todos os tokens”, o modelo gasta capacidade prevendo o usuário e os marcadores do template: desperdício e, como mostra a próxima seção, às vezes veneno.</p>
+  <h3>Média sobre o quê?</h3>
+  <p>O denominador \(\sum m\) deve contar <b>todos</b> os tokens de perda do lote acumulado, em todos os dispositivos. Se cada micro-lote tira a sua média e depois se faz a média das médias, cada token pesa de um jeito: com uma resposta de 20 tokens num micro-lote e uma de 2.000 no outro, cada token da curta pesa 100 vezes mais que um da longa, e o resultado muda com o micro-lote e o número de GPUs. Foi o bug da <span class="la-term" data-term="acumulacao-de-gradientes">acumulação de gradientes</span> de 2024. O Tülu 3 trocou a média pela <b>soma</b> (o que exige recalibrar o LR); o TRL normaliza pelo total de tokens do lote acumulado com <code>average_tokens_across_devices=True</code>.</p>
+  <h3>Imitar é KL direto, e é off-policy</h3>
+  <p>Minimizar a perda do SFT é minimizar o <span class="la-term" data-term="kl-direto">KL direto</span> dos dados para o modelo, como o capítulo 50 antecipou: \(H(p_{\text{dados}}, \pi_\theta) = H(p_{\text{dados}}) + \mathrm{KL}(p_{\text{dados}}\,\|\,\pi_\theta)\), e o primeiro termo não depende de \(\theta\). Esse KL pune o modelo sempre que ele dá probabilidade baixa a algo que os dados fazem, e ele espalha massa por todos os modos, mesmo os que não reproduz bem (a seção 7 o compara com o KL reverso).</p>
+  <p>O SFT também é <span class="la-term" data-term="off-policy">off-policy</span>: no treino, o prefixo de toda posição é o do dataset; na geração, é o do próprio modelo, e um desvio pequeno o leva a estados que nunca viu, onde os erros se acumulam. É o <span class="la-term" data-term="vies-de-exposicao">viés de exposição</span>, a motivação de toda a família on-policy adiante.</p>
+  <div class="la-callout deep"><b class="t">Aprofundamento: o SFT visto como policy gradient</b><p>O gradiente de \(-\log p_\theta(y)\) é \(-\nabla p_\theta(y)/p_\theta(y)\). Lido como policy gradient, é um REINFORCE com uma “recompensa implícita” proporcional a \(1/p\): tokens raros no modelo recebem empurrões enormes. O <i>Dynamic Fine-Tuning</i> (arXiv 2508.05629) argumenta que isso prejudica a generalização e multiplica a perda de cada token pela própria probabilidade com stop-gradient, \(-\mathrm{sg}(p_\theta(y_t))\log p_\theta(y_t)\). No TRL é <code>loss_type="dft"</code>; há também <span class="la-term" data-term="neftune">NEFTune</span> (ruído nos embeddings, <code>neftune_noise_alpha</code>) e <code>label_smoothing_factor</code>. Trate-as como hipóteses a medir, não como padrão.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>O chat template é parte do dado</h2>
+  <p>O <a data-ch="tokens-embeddings">capítulo 5</a> mostrou o chat template do lado do servidor: a função que transforma a lista de mensagens em texto com <span class="la-term" data-term="token-especial">tokens especiais</span>. No treino, o template deixa de ser detalhe de API e vira <b>parte do dado</b>. O formato de entrada mais comum é JSONL, um objeto por linha. Os frameworks aceitam conversas (<code>messages</code>), pares prompt–completion, conversas com ferramentas e com raciocínio:</p>
+  <pre data-lang="json"><code>{"messages": [{"role": "system", "content": "Você é um engenheiro de inferência. Responda em PT-BR, com números e unidades."}, {"role": "user", "content": "Quanto ocupa o KV de um token no fp8_ds_mla do GLM?"}, {"role": "assistant", "content": "656 bytes por token por camada DSA: 512 B do latente NoPE em FP8, 16 B de escalas e 128 B de RoPE (64 valores BF16)."}]}
+{"prompt": [{"role": "user", "content": "Qual o padrão de --max-lora-rank no vLLM?"}], "completion": [{"role": "assistant", "content": "16. Aceita 1, 8, 16, 32, 64, 128, 256, 320 ou 512."}]}
+{"messages": [{"role": "user", "content": "Quantos tokens de KV cabem em 14 GiB a 656 B/token/camada com 11 camadas?"}, {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "calc", "arguments": "{\"expr\": \"14*2**30/(656*11)\"}"}}]}, {"role": "tool", "tool_call_id": "c1", "content": "2083202.0"}, {"role": "assistant", "content": "≈ 2,08 milhões de tokens."}], "tools": [{"type": "function", "function": {"name": "calc", "description": "Avalia uma expressão aritmética", "parameters": {"type": "object", "properties": {"expr": {"type": "string"}}, "required": ["expr"]}}}]}
+{"messages": [{"role": "user", "content": "Um 27B em NVFP4 cabe em quantos GB?"}, {"role": "assistant", "reasoning_content": "27,8e9 parâmetros × 4,5 bits efetivos…", "content": "Cerca de 16 GB só para os pesos NVFP4…"}], "chat_template_kwargs": {"enable_thinking": true}}</code></pre>
+  <p>O primeiro formato é o conversacional. O segundo calcula a perda só na completion, por padrão (<code>completion_only_loss</code> no TRL, <code>--mask-prompt</code> no mlx-lm). O terceiro é o de ferramentas: <code>tool_calls</code> no turno do assistente, com <code>function.arguments</code> como <b>string</b> JSON; <code>role: "tool"</code> com o <code>tool_call_id</code> e o resultado; e o esquema das funções na coluna <code>tools</code>. A figura 52.3, logo abaixo, renderiza essa conversa (com system e raciocínio a mais). O quarto é o de raciocínio na família Qwen3.5/3.6/3.8: o pensamento vai no campo <span class="la-term" data-term="reasoning-content"><code>reasoning_content</code></span>, não como <code>&lt;think&gt;</code> dentro de <code>content</code>. O template do Qwen3.8-27B renderiza <code>&lt;think&gt;\n{reasoning_content}\n&lt;/think&gt;\n\n{content}</code>; pôr o raciocínio inline em <code>content</code> gera dois blocos de pensamento. O <code>chat_template_kwargs</code> de cada linha é aplicado pelo <span class="la-term" data-term="sfttrainer">SFTTrainer</span> ao renderizar aquele exemplo.</p>
+  <figure class="la-fig" id="fig-mascara-conversa" data-title="A máscara numa conversa com raciocínio e ferramenta">
+    <div class="la-fig-stage" style="height:480px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Uma conversa renderizada num template estilo Qwen. Cor por papel: system (verde), usuário (lavanda), raciocínio (âmbar), chamada de ferramenta (rosa), resultado da ferramenta (magenta), resposta (menta); marcadores do template em cinza. Tokens acesos entram na perda; apagados recebem −100. O cursor varre a conversa e cada token aceso deposita a sua perda no balde. Embaixo, o que um modelo treinado assim tende a fazer. A chamada está no formato JSON do Qwen3 (estilo Hermes, <code>name</code> + <code>arguments</code>); o template do Qwen3.5/3.8, lido pelo <code>qwen3_coder</code> da receita, usa XML (<code>&lt;function=…&gt;&lt;parameter=…&gt;</code>). Tokenização simplificada (palavras inteiras) e conversa <b>ilustrativa</b>.</figcaption>
+  </figure>
+  <p>Os quatro modos da figura:</p>
+  <ul>
+    <li><b>Texto inteiro.</b> O modelo também aprende a escrever o usuário e o resultado da ferramenta. Quem aprendeu a <i>prever</i> <code>&lt;tool_response&gt;</code> aprendeu a <i>inventar</i> resultados de ferramenta.</li>
+    <li><b>Só assistente.</b> O correto: raciocínio, chamadas de ferramenta, resposta e fim de turno entram. No TRL é <code>assistant_only_loss=True</code>, que exige blocos <code>{% generation %}…{% endgeneration %}</code> no template (o TRL corrige o de famílias conhecidas, como Qwen3).</li>
+    <li><b>Assistente sem EOS.</b> O erro mais caro: sem <code>&lt;|im_end|&gt;</code> na perda, o modelo não aprende a parar e “fala pelo usuário” ou gera até <code>max_tokens</code>. O TRL pede o <code>eos_token</code> alinhado ao template; para o <code>Qwen/Qwen2.5-1.5B</code> base, <code>eos_token="&lt;|im_end|&gt;"</code>.</li>
+    <li><b>mlx <code>--mask-prompt</code>.</b> Só a <b>última mensagem</b> conta como completion; os turnos anteriores do assistente nunca são treinados. Se cada turno importa, divida a conversa em vários exemplos.</li>
+  </ul>
+  <h3>Cinco regras que evitam semanas de depuração</h3>
+  <ol class="la-steps">
+    <li><b>Byte a byte o template do serviço.</b> Um espaço ou uma quebra de linha diferente antes de <code>&lt;|im_start|&gt;assistant</code> muda a tokenização, e o modelo vê na inferência um prefixo que não viu no treino. Renderize com <code>tokenizer.apply_chat_template</code> usando o mesmo <code>tokenizer_config.json</code> que o vLLM vai usar.</li>
+    <li><b>Histórico de raciocínio igual nos dois lados.</b> Vários templates da família Qwen3 <b>removem</b> o <code>&lt;think&gt;</code> dos turnos anteriores; treinar com o histórico completo e servir sem ele (ou o contrário) cria descasamento, e o kwarg <span class="la-term" data-term="preserve-thinking"><code>preserve_thinking</code></span> do Qwen3.8 (default <code>true</code> no card) existe para isso. Para agentes, o TRL exige templates “prefix-preserving” (anexar uma mensagem não muda a renderização das anteriores) e troca sozinho por um template de treino corrigido em Qwen3 e DeepSeek-V3.</li>
+    <li><b>Formato de tool call igual ao do parser.</b> Os <code>tool_calls</code> do dado têm que sair no formato que o <span class="la-term" data-term="tool-call-parser"><code>--tool-call-parser</code></span> vai ler (<code>mimo</code>, <code>qwen3_coder</code>, o <span class="la-term" data-term="dsml">DSML</span> do DeepSeek). Um SFT que ensina outro formato quebra o parser no vLLM (<a data-ch="api-tools-estruturado">capítulo 34</a>).</li>
+    <li><b>Checkpoint sem Jinja, dataset pré-tokenizado.</b> Quando o template é um programa, gere os tokens com o mesmo programa e entregue <code>input_ids</code> + <code>labels</code> (ou <code>assistant_masks</code>), que o <code>SFTTrainer</code> aceita.</li>
+    <li><b>Tokens novos pedem embeddings treináveis.</b> Num base sem template, o TRL pode clonar o de outro modelo (<code>chat_template_path="HuggingFaceTB/SmolLM3-3B"</code>). Se isso introduz tokens que o base nunca treinou, um LoRA nas camadas lineares não aprende os vetores deles: é preciso treinar <code>embed_tokens</code> e <code>lm_head</code> (<code>modules_to_save</code> no PEFT).</li>
+  </ol>
+  <div class="la-inrecipe" data-recipe="ds"><div class="la-inrecipe-h"><span class="la-rb ds"></span><span class="k">Parâmetro</span><code>--tokenizer-mode deepseek_v4</code></div><div class="la-inrecipe-b"><p>O DeepSeek-V4 não traz template Jinja: o chat é renderizado por um encoder Python do checkpoint (<code>encoding_dsv4.py</code>), e a receita do Módulo 1 o ativa com <code>--tokenizer-mode deepseek_v4</code>. Para um SFT servido por essa receita, tokenize os exemplos <b>pelo mesmo encoder</b> (regra 4) e escreva as chamadas de ferramenta em DSML, o formato que o <code>--tool-call-parser deepseek_v4</code> lê: um único token estrutural malformado impede o parser de reconhecer a chamada.</p></div></div>
+</section>
+
+<section class="la-sec">
+  <h2>Packing: encher a mala sem misturar as roupas</h2>
+  <p>Exemplos de SFT têm tamanhos muito diferentes: uma resposta de 40 tokens ao lado de um raciocínio de 6.000. Num lote com <span class="la-term" data-term="padding-de-sequencia">padding</span>, todos são completados até o mais longo, e os tokens de enchimento custam memória e contas mesmo fora da perda. O <span class="la-term" data-term="packing">packing</span> encaixa vários exemplos numa mesma linha de <code>max_length</code>. No TRL (<code>packing=True</code>) há três estratégias:</p>
+  <dl class="la-kv">
+    <dt>"bfd" (padrão)</dt><dd><span class="la-term" data-term="best-fit-decreasing">best-fit decreasing</span>: ordena por tamanho e põe cada exemplo na linha mais cheia em que ele ainda cabe. O excesso dos exemplos maiores que a linha é descartado.</dd>
+    <dt>"bfd_split"</dt><dd>igual, mas corta os exemplos longos em pedaços em vez de descartar o excesso.</dd>
+    <dt>"wrapped"</dt><dd>concatena tudo e corta em blocos, partindo exemplos ao meio. O relatório do Qwen3-Coder-Next diz que isso prejudica.</dd>
+  </dl>
+  <p>Empacotar cria um problema novo: na linha empacotada, o exemplo B vem logo depois do A, e a máscara causal comum deixaria B atender a A. Com <code>"bfd"</code>, o TRL liga sozinho o <span class="la-term" data-term="padding-free">padding_free</span>: o lote vira uma sequência só, os <code>position_ids</code> recomeçam em 0 a cada exemplo e o <span class="la-term" data-term="flashattention">FlashAttention</span> de comprimento variável impede que um exemplo atenda ao outro. Os <code>position_ids</code> recomeçam porque o RoPE gira cada vetor pelo índice absoluto (<a data-ch="posicao-rope">capítulo 8</a>), e porque é dos recomeços que o kernel varlen tira as fronteiras dos exemplos (<code>cu_seqlens</code>). O TRL também põe −100 no primeiro token de cada exemplo empacotado (<code>labels[position_ids == 0] = -100</code>), para o último token de A não ser treinado a prever o primeiro de B.</p>
+  <p>Sem FlashAttention 2/3, há risco de <span class="la-term" data-term="contaminacao-de-lote">contaminação de lote</span>. No serviço, o vLLM roda FA2 no SM12x (<a data-ch="kernels">capítulo 28</a>), mas as fontes não confirmam, para o treino, o FlashAttention 2/3 que o padding-free usa no sm_121 do GB10. Sem ele, use SDPA com packing sem padding-free, desde que a sua versão do transformers monte a máscara bloco-diagonal a partir dos <code>position_ids</code> (confira com um lote de dois exemplos se os logits de B mudam quando A muda), ou só padding.</p>
+  <figure class="la-fig" id="fig-packing" data-title="Padding, BFD e wrapped: a mala e a máscara">
+    <div class="la-fig-stage" style="height:400px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>À esquerda (em cima, no celular), dez exemplos de um lote em linhas de <code>max_length</code> = 16 blocos de 128 tokens (2.048). Cinza = padding; vermelho = tokens perdidos por truncamento; zigue-zague = exemplo partido entre linhas. Ao lado (embaixo, no celular), a máscara de atenção da primeira linha com dois ou mais exemplos: célula (consulta, chave) acesa = pode atender. Com a máscara por exemplo desligada, as células vermelhas são a contaminação, um exemplo lendo o outro. Abaixo dela, os <code>position_ids</code>. Tamanhos <b>ilustrativos</b>.</figcaption>
+  </figure>
+  <p>Teste “wrapped” com a máscara desligada: além de exemplos partidos, metade da linha atende a texto de outro exemplo. O SFT do DeepSeek-V3 (1,5 milhão de instâncias, 2 épocas, LR em cosseno de 5e-6 até 1e-6) fez certo: packing <b>com máscara entre amostras</b>.</p>
+  <h3>Truncamento e lote efetivo</h3>
+  <p>O <code>max_length</code> padrão do SFT no TRL é 1024, e só <code>truncation_mode="keep_start"</code> é suportado: o corte acontece no <b>fim</b>, onde está a resposta, e num trace de raciocínio decepa a conclusão e o <code>&lt;/think&gt;</code>. Filtre ou divida os exemplos longos. Quanto ao lote, a conta que importa é a de tokens por passo de otimizador:</p>
+  <div class="la-eq">
+    \[ B_{\text{tokens}} \;=\; b_{\text{micro}} \times n_{\text{acum}} \times N_{\text{dp}} \times \bar L \]
+    <ul class="la-eq-legend">
+      <li>\(b_{\text{micro}}\): exemplos (ou linhas empacotadas) por micro-lote, por dispositivo</li>
+      <li>\(n_{\text{acum}}\): passos de acumulação de gradientes antes de cada atualização</li>
+      <li>\(N_{\text{dp}}\): réplicas de data parallel</li>
+      <li>\(\bar L\): tokens úteis por linha (com packing, perto de <code>max_length</code>)</li>
+    </ul>
+  </div>
+  <p>O <span class="la-term" data-term="lote-efetivo">lote efetivo</span> de referência nos relatórios é 128 exemplos (Tülu 3, MiMo-V2-Flash). Um aviso do <i>LoRA Without Regret</i>: o LoRA tolera lotes muito grandes pior que o full fine-tuning, e aumentar o posto não resolve, porque a penalidade é propriedade da parametrização \(BA\).</p>
+</section>
+
+<section class="la-sec">
+  <h2>Dados: poucos e bons, muitos e verificados</h2>
+  <p>Quantas demonstrações bastam? A literatura parece contraditória até você separar o que cada estudo queria ensinar:</p>
+  <table>
+    <thead><tr><th>Referência</th><th>Tamanho</th><th>Achado</th></tr></thead>
+    <tbody>
+      <tr><td>LIMA</td><td>1.000 curados (LLaMA-65B)</td><td>formato com pouco dado: 43% ≥ GPT-4, 58% ≥ Bard, 65% ≥ DaVinci003</td></tr>
+      <tr><td>s1 (s1K)</td><td>1.000 perguntas com traços do Gemini Thinking</td><td>SFT do Qwen2.5-32B-Instruct + <i>budget forcing</i> supera o o1-preview em até 27% (MATH, AIME24); 26 min em 16 H100</td></tr>
+      <tr><td>LIMO</td><td>817</td><td>57,1% no AIME e 94,8% no MATH; o limite é o conhecimento já codificado no base</td></tr>
+      <tr><td>Alpaca</td><td>52 mil (self-instruct com text-davinci-003)</td><td>instrução barata a partir de um modelo mais forte</td></tr>
+      <tr><td>Tülu 3 SFT</td><td>939.344 prompts</td><td>mistura por habilidade, descontaminada; o desempenho cresce com a mistura (o TruthfulQA cai)</td></tr>
+      <tr><td>OpenThoughts3</td><td>1,2 milhão (16 respostas por pergunta do QwQ-32B)</td><td>OpenThinker3-7B só com SFT: 53% AIME25, 51% LCB, 54% GPQA-D; mais de 1.000 ablações</td></tr>
+      <tr><td><span class="la-rb ds"></span> DeepSeek-R1 distill</td><td>~800 mil</td><td>os R1-Distill (Qwen e Llama, de 1.5B a 70B) são só SFT</td></tr>
+    </tbody>
+  </table>
+  <p>A síntese (interpretação nossa): <b>formato e estilo</b> pedem poucos exemplos muito bons. <b>Raciocínio</b> pode ser <i>eliciado</i> com poucos exemplos quando o base já sabe (s1, LIMO), mas o desempenho de ponta só com SFT escala com dados diversos e verificados (OpenThoughts). A qualidade vem de filtrar por dificuldade e correção, deduplicar, fazer <span class="la-term" data-term="descontaminacao">descontaminação</span> contra os benchmarks (o Tülu 3 mostra o que removeu) e balancear a mistura por habilidade. E mais dado de um tipo pode piorar outro, como o TruthfulQA no Tülu 3: meça uma bateria larga.</p>
+  <div class="la-callout recipe" data-recipe="qwen"><b class="t"><span class="la-rb qwen"></span> Como o Qwen3 filtrou o seu cold start</b><p>O primeiro estágio do Qwen3 é um SFT de cadeias de pensamento longas em matemática, código, lógica e STEM, todos verificáveis. A filtragem foi dupla. Nas perguntas, saíram as não verificáveis e as que o Qwen2.5-72B-Instruct resolve <i>sem</i> raciocinar (fáceis demais para ensinar a pensar). Nas respostas, geradas pelo QwQ-32B, saíram as erradas, as repetitivas e as inconsistentes. O pós-treino do Qwen3.8-Flash-Next da receita não está publicado.</p></div>
+  <h3>Dados sintéticos: destilar de quem sabe mais</h3>
+  <p>A forma mais comum de conseguir demonstrações em escala é pedi-las a um modelo mais forte e fazer SFT nas saídas dele: a <span class="la-term" data-term="destilacao-off-policy">destilação off-policy</span> em nível de sequência do Alpaca, do R1-Distill, do OpenThoughts e do MiMo (com checkpoints internos especializados por domínio). Uma variante minimiza \(\mathrm{KL}(\pi_T\,\|\,\pi_\theta)\) sobre a distribuição completa do professor em cada posição, o que exige o <b>mesmo vocabulário</b> (o <code>DistillationTrainer</code> do TRL avisa disso). Os modelos do Módulo 1 têm vocabulários próprios (GLM 154.880, Qwen 248.320, DeepSeek 129.280): o aluno precisa ser da mesma família de tokenizer.</p>
+  <p>“Mais forte” não é sempre melhor. No artigo do MOPD, trocar o professor de matemática nascido do mesmo SFT pelo Qwen3-235B-A22B, muito mais forte, <b>piorou</b> o aluno: o KL inicial por token subiu de ~0,04 para ~0,19 e a entropia caiu de 0,30 para 0,21. Interpretação nossa: um professor próximo dá sinal aprendível; um distante ensina o que o aluno não consegue representar. E gerar dados com APIs fechadas pode violar os termos do provedor: confira as licenças.</p>
+  <h3>Gerar, filtrar, treinar: RFT e STaR</h3>
+  <p>A terceira fonte é o próprio modelo. O laço da <span class="la-term" data-term="rft">rejection-sampling fine-tuning</span> (ou <i>expert iteration</i>) tem quatro passos: amostrar \(k\) respostas por prompt, manter as corretas (verificador, testes, juiz), fazer SFT nelas e repetir com o modelo novo. Com taxa de acerto \(p\) num prompt, a chance de guardar pelo menos um exemplo dele é</p>
+  <div class="la-eq">
+    \[ \Pr[\text{prompt aproveitado}] \;=\; 1 - (1-p)^k, \qquad p = 0{,}2,\; k = 16 \;\Rightarrow\; 1 - 0{,}8^{16} \approx 0{,}97 \]
+    <ul class="la-eq-legend">
+      <li>\(p\): taxa de acerto do modelo atual naquele prompt</li>
+      <li>\(k\): amostras por prompt</li>
+      <li>prompts com \(p = 0\) nunca rendem exemplo, por maior que seja \(k\)</li>
+    </ul>
+  </div>
+  <figure class="la-fig" id="fig-rft" data-title="O laço do RFT: amostrar, verificar, guardar, treinar">
+    <div class="la-fig-stage" style="height:450px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Seis prompts com dificuldades diferentes (a barra é a taxa de acerto atual). Em cada rodada o modelo gera \(k\) respostas por prompt; o verificador marca ✓ ou ✗; as corretas vão para o dataset e as erradas para o lixo; o SFT nelas aumenta a taxa de acerto. Com STaR ligado, prompts sem acerto ganham uma racionalização (âmbar): a resposta é dada como dica e o modelo escreve a justificativa. À direita, a acurácia média por rodada. Dinâmica de melhora <b>ilustrativa</b>.</figcaption>
+  </figure>
+  <p>O <span class="la-term" data-term="star">STaR</span> (Zelikman et al., 2022) ataca justamente os prompts que o modelo erra sempre. O RFT de Yuan et al. (2023) levou o LLaMA-7B de 35,9% (SFT) para 49,3% no GSM8K combinando amostras de vários modelos; o ganho cresce com o número de <b>caminhos de raciocínio distintos</b> e é maior nos modelos mais fracos. O ReST-EM vê o laço como EM e escala melhor que dados humanos em matemática e código. O estágio 3 do DeepSeek-R1 é RFT em escala: ~600 mil amostras de raciocínio corretas e sem idiomas misturados, mais ~200 mil gerais, num SFT de 2 épocas sobre o DeepSeek-V3-Base. Repare na lixeira da figura. Interpretação nossa: o RFT é um policy gradient com recompensa binária cujos negativos foram jogados fora, <i>semi</i>-on-policy (os dados vêm de uma versão anterior do modelo) e tão simples quanto um SFT: a ponte natural para o RL dos capítulos seguintes.</p>
+</section>
+
+<section class="la-sec">
+  <h2>Raciocínio e ferramentas: SFT de traces longos</h2>
+  <p>Um modelo de raciocínio escreve uma cadeia de pensamento longa entre <code>&lt;think&gt;</code> e <code>&lt;/think&gt;</code> antes de responder. O SFT entra em dois pontos: no <span class="la-term" data-term="cold-start">cold start</span>, com alguns milhares de cadeias legíveis antes do RL (DeepSeek-R1, Qwen3), e na fusão de modos (o terceiro estágio do Qwen3 é um SFT que junta thinking e não-thinking com as flags <code>/think</code> e <code>/no_think</code>). E os traces são longos: os exemplos do MOPD usam 32.768 tokens em matemática e instruções e 65.536 em engenharia de software, com até 50 turnos.</p>
+  <p>O custo de memória cresce com o comprimento \(s\). Com FlashAttention, as ativações guardadas para o backward crescem linearmente em \(s\), os FLOPs da atenção crescem com \(s^2\) e os logits crescem com \(s\cdot V\). A aproximação de Korthikanti et al. para um bloco Transformer em 16 bits dá:</p>
+  <div class="la-eq">
+    \[ A_{\text{sem ckpt}} \approx 34\,s\,b\,h\,L, \qquad A_{\text{ckpt}} \approx 2\,s\,b\,h\,L + 34\,s\,b\,h, \qquad \text{logits}_{\text{FP32}} = 4\,s\,b\,V \ \ \text{(bytes)} \]
+    <ul class="la-eq-legend">
+      <li>\(s\): tokens por sequência; \(b\): sequências por micro-lote</li>
+      <li>\(h\): dimensão oculta; \(L\): camadas</li>
+      <li>34: bytes por elemento oculto por camada guardados para o backward (sem a matriz de atenção, que o FlashAttention não materializa)</li>
+      <li>ckpt: <span class="la-term" data-term="gradient-checkpointing">gradient checkpointing</span> completo; guarda só a entrada de cada camada e recalcula o resto</li>
+      <li>\(V\): vocabulário; os logits \([s \times V]\) costumam ser o maior tensor do treino</li>
+    </ul>
+  </div>
+  <p>Para o Llama-3.1-8B (\(h = 4096\), \(L = 32\), \(V = 128.256\)), com \(b = 1\): a 2.048 tokens são 9,13 GB de ativações sem checkpointing, 0,82 GB com ele e 1,05 GB de logits; a 32.768 tokens, 146,0 GB, 13,2 GB e 16,8 GB. É por isso que o TRL usa por padrão <span class="la-term" data-term="chunked-nll"><code>loss_type="chunked_nll"</code></span>: descarta as posições com rótulo −100 <b>antes</b> do <code>lm_head</code> e calcula a entropia cruzada em pedaços. No Qwen3-1.7B, isso deu ~30% menos VRAM de pico (até ~50% com FSDP2 em 4 GPUs). O <code>chunked_nll</code> não é compatível com Liger, PEFT nem VLM. A conta completa da memória de treino está no <a data-ch="treino-memoria-lora">capítulo anterior</a>.</p>
+  <figure class="la-fig" id="fig-traces" data-title="Traces longos: onde mora a perda e quanto custa">
+    <div class="la-fig-stage" style="height:470px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Em cima, uma trajetória de agente: system + ferramentas, pedido, \(n\) turnos de raciocínio → chamada → resultado, e a resposta final. Só o que o modelo gera entra na perda; o resultado da ferramenta é contexto. Os tamanhos de segmento são <b>ilustrativos</b>. Ao lado (embaixo, no celular), a fração de tokens de perda medida no MiMo-V2.6-Distill-Qwen-9B por domínio. Embaixo, a memória de um SFT LoRA do Llama-3.1-8B (base BF16 congelada 16,1 GB + estado LoRA r=16 de 0,67 GB) com as fórmulas acima, contra os 130,7 GB (121,69 GiB) que um DGX Spark expõe.</figcaption>
+  </figure>
+  <p>Ferramentas seguem a mesma lógica: os turnos do assistente com <code>tool_calls</code> entram na perda; os resultados (<code>role: tool</code>) ficam fora. Em escala, isso muda a conta. O MiMo-V2.6-Distill-Qwen-9B é um SFT do Qwen3.5-9B em <b>77,4 bilhões de tokens</b> gerados pelo MiMo, dos quais só <b>27,2 bilhões</b> (~35%) entram na perda; o resto é contexto, ferramentas e saídas de ambiente. O SWE-bench Pro foi de 32,0 para 44,6 e o AutomationBench de 5,0% para 30,3%. É destilação agêntica em escala de pré-treino continuado, e o orçamento se faz em tokens de perda, não em tokens totais.</p>
+  <div class="la-callout recipe" data-recipe="ds"><b class="t"><span class="la-rb ds"></span> O esforço de raciocínio é um artefato do pós-treino</b><p>No DeepSeek-V4, cada nível de esforço (Non-think, High, Max) é um especialista de RL treinado com penalidade de comprimento e janela de contexto próprias, avaliado com janelas de 8K, 128K e 384K. Servir com orçamento menor que o do treino corta raciocínios que o pós-treino ensinou a serem longos; num SFT seu, se os traces têm 20 mil tokens, o <code>max_tokens</code> do serviço precisa comportá-los.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Destilação on-policy: o professor corrige o que o aluno faz</h2>
+  <p>O SFT tem sinal denso (cada token tem um alvo), mas é off-policy. O RL é <span class="la-term" data-term="on-policy">on-policy</span>, mas o sinal é esparso: um escalar por episódio. A <span class="la-term" data-term="destilacao-on-policy">destilação on-policy</span> junta os dois: o aluno gera as próprias respostas, e um professor opina, em cada posição, sobre o token que o aluno escreveu.</p>
+  <table>
+    <thead><tr><th>Método</th><th>De onde vêm os estados</th><th>Sinal</th></tr></thead>
+    <tbody>
+      <tr><td>SFT / destilação off-policy</td><td>do dataset ou do professor</td><td>denso (cada token)</td></tr>
+      <tr><td>RL</td><td>do próprio modelo</td><td>esparso (um escalar por episódio)</td></tr>
+      <tr><td><b>Destilação on-policy</b></td><td><b>do próprio modelo</b></td><td><b>denso (cada token)</b></td></tr>
+    </tbody>
+  </table>
+  <p>O <span class="la-term" data-term="gkd">GKD</span> (Agarwal et al., ICLR 2024) treina o aluno nas próprias sequências, com o professor dando a distribuição completa em cada posição, e deixa escolher a divergência. No <code>DistillationTrainer</code> do TRL, ela é a <span class="la-term" data-term="jsd-generalizada">JSD generalizada</span>:</p>
+  <div class="la-eq">
+    \[ \mathcal L_\beta = \beta\,\mathrm{KL}\big(p_T\,\|\,p_M\big) + (1-\beta)\,\mathrm{KL}\big(p_S\,\|\,p_M\big), \qquad p_M = (1-\beta)\,p_S + \beta\,p_T \]
+    <ul class="la-eq-legend">
+      <li>\(p_T\), \(p_S\): distribuições do professor e do aluno na posição</li>
+      <li>\(p_M\): a mistura das duas</li>
+      <li>\(\beta = 0\): o TRL usa o KL direto \(\mathrm{KL}(p_T\|p_S)\); \(\beta = 1\): o KL reverso \(\mathrm{KL}(p_S\|p_T)\) (os extremos são tratados à parte, porque a fórmula degenera neles)</li>
+      <li>padrões do <code>DistillationConfig</code>: <code>beta 1.0</code>, <code>temperature 1.0</code>, <code>max_completion_length 512</code>, <code>learning_rate 1e-6</code></li>
+    </ul>
+  </div>
+  <p>A diferença entre as pontas, já vista no capítulo 50, é a distinção conceitual mais útil do módulo. O KL direto do SFT é <i>mass-covering</i>: pune deixar sem massa algo que o professor faz. O <span class="la-term" data-term="kl-reverso">KL reverso</span> é <i>mode-seeking</i>: pune pôr massa onde o professor não põe, e o aluno se concentra nos modos que consegue representar. Quando o aluno é menor, cobrir tudo significa pôr massa no vale entre os modos, gerando o que o professor nunca diria. A figura mostra um professor de dois modos e um aluno de um modo só.</p>
+  <figure class="la-fig" id="fig-kl" data-title="KL direto × KL reverso: cobrir tudo ou escolher um modo">
+    <div class="la-fig-stage" style="height:420px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Contorno menta: o professor \(p_T\), com dois modos. Curva lavanda: o melhor aluno gaussiano \(p_S\) para o \(\beta\) escolhido, achado por busca em grade no navegador. Âmbar = massa do professor que o aluno não cobre (o KL direto pune); rosa = massa do aluno onde o professor não põe (o KL reverso pune). As bolinhas caindo são amostras do aluno: verdes onde o professor também gera, vermelhas onde ele quase não põe massa (o vale e as caudas). Distribuições <b>ilustrativas</b>.</figcaption>
+  </figure>
+  <p>Leve \(\beta\) a 0: o aluno fica largo, centrado no vale, e boa parte das amostras cai onde o professor quase não põe massa. Leve a 1: o aluno escolhe o modo maior e fica estreito; perde o outro modo, mas o que gera é plausível. Por isso a destilação on-policy funciona bem quando o aluno é menor que o professor.</p>
+  <h3>A vantagem por token</h3>
+  <p>Com uma amostra por posição, o gradiente do KL reverso vira um policy gradient com uma <span class="la-term" data-term="vantagem-por-token">vantagem por token</span>:</p>
+  <div class="la-eq">
+    \[ \hat A_t \;=\; \mathrm{sg}\big[\log \pi_T(y_t) - \log \pi_\theta(y_t)\big], \qquad y \sim \pi_\theta \]
+    <ul class="la-eq-legend">
+      <li>\(y_t\): o token que o <i>aluno</i> amostrou na posição \(t\)</li>
+      <li>\(\pi_T(y_t)\), \(\pi_\theta(y_t)\): probabilidades do professor e do aluno para esse token, dado o mesmo prefixo</li>
+      <li>\(\mathrm{sg}\): stop-gradient; a vantagem é um peso, não um caminho de gradiente</li>
+      <li>\(\hat A_t &gt; 0\): o professor gosta mais do token que o aluno, então ele é reforçado</li>
+    </ul>
+  </div>
+  <p>Exemplos exatos: professor 0,6 e aluno 0,3 dão \(\hat A = \ln 2 \approx +0{,}693\), e o token sobe. Professor 0,05 e aluno 0,4 dão \(\ln 0{,}125 \approx -2{,}079\), e o token desce forte. Diferente do RL de resultado, todo token recebe sinal. No relatório do Qwen3 (Qwen3-8B, tabela 21), a destilação on-policy chegou a 74,4 no AIME'24 contra 67,6 do RL e a 65,5 contra 55,5 no AIME'25, com 1.800 contra 17.920 GPU-horas, cerca de 1/10. No estudo do Thinking Machines, a partir de um SFT de 400 mil exemplos (60% no AIME'24), o RL chega a ~68% e a destilação on-policy a ~70%, com custo de 9 a 30 vezes menor que estender o SFT off-policy.</p>
+  <div class="la-callout tip"><b class="t">No TRL</b><p>O <code>DistillationTrainer</code> (estável desde a v1.10) gera com vLLM (<code>colocate</code> ou <code>server</code>), calcula a JSD em pedaços sem materializar \([s \times V]\) do professor e suporta ferramentas; na CLI, <code>trl distillation --model_name_or_path … --teacher_model_name_or_path …</code>. O <code>AsyncDistillationTrainer</code> (experimental, v1.11) deixa o professor num servidor vLLM via HTTP, trafega só um top-k de log-probs (<code>teacher_top_k</code>) e limita a defasagem com <code>max_staleness</code>; só suporta FSDP2, e os professores precisam do tokenizer do aluno. É o motor de inferência do Módulo 1 dentro do laço de treino.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>MOPD: vários professores, um aluno</h2>
+  <p>O <span class="la-term" data-term="mopd">MOPD</span> (<i>Multi-Teacher On-Policy Distillation</i>) apareceu no relatório do MiMo-V2-Flash e foi formalizado num artigo próprio (Ma et al., 2026, Peking University e Xiaomi). Ele junta num modelo só as habilidades de vários especialistas, sem o RL multi-domínio, caro e cheio de interferência entre domínios, em três estágios:</p>
+  <ol class="la-steps">
+    <li><b>SFT geral</b> num corpus amplo: a inicialização comum.</li>
+    <li><b>RL especializado por domínio</b> a partir desse SFT: um professor por domínio (matemática, instruções, SWE, ferramentas…), treinados <b>em paralelo</b>, cada um com o seu algoritmo e hiperparâmetros. No artigo: GRPO on-policy com amostragem dinâmica, LR 3e-6, lote de 144 prompts × 8 rollouts em matemática e instruções.</li>
+    <li><b>MOPD</b>: o aluno, reinicializado do SFT do estágio 1, gera rollouts. Cada prompt é <b>roteado</b> ao professor do seu domínio, que devolve log-probs por token, e o aluno minimiza o KL reverso por token. A fusão acontece no espaço da política, não por média de pesos.</li>
+  </ol>
+  <div class="la-eq">
+    \[ \hat A^{\text{MOPD}}_t = \mathrm{sg}\big[\log \pi_{\phi_d}(y_t) - \log \pi_\theta(y_t)\big] \ \text{clipada em } [-A_{\max}, A_{\max}], \qquad \mathcal L_{PG} = -\,\mathbb E\Big[\tfrac{1}{|y|}\textstyle\sum_t \hat A^{\text{clip}}_t\,\log\pi_\theta(y_t)\Big] \]
+    <ul class="la-eq-legend">
+      <li>\(\pi_{\phi_d}\): o professor do domínio \(d\) do prompt</li>
+      <li>\(A_{\max}\): limite de clipping dos dois lados</li>
+      <li>\(|y|\): comprimento da resposta; a média é por token</li>
+      <li>“a única mudança é o cálculo da vantagem”: a forma cabe em frameworks de PPO/GRPO existentes</li>
+    </ul>
+  </div>
+  <p>Há uma forma <b>top-k</b>, de menor variância e com payload pequeno para o serviço do professor: \(\sum_{v\in \mathrm{TopK}_k(\pi_{\phi_d})}\big[\pi_\theta(v)\log\frac{\pi_\theta(v)}{\pi_{\phi_d}(v)} - \pi_\theta(v) + \pi_{\phi_d}(v)\big]\). O termo extra \(\pi_{\phi_d} - \pi_\theta\) corrige o viés do truncamento e faz o mínimo cair em \(\pi_\theta = \pi_{\phi_d}\) nos top-k. No MiMo-V2-Flash, as amostras vêm do motor de inferência \(\mu_\theta\), e cada token recebe o peso \(w_t = \mathrm{sg}[\pi_\theta(y_t)/\mu_\theta(y_t)]\), ou é <b>descartado</b> se essa razão sai de \([\varepsilon_{\text{low}}, \varepsilon_{\text{high}}]\): dois motores com os mesmos pesos não dão os mesmos log-probs (<a data-ch="medindo-qualidade">capítulo 25</a>). Por padrão soma-se a vantagem de um modelo de recompensa de resultado: \(\hat A_t = \mathrm{sg}[\log \pi_{\text{dom}}/\pi_\theta] + \alpha\,\hat A_{\text{ORM}}\).</p>
+  <figure class="la-fig" id="fig-mopd" data-title="MOPD por dentro, passo a passo">
+    <div class="la-fig-stage" style="height:470px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Siga o pipeline: professores nascem do mesmo SFT, o aluno gera, o prompt é roteado ao professor do domínio, o prefill do professor dá \(\log\pi_T\) em todas as posições de uma vez, cada token ganha uma vantagem (verde sobe, vermelho desce), o aluno se atualiza. Depois, os pesos \(w_t\) e o ORM, os três fluxos do MOPD2 e o caso das tool calls repetidas. \(A_{\max}\) clipa as vantagens; “top-k” mostra, para o token selecionado, a distribuição completa do professor e do aluno sobre os 4 candidatos. A resposta e as probabilidades são <b>ilustrativas</b>, exceto os pares 0,6/0,3 e 0,05/0,4 e os números do caso real (passo 8).</figcaption>
+  </figure>
+  <p>Na infraestrutura, o prefill do professor é tratado como cálculo de recompensa: um serviço assíncrono, separado do trainer, disparado quando cada sequência termina, enquanto outras ainda são amostradas. Os autores relatam overhead não mensurável no tempo de parede. É a física do <a data-ch="especulacao-fundamentos">capítulo 35</a>: um forward sobre posições já escritas sai muito mais barato que gerá-las.</p>
+  <h3>Os números</h3>
+  <p>No Qwen3-30B-A3B (matemática, instruções, SWE), o score normalizado do MOPD foi 0,937, contra 0,882 do Mix-RL, 0,857 da média de pesos, 0,824 do fine-tuning off-policy e 0,775 do RL em cascata; o platô do professor veio com ~25 mil amostras de instruções e ~30 mil de SWE, contra 150 a 180 mil por domínio no Mix-RL. No MiMo-V2-Flash (309B), com cinco professores:</p>
+  <table>
+    <thead><tr><th>Benchmark</th><th>Aluno</th><th>Professor</th><th>MOPD</th></tr></thead>
+    <tbody>
+      <tr><td>AIME25</td><td>89,3</td><td>93,9</td><td><b>94,1</b></td></tr>
+      <tr><td>HMMT25</td><td>76,9</td><td>82,6</td><td><b>84,4</b></td></tr>
+      <tr><td>LiveCodeBench</td><td>77,5</td><td>82,6</td><td><b>83,2</b></td></tr>
+      <tr><td>IFBench</td><td>55,4</td><td>68,9</td><td>66,7</td></tr>
+      <tr><td>SWE-Bench Verified</td><td>67,8</td><td>74,2</td><td>73,4</td></tr>
+      <tr><td>τ²-Bench</td><td>75,9</td><td>79,6</td><td><b>80,3</b></td></tr>
+    </tbody>
+  </table>
+  <p>O aluno passa do professor em quatro linhas e fica pouco abaixo em IFBench (−2,2) e SWE-Bench Verified (−0,8). E o processo se repete: o aluno de um MOPD inicializa novos professores RL para outro MOPD, e ainda sobrou ganho em matemática e instruções.</p>
+  <h3>MOPD2 e o checkpoint que você serviu</h3>
+  <p>O <code>MiMo-V2.6-Flash-MOPD</code>, o modelo do <a data-ch="receita-do-zero">capítulo 46</a>, é “o upgrade MOPD do checkpoint MiMo-V2.6-Flash-RL”: mesma arquitetura (309B no total, 15B ativos), pesos diferentes. A etapa é o <span class="la-term" data-term="mopd2">MOPD2</span>, <i>Multi-Prefix Multi-Teacher On-Policy Distillation</i>, aplicada depois do RL misto. Os professores são <b>mixRL</b> (tarefas verificáveis) e <b>SFT</b> (demonstrações sintéticas de domínios abertos, onde é difícil desenhar recompensa), e três fluxos entram na mesma atualização: rollouts completos; o <i>Teacher-Prefix OPD</i>, em que \(k\) turnos de uma trajetória do professor viram \(k\) prefixos e o aluno escreve um turno a partir de cada um; e o <i>SFT-Prefix OPD</i>, em que o histórico vem de uma demonstração: os dados de SFT viram contexto, não alvo. Interpretação nossa: é uma resposta direta ao viés de exposição, porque o aluno aprende on-policy no último turno, condicionado a históricos realistas que sozinho talvez nunca alcançasse.</p>
+  <div class="la-callout why"><b class="t">O caso das tool calls repetidas</b><p>O MiMo-V2.6-RL repetia chamadas de ferramenta iguais, “parecendo ocupado sem progredir” (1,02% no OpenCode, no Flash). Ponto cego da recompensa: a penalidade de flooding só disparava acima de 32 chamadas num turno, e o RL amplificou o comportamento abaixo do limiar. Baixá-lo para 8 e refazer ~20 passos de MixRL custaria ~US$ 2,31 milhões, e em replay a repetição só caiu de 13,45% para 3,83%. A correção foi um <b>professor RL de turno único</b>, com recompensa 1 só sem repetição nem uso errado de ferramenta: 12 passos (~7.000 exemplos) zeraram a repetição em replay. O MOPD final foi recuado cinco passos e continuou com teacher-prefix OPD incluindo esse professor. Custo: ~US$ 90 mil, 4% da alternativa, com o resto dos benchmarks estável. Corrigir um defeito virou “treinar um professor pequeno e destilá-lo”.</p></div>
+  <div class="la-inrecipe" data-recipe="ds"><div class="la-inrecipe-h"><span class="la-rb ds"></span><span class="k">Pós-treino</span><code>OPD multi-professor, vocabulário inteiro</code></div><div class="la-inrecipe-b"><p>No DeepSeek-V4, o RL misto do V3.2 foi inteiramente substituído por destilação on-policy: \(\mathcal L_{\text{OPD}} = \sum_i w_i\,\mathrm{KL}(\pi_\theta\,\|\,\pi_{E_i})\), KL reverso sobre amostras do aluno, com mais de 10 professores e <b>logits do vocabulário inteiro</b> (129.280). A versão por vantagem de token foi rejeitada por variância alta e instabilidade. Para caber, os pesos dos professores ficam num armazenamento central, carregados sob demanda (sharding estilo ZeRO); guardam-se só os estados ocultos da última camada do professor, e os logits são reconstruídos na hora pela cabeça de predição. As amostras são ordenadas por professor (uma cabeça de professor por vez na GPU), e um kernel TileLang calcula o KL exato.</p></div></div>
+  <div class="la-inrecipe" data-recipe="qwen"><div class="la-inrecipe-h"><span class="la-rb qwen"></span><span class="k">Pós-treino</span><code>strong-to-weak distillation</code></div><div class="la-inrecipe-b"><p>Os Qwen3 pequenos recebem destilação do modelo grande em duas fases: off-policy (saídas do professor nos dois modos) e depois <b>on-policy</b>, alinhando os logits por KL. É dela que vêm os 74,4 contra 67,6 no AIME'24 com ~1/10 das GPU-horas. Para o Qwen3.8, análises de terceiros atribuem parte do ganho a destilação on-policy do Qwen3.8-Max, sem confirmação em fonte primária.</p></div></div>
+  <p>Para reproduzir o estágio 3 em pequena escala, o <code>AsyncDistillationTrainer</code> aceita uma URL por professor e uma coluna <code>teacher_id</code> por amostra. A própria documentação avisa que o MOPD usa KL reverso (<code>beta=1.0</code>), e não o <code>beta=0.0</code> padrão desse trainer:</p>
+  <pre data-lang="python"><code>from trl.experimental.async_distillation import AsyncDistillationConfig, AsyncDistillationTrainer
+trainer = AsyncDistillationTrainer(
+    model="Qwen/Qwen3-4B",
+    args=AsyncDistillationConfig(
+        teacher_server_urls=["http://teacher-math:8000", "http://teacher-code:8000"],
+        teacher_top_k=16,
+        beta=1.0,   # KL reverso, como no estágio 3 do MOPD (o padrão deste trainer é 0.0)
+    ),
+    train_dataset=dataset,   # coluna "prompt" + coluna "teacher_id"
+)
+trainer.train()</code></pre>
+</section>
+
+<section class="la-sec">
+  <h2>Hiperparâmetros e curvas: as alavancas e onde elas ficam</h2>
+  <p>Um SFT tem poucas alavancas, e todas interagem: LR, épocas, lote e mistura de dados. Onde os praticantes as deixam:</p>
+  <table>
+    <thead><tr><th>Fonte</th><th>Método</th><th>LR</th><th>Schedule</th><th>Lote</th><th>Épocas</th></tr></thead>
+    <tbody>
+      <tr><td>Tülu 3, 8B</td><td>SFT full</td><td>5e-6 (perda soma)</td><td>linear, warmup 0,03</td><td>128 × 4.096</td><td>2</td></tr>
+      <tr><td>Tülu 3, 70B</td><td>SFT full</td><td>2e-6</td><td>linear, warmup 0,03</td><td>128 × 4.096</td><td>2</td></tr>
+      <tr><td><span class="la-rb ds"></span> DeepSeek-V3</td><td>SFT full</td><td>5e-6 → 1e-6</td><td>cosseno</td><td>—</td><td>2</td></tr>
+      <tr><td>MiMo-V2-Flash (MoE 309B)</td><td>SFT full</td><td>5e-5 → 5e-6</td><td>cosseno</td><td>128</td><td>—</td></tr>
+      <tr><td><code>SFTConfig</code> (padrão TRL)</td><td>SFT</td><td>2e-5</td><td>linear</td><td>8/disp. × 1024</td><td>3</td></tr>
+      <tr><td>Axolotl <code>lora-1b.yml</code></td><td>LoRA r16 α32</td><td>2e-4</td><td>cosseno, warmup 0,1</td><td>2 × 2 × 2.048</td><td>1</td></tr>
+      <tr><td>LLaMA-Factory (Qwen3-4B)</td><td>LoRA r8, todas</td><td>1e-4</td><td>cosseno, warmup 0,1</td><td>1 × 8 × 2.048</td><td>3</td></tr>
+      <tr><td>mlx-lm (padrão)</td><td>LoRA r8, scale 20</td><td>1e-5</td><td>constante</td><td>4 × 2.048</td><td>1.000 iters</td></tr>
+    </tbody>
+  </table>
+  <p>Três regras atravessam a tabela. <b>LoRA quer LR ~10× maior</b> que o full fine-tuning (≈15× em runs com menos de ~100 passos), e o LR ótimo quase não muda com o posto: menos de 2× de variação entre \(r = 4\) e \(r = 512\), graças ao prefator \(\alpha/r\) (<i>LoRA Without Regret</i>). Por isso o TRL dá ~1e-4 como dica para PEFT contra 2e-5 de padrão. <b>O <code>scale</code> do mlx-lm não é o \(\alpha\) do PEFT</b>: <code>scale = 20</code> multiplica \(BA\) direto, o equivalente a \(\alpha/r = 20\) (\(\alpha = 160\) com \(r = 8\)), e explica o LR de 1e-5. <b>Poucas épocas</b>: 1 a 3 em quase todo lugar, porque mais épocas num dataset pequeno são memorização.</p>
+  <p>Por que LRs tão baixos? O pré-treino do MiMo-V2-Flash teve pico de 3,2e-4; os SFTs full da tabela ficam de 6× (MiMo, 5e-5) a 160× (Tülu 3 70B, 2e-6) abaixo. Interpretação nossa: o modelo parte perto de um bom mínimo e o dataset é pequeno, então passos grandes sobretudo o afastam do base, o eixo de KL da figura 52.9 e a raiz do esquecimento da seção 10. O warmup protege os primeiros passos do Adam, enquanto as estimativas do segundo momento ainda são ruidosas; o decaimento deixa o modelo assentar (detalhes no <a data-ch="treino-memoria-lora" data-sec="s4-otimizadores-taxa-de-aprendizado-e-lotes">capítulo 51</a>).</p>
+  <p>O que olhar durante o treino: o <code>SFTTrainer</code> registra <code>loss</code>, <code>entropy</code> (entropia média da distribuição prevista nos tokens de perda), <code>mean_token_accuracy</code> (top-1 igual ao rótulo), <code>grad_norm</code> (antes do clipping), <code>num_tokens</code>, <code>learning_rate</code> e, em MoE, <code>aux_loss</code>. Leitura nossa: entropia caindo rápido e acurácia por token perto de 1 no treino, com a validação subindo, é memorização.</p>
+  <figure class="la-fig" id="fig-curvas" data-title="Curvas de treino: onde parar e quanto custa">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Em cima, perda de treino (menta) e de validação mascaradas (lavanda tracejada) ao longo das épocas; a estrela marca o melhor checkpoint pela validação. Embaixo, o custo colateral: KL ao modelo base em prompts gerais (âmbar, com escala própria à direita) e a bateria geral relativa ao base (rosa, escala à esquerda). <b>Modelo de brinquedo</b>; as formas seguem as fontes: LR ótimo do LoRA ~10× o do full, overfitting com muitas épocas em poucos dados, LoRA que aprende menos e esquece menos, e replay de dados gerais como mitigação.</figcaption>
+  </figure>
+  <p>Quatro cenários: com LR 10× acima do ótimo, a perda dá saltos e o KL ao base dispara. Com 5 ou 6 épocas em 2 mil exemplos, o treino continua caindo enquanto a validação sobe, e o melhor checkpoint fica para trás. Em LoRA com o LR do full, o treino quase não anda; com 10× mais, ele volta, com menos KL. Com 30% de dados gerais (o Thinking Machines usou 70% de domínio e 30% de chat), a bateria geral cai menos.</p>
+  <h3>Overfitting de formato</h3>
+  <p>A perda de validação, tirada do mesmo domínio, não pega um overfitting: o modelo decora o <i>formato</i> do treino. Responde tudo em lista, começa toda resposta igual, envolve em JSON o que não pedia JSON, abre um <code>&lt;think&gt;</code> onde não devia. Chu et al. (2025) resumem no título: “SFT memoriza, RL generaliza”. O remédio é medir fora do domínio (seção 10) e manter a mistura diversa.</p>
+  <div class="la-callout warn"><b class="t">SFT de MoE e otimizador: dois cuidados</b><p>No SFT do MiMo-V2-Flash, a métrica crítica de estabilidade foi o número de parâmetros com gradiente zero (<code>num-zeros</code>): se sobe, o balanceamento dos experts piora; se cai, o modelo sobreajusta. Ela depende da taxa de atualização do bias dos experts (1e-4 no MiMo) e do \(\varepsilon\) do AdamW (1e-8); no TRL, o equivalente acessível é o <code>router_aux_loss_coef</code>. E o otimizador: no Moonlight, o <span class="la-term" data-term="muon">Muon</span> no SFT só teve vantagem quando o pré-treino também usou Muon, como no Qwen3.8 e no DeepSeek-V4; num full FT deles, ele é a escolha coerente (interpretação, não testada nesses modelos; o descasamento está no <a data-ch="treino-memoria-lora">capítulo 51</a>). Em LoRA, fique com AdamW.</p></div>
+  <h3>Onde cada alavanca mora: frameworks em 2026</h3>
+  <table>
+    <thead><tr><th>Framework</th><th>Versão</th><th>Para quê</th><th>Observação</th></tr></thead>
+    <tbody>
+      <tr><td><span class="la-term" data-term="trl">TRL</span></td><td>1.14.1</td><td>SFT, DPO, KTO, reward, RLOO, GRPO, destilação</td><td>referência do ecossistema HF; <code>chunked_nll</code>, perfis do Accelerate, vLLM colocate/server; <code>PPOTrainer</code> removido na 1.13</td></tr>
+      <tr><td>Unsloth</td><td>2026.9.14</td><td>LoRA/QLoRA/full rápidos numa GPU</td><td>kernels Triton; MoE com grouped-GEMM + LoRA; roteador congelado por padrão</td></tr>
+      <tr><td>Axolotl</td><td>0.20.0</td><td>treino por YAML: full, LoRA, QLoRA, DPO/KTO/ORPO, GRPO</td><td>FSDP2/DeepSpeed, expert parallel, NVFP4 MoE LoRA com merge</td></tr>
+      <tr><td>LLaMA-Factory</td><td>0.9.5</td><td>SFT/DPO/KTO/PPO por YAML + WebUI</td><td>muitos templates (<code>qwen3_nothink</code>…); playbook oficial no DGX Spark</td></tr>
+      <tr><td><span class="la-term" data-term="mlx-lm">mlx-lm</span></td><td>0.32.0</td><td>LoRA/DoRA/full no Apple Silicon</td><td>QLoRA automático em modelo quantizado; LoRA em experts; Muon</td></tr>
+      <tr><td>torchtune</td><td>—</td><td>—</td><td><b>descontinuado</b> em 2025-07-15; o treino de LLMs do PyTorch foi consolidado no torchtitan</td></tr>
+    </tbody>
+  </table>
+  <p>O mesmo SFT LoRA, em três sintaxes. No TRL, por linha de comando (os valores são escolhas para um 8B num DGX Spark, não padrões):</p>
+  <pre data-lang="bash"><code>trl sft \
+  --model_name_or_path Qwen/Qwen3-8B \
+  --dataset_name trl-lib/Capybara \
+  --dtype bfloat16 \
+  --use_peft --lora_r 16 --lora_alpha 32 \
+  --lora_target_modules q_proj k_proj v_proj o_proj gate_proj up_proj down_proj \
+  --assistant_only_loss True \
+  --max_length 4096 \
+  --learning_rate 1e-4 --lr_scheduler_type cosine \
+  --per_device_train_batch_size 2 --gradient_accumulation_steps 16 \
+  --num_train_epochs 1 \
+  --output_dir qwen3-8b-lora-sft</code></pre>
+  <p>Sem <code>--dtype bfloat16</code>, o <code>SFTTrainer</code> carrega em FP32 e dobra a memória dos pesos congelados; e, com PEFT, o <code>chunked_nll</code> não se aplica (confira no log a perda escolhida). No Mac, com <code>mlx_lm.lora</code>, as chaves de LoRA e de schedule <b>só existem no YAML</b>:</p>
+  <pre data-lang="yaml"><code>model: "mlx-community/Qwen3-4B-Instruct-2507-4bit"   # quantizado ⇒ QLoRA automaticamente
+train: true
+fine_tune_type: lora          # lora | dora | full
+optimizer: adamw              # padrão do código: adam
+data: "./data"                # train.jsonl / valid.jsonl, formato chat
+num_layers: 16                # -1 = todas
+batch_size: 2
+grad_accumulation_steps: 4
+iters: 1000
+learning_rate: 1e-5
+max_seq_length: 2048
+grad_checkpoint: true
+mask_prompt: true             # perda só na ÚLTIMA mensagem
+lora_parameters:
+  rank: 8
+  scale: 20.0                 # NÃO é alpha: multiplica B·A diretamente
+  dropout: 0.0
+lr_schedule:
+  name: cosine_decay
+  warmup: 100
+  warmup_init: 1e-7
+  arguments: [1e-5, 1000, 1e-7]</code></pre>
+  <p>Sem <code>keys</code>, o adaptador vai para todas as lineares das camadas treinadas, como recomenda o <i>LoRA Without Regret</i>. No Axolotl e no LLaMA-Factory, o YAML é o próprio contrato:</p>
+  <pre data-lang="yaml"><code># Axolotl — trecho de examples/llama-3/lora-1b.yml
+base_model: NousResearch/Llama-3.2-1B
+datasets:
+  - path: teknium/GPT4-LLM-Cleaned
+    type: alpaca
+adapter: lora
+sequence_len: 2048
+sample_packing: true
+lora_r: 16
+lora_alpha: 32
+lora_target_modules: [gate_proj, down_proj, up_proj, q_proj, v_proj, k_proj, o_proj]
+micro_batch_size: 2
+gradient_accumulation_steps: 2
+num_epochs: 1
+optimizer: adamw_8bit
+lr_scheduler: cosine
+learning_rate: 0.0002
+warmup_ratio: 0.1
+
+# LLaMA-Factory — trecho de examples/train_lora/qwen3_lora_sft.yaml
+model_name_or_path: Qwen/Qwen3-4B-Instruct-2507
+stage: sft
+finetuning_type: lora
+lora_rank: 8
+lora_target: all
+template: qwen3_nothink
+cutoff_len: 2048
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 8
+learning_rate: 1.0e-4
+num_train_epochs: 3.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.1</code></pre>
+  <p>No playbook da NVIDIA para o DGX Spark, essa receita do LLaMA-Factory (Qwen3-4B, LoRA, 3 épocas) terminou com <code>train_runtime 0:14:32</code>, <code>train_samples_per_second 3.749</code> e <code>train_loss 0.9993</code>. No Unsloth, o trecho da documentação para um MoE:</p>
+  <pre data-lang="python"><code>from unsloth import FastLanguageModel
+model, tokenizer = FastLanguageModel.from_pretrained(
+    model_name = "Qwen/Qwen3-30B-A3B-Instruct-2507",
+    max_seq_length = max_seq_length,
+    load_in_4bit = False,  # MoE doesn't support bnb 4bit yet
+)
+model = FastLanguageModel.get_peft_model(
+    model, r = 16,
+    target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_up_proj", "down_proj"],
+    lora_alpha = 32, use_gradient_checkpointing = "unsloth", random_state = 3407,
+)</code></pre>
+  <p>Os alvos <code>gate_up_proj</code>/<code>down_proj</code> põem LoRA nos experts, e o roteador fica congelado (padrão do Unsloth) porque mexer nele desbalanceia a carga: no RL do MiMo-V2.6-Pro, um roteador treinável colapsou o balanceamento dos experts em 20 passos. O que cabe em cada máquina está no <a data-ch="treino-memoria-lora">capítulo 51</a>.</p>
+</section>
+
+<section class="la-sec">
+  <h2>Esquecer menos, medir direito e levar às receitas</h2>
+  <p>Ajustar um modelo para uma tarefa nova costuma custar capacidades que ele tinha (seguir instruções, segurança, raciocínio geral, formato): é o <span class="la-term" data-term="esquecimento-catastrofico">esquecimento catastrófico</span>. Três achados dão a régua. O <span class="la-term" data-term="rls-razor">RL's Razor</span> (Shenfeld et al., 2025): o quanto se esquece é determinado pelo KL entre o modelo ajustado e o base <i>na distribuição da tarefa nova</i>, e o RL on-policy esquece menos que o SFT com o mesmo desempenho porque tende a soluções de KL mínimo. Biderman et al. (2024): o LoRA “aprende menos e esquece menos” que o full FT. E o Thinking Machines: a destilação on-policy <b>recupera</b> o comportamento perdido. Meça os dois KLs: nos prompts da tarefa nova, ele prevê quanto você vai esquecer; em prompts gerais, mostra onde o modelo já se afastou do base.</p>
+  <figure class="la-fig" id="fig-esquecimento" data-title="Esquecer e recuperar: o experimento do Thinking Machines">
+    <div class="la-fig-stage" style="height:420px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Qwen3-8B ajustado em documentos internos de uma empresa (mid-training, perda em todos os tokens), números do Thinking Machines. Eixo x: QA interno (conhecimento novo). Eixo y: IF-eval (seguir instruções, o comportamento de assistente). A guia âmbar liga o base ao ponto atual; quanto mais esticada, mais longe do base. Ao lado (embaixo, no celular), as duas métricas em barras, com o base tracejado.</figcaption>
+  </figure>
+  <p>Com 100% de documentos de domínio, o QA interno vai de 18% para 43%, mas o IF-eval despenca de 85% para 45%; com 70% de domínio e 30% de chat, ficam em 36% e 79%; e uma rodada de destilação on-policy depois leva a 41% e 83%. As mitigações que as fontes sustentam:</p>
+  <ol class="la-steps">
+    <li><b>Misture dados gerais ou de replay</b> ao SFT de domínio, como os 30% de chat acima.</li>
+    <li><b>LR menor e menos épocas</b>; escolha o checkpoint pela validação geral, não pela perda de treino.</li>
+    <li><b>LoRA</b> em vez de full FT quando a tarefa é estreita.</li>
+    <li><b>Destilação on-policy</b> do base (ou de um professor) depois do SFT, ou um termo de KL ao base no RL.</li>
+    <li><b>Média de pesos</b> entre base e ajustado (estilo WiSE-FT) ou merge de adaptadores com peso menor que 1 (<code>add_weighted_adapter</code> no PEFT).</li>
+  </ol>
+  <h3>Avaliar um SFT em camadas</h3>
+  <p>A perda de validação é a primeira camada, e a menos importante. Em ordem de custo (interpretação nossa):</p>
+  <table>
+    <thead><tr><th>Camada</th><th>O que medir</th><th>Como</th></tr></thead>
+    <tbody>
+      <tr><td>Treino</td><td>perda de treino e de validação <b>mascaradas</b>, <code>mean_token_accuracy</code>, <code>entropy</code>, <code>grad_norm</code>, <code>aux_loss</code>/<code>num-zeros</code> (MoE)</td><td>logs do trainer; validação = split separado do mesmo domínio</td></tr>
+      <tr><td>Distância ao base</td><td>KL(\(\pi_\theta\|\pi_{\text{base}}\)) nos prompts da tarefa (prevê o esquecimento) e em prompts gerais; perplexidade num corpus geral</td><td>a metodologia de <span class="la-term" data-term="kld">KLD</span> do <a data-ch="medindo-qualidade">capítulo 25</a>, agora medindo mudança desejada e indesejada</td></tr>
+      <tr><td>Tarefa-alvo</td><td>acurácia, pass@k, exact match</td><td>conjunto de teste descontaminado</td></tr>
+      <tr><td>Regressão geral</td><td>IFEval/IFBench, MMLU-Pro, GPQA, AIME, LiveCodeBench, BFCL/τ²-Bench, Arena-Hard/AlpacaEval com controle de comprimento</td><td>lm-evaluation-harness, lighteval, evalscope; mesmos prompts e mesma amostragem do serviço</td></tr>
+      <tr><td>Formato</td><td>fechamento de <code>&lt;/think&gt;</code>, EOS correto, parse do tool call no parser do vLLM, distribuição de comprimentos, taxa de repetição \((N-U)/N\), recusas</td><td>scripts contra o servidor real (<a data-ch="api-tools-estruturado">capítulo 34</a>, <a data-ch="benchmarking">capítulo 45</a>)</td></tr>
+      <tr><td>Serviço</td><td>aceitação do rascunho MTP/EAGLE/DFlash; KLD depois de requantizar</td><td>capítulos 35–37 e 25</td></tr>
+    </tbody>
+  </table>
+  <p>A taxa de repetição é a métrica do caso MiMo: com \(N\) chamadas num turno e \(U\) únicas (mesma ferramenta e argumentos iguais depois de canonicalizar o JSON), ela vale \((N-U)/N\), um limite inferior da repetição observável. E use o protocolo A/B/A do <a data-ch="benchmarking">capítulo 45</a> também para qualidade: base, ajustado e base de novo, na mesma bateria e com a mesma amostragem, reportando intervalos. Com 30 problemas de AIME, uma diferença de 3 pontos é ruído.</p>
+  <h3>Do adaptador à receita</h3>
+  <p>Há dois caminhos para servir o resultado. O primeiro é o LoRA no vLLM: <code>vllm serve &lt;base&gt; --enable-lora --lora-modules meu=./adapter --max-lora-rank 64</code> (o <code>--max-lora-rank</code> padrão é 16 e dimensiona a memória; a requisição escolhe o adaptador pelo campo <code>model</code>). O segundo é fundir em BF16, requantizar (NVFP4, FP8, EXL3) e medir o KLD contra o BF16 fundido e a métrica da tarefa, porque um delta de LoRA pequeno pode ser comparável ao ruído de quantização por peso. Como não está verificado que o LoRA do vLLM funcione sobre as quantizações customizadas das receitas (EXL3 do GLM, MoE NVFP4 do Qwen3.8 no SM121), fundir e requantizar é o caminho seguro.</p>
+  <p>Falta o rascunhador: as cabeças MTP, DFlash2 ou DSpark das receitas foram treinadas contra o alvo <b>original</b>, e depois de um SFT a <span class="la-term" data-term="taxa-de-aceitacao">taxa de aceitação</span> tende a cair. O MiMo-V2.6 tratou isso como parte do pós-treino: o rascunho padrão do RL passou a ser um DFlash de bloco 6, treinado primeiro na política SFT e depois ajustado em logs de rollouts, com comprimento aceito médio 31,3% maior que o do MTP-3 herdado do SFT. Depois de fine-tunar, meça de novo a aceitação (<a data-ch="especulacao-fundamentos">capítulos 35–37</a>) e, se ela cair, ajuste também o rascunho.</p>
+  <div class="la-inrecipe" data-recipe="qwen"><div class="la-inrecipe-h"><span class="la-rb qwen"></span><span class="k">Checklist</span><code>SFT de um aluno para a família Qwen</code></div><div class="la-inrecipe-b"><p>Template do mesmo <code>tokenizer_config.json</code> que o vLLM usa; raciocínio em <code>reasoning_content</code>; <code>&lt;|im_end|&gt;</code> (248046) na perda; <code>preserve_thinking</code> igual no treino e no serviço; vocabulário de 248.320 conferido no <code>tokenizer.json</code> antes de qualquer destilação por logits; avaliação com a amostragem do card (<code>temperature 1.0</code>, <code>top_p 0.95</code>, <code>top_k 20</code> no thinking); e a aceitação do MTP (\(k=3\)) medida de novo depois do ajuste.</p></div></div>
+  <div class="la-inrecipe" data-recipe="ds"><div class="la-inrecipe-h"><span class="la-rb ds"></span><span class="k">Checklist</span><code>SFT para servir na receita DeepSeek</code></div><div class="la-inrecipe-b"><p>Tokenização pelo <code>encoding_dsv4.py</code> e dataset pré-tokenizado; tool calls em DSML; orçamento de <code>max_tokens</code> compatível com o esforço de raciocínio treinado; packing com máscara entre amostras e 2 épocas como no SFT do V3; e a aceitação do DSpark (\(k=6\)) medida de novo.</p></div></div>
+  <p>O SFT ensina a imitar. Mas e quando não há demonstração para imitar, só a opinião de alguém de que a resposta A é melhor que a B? Aprender com comparações exige modelar preferências, o tema do <a data-ch="preferencias-reward-models">próximo capítulo</a>: dados de preferência humana, o modelo de Bradley–Terry e os reward models que alimentam o RLHF.</p>
+</section>

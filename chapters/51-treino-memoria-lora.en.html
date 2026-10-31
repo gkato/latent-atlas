@@ -1,0 +1,442 @@
+<p class="la-lead">To <i>serve</i> Llama-3.1-8B in BF16 you need only 16.1 GB of weights, and a DGX Spark still has plenty left over for the KV cache. To <i>fine-tune all of it</i> with AdamW in mixed precision, you need 128.5 GB of state alone, before storing a single activation. The Spark exposes 121.69 GiB to the GPU (130.7 GB), and in practice the training process gets about 100–110 GiB (interpretation). It does not fit. Same numbers, same architecture, taking up 8× more memory. This chapter explains where every byte comes from: gradients, optimizer moments, FP32 master weights, activations saved for the backward. Then it shows the four levers the community invented to make it fit: recompute instead of storing, split the state across machines (ZeRO/FSDP), train only a <b>low-rank</b> correction (LoRA), and freeze the base in 4 bits (QLoRA). By the end you will be able to do the math for any model and say, before hitting <code>train</code>, whether it fits on 2× DGX Spark or on a 24 GB Mac M4.</p>
+
+<section class="la-sec">
+  <h2>Inference keeps weights; training carries a backpack</h2>
+  <p>In Module 1, a server’s memory had two owners: the weights, read at every decode step, and the <span class="la-term" data-term="kv-cache">KV cache</span>, which grows with the context (<a data-ch="memoria-unificada">chapter 27</a>). The activations of an inference forward are temporary: layer 12 uses the output of layer 11, and layer 11’s output can then be forgotten. None of that changes with post-training, which is ordinary learning (<a data-ch="aprender-com-dados">chapter 1</a>) applied to an already-trained model. What changes is the question the training step asks. To turn each knob in the right direction, training needs to know <i>how much the loss changes if that knob changes</i>, and that creates a little baggage for every parameter.</p>
+  <ol class="la-steps">
+    <li><b>Forward.</b> The batch goes through the model and each layer <b>saves</b> the inputs the backward will need (the chain rule from <a data-ch="redes-neurais">chapter 2</a> multiplies local derivatives, and each local derivative depends on the operation’s input).</li>
+    <li><b>Loss.</b> The <span class="la-term" data-term="logits">logits</span> become cross-entropy against the target tokens.</li>
+    <li><b>Backward.</b> The gradient flows down layer by layer and leaves a number \(\partial L/\partial w\) next to <b>each</b> parameter: a gradient tensor the size of the model.</li>
+    <li><b>Optimizer step.</b> AdamW reads the gradient, updates two moving averages per parameter (the moments \(m\) and \(v\)), computes the update, and applies it to a high-precision copy of the weight, the <span class="la-term" data-term="pesos-mestres">master weight</span>, which is then rounded back to BF16.</li>
+  </ol>
+  <p>Add it all up and you get the per-parameter <span class="la-term" data-term="estado-do-otimizador">training state</span>. The classic accounting comes from the ZeRO paper (Rajbhandari et al.), which calls the number of parameters \(\Psi\):</p>
+  <div class="la-eq">
+    \[ M_{\text{state}} \;=\; \underbrace{2\Psi}_{\text{BF16 weights}} \;+\; \underbrace{2\Psi}_{\text{BF16 gradients}} \;+\; \underbrace{K\Psi}_{\text{optimizer}}, \qquad K \;=\; \underbrace{4}_{\text{FP32 master}} + \underbrace{4}_{m\ \text{FP32}} + \underbrace{4}_{v\ \text{FP32}} \;=\; 12 \]
+    <ul class="la-eq-legend">
+      <li>\(\Psi\): number of <b>trainable</b> parameters (in an MoE, the total ones, not the active ones)</li>
+      <li>\(2\Psi\): the BF16 copy used in the forward and backward (2 bytes per number)</li>
+      <li>\(K\): optimizer bytes per parameter; 12 for AdamW in <span class="la-term" data-term="precisao-mista">mixed precision</span></li>
+      <li>total: \(16\Psi\) bytes, the famous <span class="la-term" data-term="bytes-por-parametro">16 B/parameter</span>; activations, logits, and communication buffers come on top</li>
+    </ul>
+  </div>
+  <p>In the figure, each parameter is a character with a backpack. In inference the backpack holds only the weight itself; in <span class="la-term" data-term="full-fine-tuning">full fine-tuning</span>, it gains one compartment per state. Switch the regime and watch the bytes appear and disappear; the animated cycle shows who writes to each compartment during a step.</p>
+  <figure class="la-fig" id="fig-mochila" data-title="Each parameter’s backpack">
+    <div class="la-fig-stage" style="height:430px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Each little square is 1 byte. The cycle shows one step: forward (the weight is read), backward (the gradient arrives), optimizer (\(m\), \(v\), and the master are rewritten), and the copy back to BF16. Below, the same regime multiplied by the size of the chosen model, against the memory a DGX Spark exposes to the GPU (121.69 GiB = 130.7 GB). Bytes per regime: table below; parameter counts from the module’s research note.</figcaption>
+  </figure>
+  <p>The table gathers the regimes you will find in real frameworks. All of them keep weights and gradients; what changes is the optimizer and whether there is a master copy.</p>
+  <table>
+    <thead><tr><th>Regime</th><th>Weights</th><th>Grad.</th><th>Master</th><th>Optimizer</th><th>B/param</th><th>Where it shows up</th></tr></thead>
+    <tbody>
+      <tr><td>A. Classic mixed precision</td><td>2</td><td>2</td><td>4</td><td>8 (\(m\), \(v\) FP32)</td><td><b>16</b></td><td>ZeRO, Megatron</td></tr>
+      <tr><td>A′. FP32 load + autocast</td><td>4</td><td>4</td><td>—</td><td>8</td><td><b>16</b></td><td><code>SFTTrainer</code> without <code>dtype</code></td></tr>
+      <tr><td>B. Pure BF16 + AdamW</td><td>2</td><td>2</td><td>—</td><td>4 (BF16)</td><td><b>8</b></td><td>PyTorch AdamW on a BF16 model</td></tr>
+      <tr><td>C. BF16 + 8-bit AdamW</td><td>2</td><td>2</td><td>—</td><td>~2</td><td><b>~6</b></td><td>bitsandbytes (<code>adamw_8bit</code>)</td></tr>
+      <tr><td>D. Mixed-precision Muon</td><td>2</td><td>2</td><td>4</td><td>4 (1 moment)</td><td><b>12</b></td><td>a single buffer</td></tr>
+      <tr><td>E. Pure BF16 Muon</td><td>2</td><td>2</td><td>—</td><td>2</td><td><b>6</b></td><td>MLX (<code>zeros_like(param)</code>)</td></tr>
+      <tr><td>LoRA: trainable parameter</td><td>4</td><td>4</td><td>—</td><td>8</td><td><b>16</b></td><td>adapters in FP32 (interpretation of the <span class="la-term" data-term="peft">PEFT</span> docs)</td></tr>
+      <tr><td>LoRA: frozen parameter</td><td>2 or ~0.52</td><td>0</td><td>0</td><td>0</td><td><b>2 / 0.52</b></td><td>BF16, or NF4 with double quantization</td></tr>
+    </tbody>
+  </table>
+  <div class="la-callout warn"><b class="t">The regime A′ trap</b><p>TRL’s <code>SFTTrainer</code> loads the model in FP32 if you do not pass <code>dtype</code> (“If dtype is not specified … it defaults to float32”). In full FT this gives the same 16 B/param with a different split. In a LoRA, however, it doubles the memory of the <i>frozen</i> weights, which go from 2 to 4 B/param. Always pass <code>--dtype bfloat16</code>.</p></div>
+  <h3>In an MoE, you pay for the total</h3>
+  <p>In the full FT of an <a data-ch="mixture-of-experts">MoE</a>, every expert has a gradient and optimizer state, even if each token visits only a few of them. Memory scales with the <b>total</b> parameters; compute per token, with the <b>active</b> ones. Qwen3-30B-A3B (30.5 B total, 3.35 B active) needs 488 GB of state for a model that computes like a ~3.3 B one. And there is a subtlety: an expert can go through an entire microbatch without receiving a single token. Its gradient is zero on that step, but Adam keeps decaying the moments. MiMo-V2-Flash uses the count of parameters with zero gradient (<code>num-zeros</code>) as a thermometer for MoE SFT: if it rises, expert load balancing is getting worse; if it falls, the model is overfitting.</p>
+  <div class="la-callout why"><b class="t">Why this matters for the rest of the module</b><p>Classic RLHF with PPO keeps <b>four</b> models in memory: a trainable policy and critic (16 B/param each), plus a frozen reference model and reward model (2 B/param each). That is \(36N\) bytes: with four 8 B models, 288 GB before the activations and before the inference engine that generates the rollouts. This math is what pushes LLM RL toward LoRA (the reference becomes “the same network with the adapter turned off”), toward smaller critics, or toward critic-free methods such as GRPO. The math in this chapter is the yardstick for every method on the <a data-ch="pos-treino-mapa">post-training map</a>.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Mixed precision: the master weight and the BF16 step</h2>
+  <p>Why spend 4 bytes on an FP32 master weight if the forward uses BF16? The answer is in <a data-ch="numeros-no-computador">chapter 4</a>. <span class="la-term" data-term="bf16">BF16</span> has 8 exponent bits (the range of FP32) and only 7 explicit mantissa bits. Between two neighboring BF16 numbers there is a step, the <span class="la-term" data-term="ulp">ulp</span>, and <span class="la-term" data-term="arredondamento-rne">round-to-nearest-even</span> throws away any addition smaller than half a step:</p>
+  <div class="la-eq">
+    \[ \mathrm{ulp}(w) = 2^{\lfloor \log_2 |w| \rfloor - 7}, \qquad \mathrm{bf16}(w + \Delta) = w \quad\text{if}\quad |\Delta| &lt; \tfrac12\,\mathrm{ulp}(w) \]
+    <ul class="la-eq-legend">
+      <li>\(w\): the weight, already in BF16</li>
+      <li>\(\lfloor \log_2|w|\rfloor\): the exponent, that is, the <span class="la-term" data-term="binade">binade</span> where \(w\) lives</li>
+      <li>\(-7\): the 7 mantissa bits split each binade into \(2^7 = 128\) steps</li>
+      <li>\(\Delta\): the optimizer update on this step</li>
+    </ul>
+  </div>
+  <p>Now plug in the typical size of an update. AdamW divides the first moment by the square root of the second moment, so each coordinate moves by something on the order of the learning rate \(\eta\) per step. A typical SFT uses \(\eta \approx\) 1e-5 to 2e-5 (TRL’s default is 2e-5). On a weight of magnitude 0.02, the ulp is 1.22e-4 and half an ulp is 6.1e-5. Steps of 1e-5 are all rounded to zero. <span class="la-term" data-term="weight-decay">Weight decay</span> is even worse: \(\eta\lambda w = 10^{-5}\times 0.1\times 0.02 = 2\times10^{-8}\) always vanishes. The table comes from a simulation with real BF16 rounding:</p>
+  <table>
+    <thead><tr><th>\(w\)</th><th>ulp</th><th>½ ulp</th><th>\(w\) + 1e-6</th><th>\(w\) + 1e-5</th><th>\(w\) + 1e-4</th></tr></thead>
+    <tbody>
+      <tr><td>0.002</td><td>1.53e-5</td><td>7.63e-6</td><td><b>unchanged</b></td><td>+1.53e-5 (53% more)</td><td>+1.07e-4</td></tr>
+      <tr><td>0.02</td><td>1.22e-4</td><td>6.10e-5</td><td><b>unchanged</b></td><td><b>unchanged</b></td><td>+1.22e-4</td></tr>
+      <tr><td>0.2</td><td>9.77e-4</td><td>4.88e-4</td><td><b>unchanged</b></td><td><b>unchanged</b></td><td><b>unchanged</b></td></tr>
+    </tbody>
+  </table>
+  <p>Notice the perverse effect: small weights move, and in steps larger than requested; large ones stay stuck. Pure BF16 training does not fail with a bang; it just learns less than you told it to. There are three remedies. The first is the FP32 master weight (regime A): the additions happen with 23 mantissa bits and only the <i>copy</i> used in the forward is rounded. The second is <span class="la-term" data-term="soma-de-kahan">Kahan compensated summation</span>, which keeps aside the remainder lost in each addition and gives it back in the next one. The third is <span class="la-term" data-term="arredondamento-estocastico">stochastic rounding</span>, which rounds up or down with probability proportional to the distance, and therefore gets it right <i>on average</i>:</p>
+  <div class="la-eq">
+    \[ \mathrm{SR}(x) = \begin{cases} \lceil x \rceil & \text{with prob. } p = \dfrac{x - \lfloor x\rfloor}{\mathrm{ulp}} \\[4pt] \lfloor x \rfloor & \text{with prob. } 1-p \end{cases} \qquad\Longrightarrow\qquad \mathbb{E}\big[\mathrm{SR}(x)\big] = x \]
+    <ul class="la-eq-legend">
+      <li>\(\lfloor x\rfloor, \lceil x\rceil\): the two BF16 neighbors of \(x\)</li>
+      <li>\(p\): the fraction of the step that \(x\) has already covered</li>
+      <li>the expected value is exact: many small steps add up to what they should, with noise</li>
+    </ul>
+  </div>
+  <figure class="la-fig" id="fig-bf16" data-title="The weight that does not move">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Three copies of the same weight receive the same sequence of updates \(\Delta = \eta\) (or \(\eta\) with noise). At the top, the BF16 ruler near \(w_0\): each tick is a representable number. Mint = FP32 (the master weight), pink = BF16 with round-to-nearest-even, lilac = BF16 with stochastic rounding. Below, the accumulated displacement of each copy over the steps. With \(w_0 = 0.02\) and \(\eta = 10^{-5}\), the pink copy never leaves its spot.</figcaption>
+  </figure>
+  <h3>What about FP8? And NVFP4?</h3>
+  <p>Training “in FP8” means doing the <span class="la-term" data-term="gemm">GEMMs</span> in FP8, and sometimes storing activations in FP8. The optimizer state and the master weights stay in high precision. DeepSeek-V3 is the reference: FP8 GEMMs with fine-grained quantization (1×128 blocks for activations and 128×128 for weights), accumulation promoted to FP32, master weights and weight gradients in high precision, AdamW moments in <b>BF16</b>, and the embedding, head, MoE gating, normalizations, and attention kept out of FP8. MiMo-V2-Flash follows the same design and keeps <b>FP32 in the router parameters</b>. Low precision in training buys speed, not state memory. NVIDIA’s <code>nvfp4-pretraining</code> playbook measured, on a GB300 (not on the Spark), Llama 3.1 8B with the <code>bf16_with_nvfp4_mixed</code> recipe: 9.05 s/step and a 221.6 GB peak in BF16 versus 5.39 s/step and 207.8 GB in NVFP4. That was 1.68× faster with only ~6% less memory. For the GB10 (sm_121), support for the FP8/NVFP4 training paths was not confirmed in this module’s research; Module 1 already showed that several “Blackwell” kernels in vLLM are <code>sm_100</code> only (<a data-ch="kernels">chapter 28</a>).</p>
+</section>
+
+<section class="la-sec">
+  <h2>Activations and logits: the memory that grows with the text</h2>
+  <p>The 16 B/param do not depend on the text. The <span class="la-term" data-term="memoria-de-ativacoes">saved activations</span> do, and a lot. Korthikanti et al. counted, for a Transformer block with 16-bit activations, how many bytes stay saved per layer waiting for the backward:</p>
+  <div class="la-eq">
+    \[ A_{\text{layer}} = s\,b\,h\left(34 + \frac{5\,a\,s}{h}\right)\ \text{bytes} \quad\xrightarrow{\ \text{FlashAttention}\ }\quad A_{\text{layer}} \approx 34\,s\,b\,h \]
+    <ul class="la-eq-legend">
+      <li>\(s\): sequence length; \(b\): microbatch (sequences per forward step)</li>
+      <li>\(h\): <span class="la-term" data-term="hidden-size">hidden size</span>; \(a\): number of attention heads</li>
+      <li>\(34\): the sum, in bytes per unit of \(sbh\), of every tensor the backward rereads (QKV, attention, projections, MLP, norms, and dropout masks); the table right below breaks it down</li>
+      <li>\(5as/h\): the \(s\times s\) attention matrix, which <span class="la-term" data-term="flashattention">FlashAttention</span> does not materialize</li>
+    </ul>
+  </div>
+  <h3>Where the 34 comes from</h3>
+  <p>The 34 is not magic: it is a list of tensors. For each operation in the block, ask what its backward needs to reread and add up the bytes. The table does the math per layer, with 16 bits per number and \(b\cdot s\cdot h\) as the unit: “2” means a \([b, s, h]\) tensor in BF16, and a dropout mask costs 1 byte per position. The GPT column is the count by Korthikanti et al.; the Llama column is the research note’s recount for SwiGLU with a \(3.5h\) intermediate, 4:1 GQA, RMSNorm, no dropout, and FlashAttention.</p>
+  <table>
+    <thead><tr><th>Tensor reread in the backward</th><th>GPT</th><th>Llama</th></tr></thead>
+    <tbody>
+      <tr><td colspan="3"><b>Attention</b></td></tr>
+      <tr><td>input of the Q, K, V projections</td><td>2</td><td>2</td></tr>
+      <tr><td>Q and K, for \(QK^\top\) (with 4:1 GQA, K is ¼ the width)</td><td>4</td><td>2 + 0.5</td></tr>
+      <tr><td>softmax output, dropout mask, and dropout output (FlashAttention recomputes them)</td><td>\(5as/h\) (2 + 1 + 2)</td><td>—</td></tr>
+      <tr><td>V (same)</td><td>2</td><td>0.5</td></tr>
+      <tr><td>input of the output projection</td><td>2</td><td>2</td></tr>
+      <tr><td>dropout mask after attention</td><td>1</td><td>—</td></tr>
+      <tr><td><b>attention subtotal</b></td><td><b>\(11 + 5as/h\)</b></td><td><b>7</b></td></tr>
+      <tr><td colspan="3"><b>MLP</b></td></tr>
+      <tr><td>input of the 1st linear (or of <code>gate</code> and <code>up</code>)</td><td>2</td><td>2</td></tr>
+      <tr><td>input of the nonlinearity: GeLU over \(4h\) · outputs of <code>gate</code> and <code>up</code> (\(3.5h\) each)</td><td>8</td><td>7 + 7</td></tr>
+      <tr><td>input of the 2nd linear (<code>down</code>)</td><td>8</td><td>7</td></tr>
+      <tr><td>dropout mask</td><td>1</td><td>—</td></tr>
+      <tr><td><b>MLP subtotal</b></td><td><b>19</b></td><td><b>23</b></td></tr>
+      <tr><td colspan="3"><b>Norms</b></td></tr>
+      <tr><td>input of each of the 2 norms</td><td>2 + 2</td><td>2 + 2</td></tr>
+      <tr><td><b>Total per layer</b></td><td><b>\(34 + 5as/h\)</b></td><td><b>34</b></td></tr>
+    </tbody>
+  </table>
+  <p>In Llama, GQA saves on K and V and the absence of dropout removes 2 bytes, but SwiGLU, with three matrices and a \(3.5h\) intermediate, gives back what was saved: the total lands at ~34 again. The rule for any other architecture is the same: <b>list every tensor the backward rereads and add up the bytes</b>. In an MoE, the MLP row becomes the \(k\) active experts of each token, with each expert’s intermediate, plus the router logits. In a model with a widened residual stream, such as the 4 mHC streams of GLM-5.3-Flash (4 × 4,096 numbers per token), the mixes between streams and the norms reread inputs of that width, and the KDA layers have their own accounting. That is why the calculator at the end of the chapter does not estimate GLM activations (interpretation).</p>
+  <p>For Llama-3.1-8B (\(h = 4096\), 32 layers) with a 2,048-token sequence, this comes to 9.13 GB, and it grows <b>linearly</b> with \(s\): 146 GB at 32K tokens. The way out is <span class="la-term" data-term="gradient-checkpointing">gradient checkpointing</span>. Instead of saving everything, you save only the input of each layer (\(2sbh\) bytes) and, in the backward, each layer is <i>recomputed</i> from it, one at a time:</p>
+  <div class="la-eq">
+    \[ A_{\text{peak}}^{\text{ckpt}} \;\approx\; \underbrace{2\,s\,b\,h\,L}_{\text{saved inputs}} \;+\; \underbrace{34\,s\,b\,h}_{\text{the layer being recomputed}}, \qquad \text{FLOPs per token: } 6N \;\to\; 8N \]
+    <ul class="la-eq-legend">
+      <li>\(L\): number of layers</li>
+      <li>\(6N\): forward (\(2N\)) + backward (\(4N\): gradients of the activations and of the weights), with \(N\) = active parameters</li>
+      <li>\(8N\): the recompute costs one more forward, that is, ~33% more math</li>
+    </ul>
+  </div>
+  <p>There is a third giant, the <b>logits</b> tensor \([b, s, V]\). In FP32 it takes \(s\cdot V\cdot 4\) bytes per sequence: with vocabularies of 128–152K tokens, ~1 GB per 2K tokens. In the backward, the logits gradient is the same size, so the real peak is ~2× \(s\cdot V\cdot 4\). With short sequences, the logits become the largest thing in memory. TRL uses <code>loss_type="chunked_nll"</code> by default: it drops the positions with <code>labels == -100</code> <b>before</b> the <code>lm_head</code> and computes the cross-entropy in chunks, without materializing either the logits or their gradient all at once. The documentation reports ~30% less peak memory on Qwen3-1.7B, and up to ~50% with FSDP2 on 4 GPUs. The option is not compatible with Liger, PEFT, or VLM, so in a LoRA run check the log to see which loss was chosen. There is also <b>selective</b> checkpointing (<code>gradient_checkpointing_kwargs={"selective": True}</code> in TRL), which saves the attention output so it does not have to be recomputed at long context.</p>
+  <figure class="la-fig" id="fig-ativacoes" data-title="Save or recompute">
+    <div class="la-fig-stage" style="height:470px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>On the left, the model (8 layers drawn to stand for the real \(L\)). In the forward, each layer leaves a box of activations on the shelf; at the top, the FP32 logits. In the backward the boxes are consumed from top to bottom. With checkpointing, each layer leaves only a chip with its input and, in the backward, the box reappears for an instant (the recompute, in amber) before being used. Below, memory over the step, with and without checkpointing. \(b = 1\), BF16, FlashAttention, Korthikanti formula.</figcaption>
+  </figure>
+  <table>
+    <thead><tr><th>Model</th><th>\(s\)</th><th>no ckpt</th><th>full ckpt</th><th>FP32 logits</th></tr></thead>
+    <tbody>
+      <tr><td>Llama-3.1-8B (\(h\) 4096, \(L\) 32, \(V\) 128,256)</td><td>2,048</td><td>9.13 GB</td><td>0.82 GB</td><td>1.05 GB</td></tr>
+      <tr><td></td><td>32,768</td><td>146.0 GB</td><td>13.2 GB</td><td>16.8 GB</td></tr>
+      <tr><td>Qwen3-8B (\(h\) 4096, \(L\) 36, \(V\) 151,936)</td><td>2,048</td><td>10.3 GB</td><td>0.89 GB</td><td>1.24 GB</td></tr>
+      <tr><td>Llama-3.3-70B (\(h\) 8192, \(L\) 80)</td><td>2,048</td><td>45.6 GB</td><td>3.25 GB</td><td>1.05 GB</td></tr>
+    </tbody>
+  </table>
+  <div class="la-callout analogy"><b class="t">Analogy: the trail and the breadcrumbs</b><p>Without checkpointing, you climb the mountain taking a photo of every step so you can retrace the path on the way down: the backpack fills up with photos. With checkpointing, you only drop a breadcrumb at each camp and, on the way down, you redo the stretch between two breadcrumbs by looking around again. You walk more (one extra forward), but you carry almost nothing.</p></div>
+  <div class="la-callout deep"><b class="t">Offload on a unified-memory machine</b><p>On a discrete GPU, sending activations (<code>activation_offloading=True</code> in TRL), optimizer states (ZeRO-Offload), or optimizer pages to host RAM frees up VRAM. On the GB10 and on Apple Silicon, host RAM <b>is</b> GPU memory (<a data-ch="memoria-unificada">chapter 27</a>). Offloading to the “CPU” creates no new capacity: at most it changes fragmentation or pinning. Only offloading to NVMe (ZeRO-Infinity) adds capacity. And the Module 1 tip that the Spark playbooks repeat still applies: if training fails “within capacity,” free the page cache with <code>sudo sh -c 'sync; echo 3 &gt; /proc/sys/vm/drop_caches'</code> before starting.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Optimizers, learning rate, and batches</h2>
+  <p><a data-ch="aprender-com-dados">Chapter 1</a> showed <i>how</i> momentum, AdamW, and Muon move across the loss landscape. Here the question is different: <b>what each one carries</b>, and how much that costs in memory and in bandwidth.</p>
+  <ul>
+    <li>Plain <span class="la-term" data-term="sgd">SGD</span> stores nothing. With <span class="la-term" data-term="momentum">momentum</span>, it stores one buffer the size of the weights.</li>
+    <li><span class="la-term" data-term="adamw">AdamW</span> stores two: \(m\) (mean of the gradient) and \(v\) (mean of the squared gradient), coordinate by coordinate. TRL <code>SFTConfig</code> defaults: <code>adam_beta1 0.9</code>, <code>adam_beta2 0.999</code>, <code>adam_epsilon 1e-8</code>, <code>weight_decay 0.0</code>, <code>optim "adamw_torch_fused"</code>, <code>max_grad_norm 1.0</code>. LLM pretraining runs usually use \(\beta_2 = 0.95\) (MiMo-V2-Flash used \(\beta_1\) 0.9, \(\beta_2\) 0.95, weight decay 0.1, and <span class="la-term" data-term="clipping-de-gradiente">clipping</span> at 1.0).</li>
+    <li><span class="la-term" data-term="adamw-8bit">8-bit AdamW</span> (bitsandbytes) quantizes \(m\) and \(v\) in blocks, as in <a data-ch="quantizacao-fundamentos">chapter 20</a>; Axolotl’s examples use <code>optimizer: adamw_8bit</code>. That is ~2 B/param of state, with a quality risk that still has to be measured.</li>
+    <li><span class="la-term" data-term="adafactor">Adafactor</span> does not store the full \(v\) matrix: it stores row and column means and reconstructs the second moment as an outer product. Memory becomes sublinear (available in <code>mlx_lm.lora --optimizer adafactor</code>).</li>
+    <li><span class="la-term" data-term="muon">Muon</span> stores <b>one</b> momentum buffer and orthogonalizes the update via <span class="la-term" data-term="newton-schulz">Newton–Schulz</span>, using the quintic iteration with coefficients \((a,b,c) = (3.4445,\,-4.7750,\,2.0315)\) for 5 steps (MLX uses exactly this, with <code>momentum 0.95</code>, Nesterov, <code>weight_decay 0.01</code>, <code>ns_steps 5</code>). It applies only to hidden 2D matrices; embeddings, head, norms, and biases stay on AdamW. The extra cost in FLOPs is \(\approx T m/B\) (\(T\) Newton–Schulz steps, \(m\) the model dimension, \(B\) the tokens in the batch): 0.7% in the NanoGPT speedrun and ~0.5% for a hypothetical “Llama 405B”.</li>
+  </ul>
+  <p>AdamW’s defaults are not arbitrary numbers. Each one answers a question about the gradient: how much of the past to remember, how much to trust the estimated scale, how much to pull back. The values from <code>SFTConfig</code> and from MiMo-V2-Flash pretraining, side by side:</p>
+  <table class="la-params">
+    <thead><tr><th>Parameter</th><th>Value</th><th>What it does</th><th>Why it matters</th></tr></thead>
+    <tbody>
+      <tr><td><code>adam_beta1</code></td><td>0.9</td><td>\(m \leftarrow \beta_1 m + (1-\beta_1)\,g\): moving average of the gradient</td><td>a memory of ~\(1/(1-\beta_1)\) = 10 steps: the noise of each microbatch cancels out and what remains is the direction that persists</td></tr>
+      <tr><td><code>adam_beta2</code></td><td>0.999 (SFT) · 0.95 (pretraining)</td><td>\(v \leftarrow \beta_2 v + (1-\beta_2)\,g^2\): the scale of each coordinate</td><td>a window of ~1,000 steps versus ~20. With 0.999, \(v\) reacts slowly: if the gradient scale suddenly rises, \(m/\sqrt v\) stays large for many steps. With 0.95, \(v\) keeps up with the change, which gives fewer <span class="la-term" data-term="loss-spike">spikes</span> in long pretraining runs with a high LR (the usual explanation). In a short, low-LR SFT, the long window gives a less noisy estimate.</td></tr>
+      <tr><td><code>adam_epsilon</code></td><td>1e-8</td><td>\(\epsilon\), added to \(\sqrt{\hat v}\) in the denominator of the step</td><td>it is the floor of the denominator. On a coordinate that almost never receives gradient, such as one belonging to an expert that rarely receives tokens, \(\hat v\) shrinks and \(\epsilon\) ends up deciding the step size (interpretation). MiMo-V2-Flash reports that \(\epsilon\) governs the stability of MoE SFT.</td></tr>
+      <tr><td><code>weight_decay</code></td><td>0 (SFT) · 0.1 (pretraining)</td><td>\(\lambda\): adds \(\eta\lambda w\) to the step, pulling each weight toward zero</td><td>in pretraining, it keeps the weight norm in check over trillions of tokens. In SFT, zero is not a good destination: pulling toward zero means pulling the model away from the base in a few steps (interpretation). And, in pure BF16, this term vanishes in rounding (section 2).</td></tr>
+      <tr><td><code>max_grad_norm</code></td><td>1.0</td><td><span class="la-term" data-term="clipping-de-gradiente">clipping</span>: if the global gradient norm exceeds 1, the whole vector is rescaled</td><td>a bad batch (a huge example, a wrong label) does not turn into a giant step, and the direction is preserved. If the log shows the norm hitting the ceiling all the time, the LR is probably too high.</td></tr>
+      <tr><td><code>warmup_ratio</code></td><td>0.03 · 0.1</td><td>fraction of the steps during which the LR ramps from 0 up to the peak</td><td>in the first steps, \(\hat v\) has been estimated from only a few samples, and full-size steps there destabilize training. Tülu 3’s full SFT uses 0.03; short runs and high LRs use a larger fraction, such as the 0.1 of Tülu 3’s DPO and of the Axolotl and LLaMA-Factory LoRAs (which run at ~10× the full-FT LR). According to the research note, in <code>transformers</code> 5.x <code>warmup_steps</code> accepts a fraction &lt; 1 in place of <code>warmup_ratio</code>; check with <code>--help</code>.</td></tr>
+    </tbody>
+  </table>
+  <figure class="la-fig" id="fig-otimizadores" data-title="What each optimizer carries">
+    <div class="la-fig-stage" style="height:470px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>A weight matrix \(W\) (4×6) receives, at each step, a gradient \(G\) with one dominant direction. Next to it (and below), the buffers the chosen optimizer keeps, with their real values: \(m\) and \(v\) in AdamW, 8-bit codes plus one scale per block in 8-bit AdamW, row and column vectors in Adafactor, and the momentum \(M\) and its orthogonalization \(O\) in Muon (computed with 5 Newton–Schulz steps). The little bars show the singular values of \(M\) and \(O\): orthogonalization flattens the spectrum. The 8-bit panel uses linear quantization for simplicity; bitsandbytes uses dynamic (nonlinear) block-wise quantization. Illustrative values; bytes per parameter from the table in section 1.</figcaption>
+  </figure>
+  <h3>Muon in pretraining, and the mismatch in SFT</h3>
+  <p>To scale Muon, Moonlight matched the RMS of the update to AdamW’s and added weight decay: \(W \leftarrow W - \eta\,(0.2\cdot O\cdot\sqrt{\max(A,B)} + \lambda W)\), where \(A\times B\) is the matrix shape. With that, it reported ~2× compute efficiency versus AdamW in the compute-optimal regime (3B/16B MoE, 5.7T tokens). Two Module 1 models were pretrained this way. Qwen3.8 uses Muon with 8 Newton–Schulz iterations on the “linear” matrices and AdamW on the embeddings, the router, and the low-rank GR projections. At 4× the optimal learning rate, AdamW with the Qwen3.5 architecture had 183 <span class="la-term" data-term="loss-spike">spikes</span> per 10,000 steps, while Muon with GR had zero. DeepSeek-V4 uses a hybrid 10-iteration Muon: 8 with \((3.4445, -4.7750, 2.0315)\) and 2 with \((2, -1.5, 0.5)\). Moonlight’s practical finding for post-training is that the best result came from using Muon in pretraining <b>and</b> in SFT; switching optimizers between the two erased Muon’s advantage in SFT. Interpretation: in a full FT of Qwen3.8 or DeepSeek-V4, Muon is the coherent choice; in LoRA, where the \(A\) and \(B\) matrices are thin, the evidence is weak and AdamW remains the default. Muon is available as <code>torch.optim.Muon</code> starting with PyTorch 2.9 (2D parameters only and, in that version, without distributed support), as <code>optim.Muon</code> in MLX, and as <code>mlx_lm.lora --optimizer muon</code>.</p>
+  <div class="la-callout math"><b class="t">The bandwidth of the optimizer step</b><p>A mixed-precision AdamW step reads the gradient, master, \(m\), and \(v\), and writes the master, \(m\), \(v\), and the BF16 copy: ~28 bytes per parameter. For 8 B parameters, that is ~225 GB; at ~230 GB/s effective on the GB10, <b>~1 s per step</b> for the optimizer alone. With LoRA r=16 (41.9 M trainable parameters), ~1.2 GB, ~5 ms. On LPDDR5x memory, frequent optimizer steps are expensive in full FT. Accumulating gradients, that is, running several microbatches per step, amortizes that second.</p></div>
+  <h3>The learning-rate clock</h3>
+  <p>The learning rate \(\eta\) is almost never constant. <span class="la-term" data-term="warmup-de-lr">Warmup</span> ramps \(\eta\) up gradually at the start; the usual explanation is that Adam’s \(v\) estimates are still raw in the first steps, and large steps there destabilize training. Then comes the decay: linear (Tülu 3), <span class="la-term" data-term="schedule-cosseno">cosine</span> (Axolotl, LLaMA-Factory, MiMo’s SFT), or <span class="la-term" data-term="wsd">WSD</span> (warmup-stable-decay). MiMo-V2-Flash pretraining warmed up to 3.2e-4 over 50 B tokens, stayed constant for 12T, and decayed along a cosine to 1e-4 over 10T. In short LoRA runs it is common to stay constant after warmup. The figure puts the published recipes side by side on a logarithmic axis. Note the distance between full FT and LoRA.</p>
+  <figure class="la-fig" id="fig-lr" data-title="The learning-rate clock">
+    <div class="la-fig-stage" style="height:420px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Learning rate over training (horizontal axis normalized from 0 to 100%) for published configurations: Tülu 3 (SFT and DPO, full), MiMo-V2-Flash (SFT and WSD pretraining), Axolotl <code>lora-1b.yml</code>, LLaMA-Factory <code>qwen3_lora_sft.yaml</code>, the <code>SFTConfig</code> default, and the mlx-lm default. Shaded band = warmup. The little ball travels along the chosen curve. Where the source does not give the warmup, the curve starts at the peak; linear and cosine schedules with no stated final value decay to 0, the default of the <code>transformers</code> schedulers.</figcaption>
+  </figure>
+  <table class="la-params">
+    <thead><tr><th>Source</th><th>Method</th><th>LR</th><th>Schedule</th><th>Effective batch · seq · epochs</th></tr></thead>
+    <tbody>
+      <tr><td>Tülu 3, 8B</td><td>full SFT</td><td>5e-6 (<b>sum</b> loss)</td><td>linear, warmup 0.03</td><td>128 · 4,096 · 2</td></tr>
+      <tr><td>Tülu 3, 70B</td><td>full SFT</td><td>2e-6</td><td>linear, warmup 0.03</td><td>128 · 4,096 · 2</td></tr>
+      <tr><td>Tülu 3, 8B / 70B</td><td>normalized DPO</td><td>5e-7 / 2e-7, β = 5</td><td>linear, warmup 0.1</td><td>128 · 2,048 · 1</td></tr>
+      <tr><td>MiMo-V2-Flash (309B MoE)</td><td>full SFT</td><td>5e-5 → 5e-6</td><td>cosine</td><td>128 · — · —</td></tr>
+      <tr><td><code>SFTConfig</code> (default)</td><td>SFT</td><td>2e-5</td><td>linear</td><td>8/device · 1024 · 3</td></tr>
+      <tr><td>Axolotl <code>lora-1b.yml</code></td><td>LoRA r16 α32</td><td>2e-4</td><td>cosine, warmup 0.1</td><td>2×2 · 2,048 · 1</td></tr>
+      <tr><td>LLaMA-Factory <code>qwen3_lora_sft.yaml</code></td><td>LoRA r8, all</td><td>1e-4</td><td>cosine, warmup 0.1</td><td>1×8 · 2,048 · 3</td></tr>
+      <tr><td>mlx-lm (default)</td><td>LoRA r8, scale 20</td><td>1e-5</td><td>constant</td><td>4 · 2,048 · 1,000 iters</td></tr>
+      <tr><td>Thinking Machines</td><td>LoRA vs full</td><td>LoRA ≈ <b>10×</b> the full-FT optimum</td><td>—</td><td>≈15× in runs &lt; ~100 steps</td></tr>
+    </tbody>
+  </table>
+  <h3>Batches, packing, and sequence length</h3>
+  <p>The <span class="la-term" data-term="lote-efetivo">effective batch</span> is microbatch × <span class="la-term" data-term="acumulacao-de-gradiente">gradient accumulation</span> steps × data-parallel replicas. The number that matters is <b>tokens per optimizer step</b>. LoRA tolerates very large batches worse than full FT does, and raising the rank does not fix it: it is a property of the \(BA\) parametrization. Another detail that changes the LR is loss normalization. Tülu 3 switched from the mean to the <b>sum</b> to avoid the accumulation bias (with a per-microbatch mean, samples with few tokens get too much weight), “which requires adjusting the LR”; TRL normalizes by the total number of tokens in the accumulated batch (<code>average_tokens_across_devices=True</code>).</p>
+  <p><span class="la-term" data-term="packing">Packing</span> puts short examples together in the same <code>max_length</code> row so positions are not wasted on padding. <code>SFTTrainer</code> packs with <i>best-fit decreasing</i> (<code>"bfd"</code>, the default; it drops the overflow of long examples), <code>"bfd_split"</code> (cuts long examples into pieces), or <code>"wrapped"</code> (concatenates everything and cuts it into blocks, mixing examples; the Qwen3-Coder-Next report says this hurts). With <code>"bfd"</code>, <code>padding_free</code> turns on by itself: the batch becomes a single sequence, with <code>position_ids</code> reset per example, and variable-length FlashAttention keeps one example from attending to another. Without FlashAttention 2/3 there is a risk of “contamination” between examples, and its availability on sm_121 was not confirmed. The length \(s\) weighs in three times: activations \(\propto s\), attention FLOPs \(\propto s^2\), logits \(\propto sV\). For reasoning models there is no escaping it: the MOPD examples use 32,768 tokens (math/instructions) and 65,536 (SWE). The <a data-ch="sft">SFT chapter</a> comes back to packing and the loss mask in detail.</p>
+</section>
+
+<section class="la-sec">
+  <h2>Divide to fit: data parallel, ZeRO, FSDP, and friends</h2>
+  <p>In <a data-ch="paralelismos">chapter 38</a> the problem was serving a model that does not fit on one GPU. In training, the extra problem is the state. Classic <span class="la-term" data-term="data-parallel">data parallel</span> (DDP) replicates <i>everything</i> in each process: each one runs its own microbatch, and an <span class="la-term" data-term="all-reduce">all-reduce</span> sums the gradients before the step. It is simple, but wasteful: \(N_d\) processes keep \(N_d\) identical copies of the optimizer. <span class="la-term" data-term="zero-dp">ZeRO</span> (<i>Zero Redundancy Optimizer</i>) partitions that state instead of replicating it:</p>
+  <table>
+    <thead><tr><th>Stage</th><th>What is partitioned</th><th>Memory per process (\(K\) = 12)</th></tr></thead>
+    <tbody>
+      <tr><td>DDP</td><td>nothing</td><td>\((2 + 2 + K)\,\Psi\)</td></tr>
+      <tr><td>ZeRO-1 (\(P_{os}\))</td><td>optimizer</td><td>\((2 + 2)\,\Psi + K\Psi/N_d\)</td></tr>
+      <tr><td>ZeRO-2 (\(P_{os+g}\))</td><td>+ gradients</td><td>\(2\Psi + (2 + K)\,\Psi/N_d\)</td></tr>
+      <tr><td>ZeRO-3 (\(P_{os+g+p}\)) ≈ FSDP <code>FULL_SHARD</code></td><td>+ parameters</td><td>\((2 + 2 + K)\,\Psi/N_d\)</td></tr>
+    </tbody>
+  </table>
+  <p>The paper’s example (7.5 B parameters, \(N_d = 64\)) goes from 120 GB to 31.4, 16.6, and 1.9 GB per process. The example we care about is Llama-3.1-8B (8.03 B) on two Sparks, one process per node: DDP needs <b>128.5 GB</b> per node and does not fit; ZeRO-1, 80.3; ZeRO-2, 72.3; <b>ZeRO-3, 64.2 GB per node</b>, and then it fits along with the activations.</p>
+  <figure class="la-fig" id="fig-zero" data-title="ZeRO in bars">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Each column is a data-parallel process with its stack: BF16 weights (mint), gradients (lilac), and optimizer state (pink). A solid slice is stored there; a dashed slice belongs to another process. During the step, the pulses show the collectives: <span class="la-term" data-term="reduce-scatter">reduce-scatter</span> of the gradients and <span class="la-term" data-term="all-gather">all-gather</span> of the parameters (in ZeRO-3, before each layer, in the forward <i>and</i> in the backward). Math from the table above; network time assumes ~20 GB/s effective between the Sparks (research-note assumption).</figcaption>
+  </figure>
+  <p>ZeRO is not free on the network. DDP, ZeRO-1, and ZeRO-2 move \(2\Psi\) elements per step. An all-reduce is a reduce-scatter (each process ends up with the sum of <i>one shard</i>) followed by an all-gather (everyone receives all the shards), and each half moves ~\(\Psi\), hence \(2\Psi\). ZeRO-1/2 does the same two halves with the optimizer step in the middle: reduce-scatter of the gradients, each process updates its shard, all-gather of the updated parameters. ZeRO-3 moves \(3\Psi\), 1.5× as much, because it gathers the parameters in the forward and again in the backward. Between two Sparks, the 200 Gb/s cable gives 25 GB/s in theory, served by two PCIe Gen5 ×4 functions of ~126 Gb/s each (<a data-ch="nccl-rdma">chapter 39</a>); at ~20 GB/s effective (research-note assumption), the all-reduce of an 8B’s 16.1 GB of gradients takes <b>~0.8 s</b> per step (~1.2 s with ZeRO-3). The compute for a step with a global batch of 64 × 2,048 = 131,072 tokens is \(6 \times 8.03\times10^{9}\times 131{,}072 \approx 6.3\times10^{15}\) FLOPs, ~63 s on the two Sparks at 50 TFLOPS effective each (assumption: ~40% MFU of the estimated 125 TFLOPS peak). The network stays at 1–2% even without overlap. It is the opposite of decode with TP over the same cable, where each token waits on ~100 collectives: in training, the compute/communication ratio per step is huge.</p>
+  <p><span class="la-term" data-term="fsdp">FSDP</span> is PyTorch’s native ZeRO-3; version 2 (<code>fully_shard</code>) shards per parameter on top of DTensor. The Spark multi-node playbook uses Accelerate with this configuration:</p>
+  <pre data-lang="yaml"><code>distributed_type: FSDP
+fsdp_config:
+  fsdp_sharding_strategy: FULL_SHARD          # ZeRO-3
+  fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
+  fsdp_backward_prefetch: BACKWARD_PRE
+  fsdp_state_dict_type: SHARDED_STATE_DICT
+  fsdp_use_orig_params: true
+mixed_precision: 'bf16'
+num_machines: 2
+num_processes: 2
+# + machine_rank 0|1, main_process_ip &lt;link IP&gt;, main_process_port &lt;port&gt;</code></pre>
+  <p>Each key decides a trade-off between memory, network, and convenience:</p>
+  <table class="la-params">
+    <thead><tr><th>Parameter</th><th>Value</th><th>What it does</th><th>Why it matters</th></tr></thead>
+    <tbody>
+      <tr><td><code>fsdp_sharding_strategy</code></td><td><code>FULL_SHARD</code></td><td>shards parameters, gradients, and optimizer across the nodes (ZeRO-3)</td><td>this is what takes the 8B from 128.5 down to 64.2 GB per node; <code>SHARD_GRAD_OP</code> keeps the parameters whole (≈ ZeRO-2) and communicates less</td></tr>
+      <tr><td><code>fsdp_auto_wrap_policy</code></td><td><code>TRANSFORMER_BASED_WRAP</code></td><td>each Transformer block becomes one FSDP unit</td><td>the unit is what the all-gather gathers in one go. The peak sits at “all the shards + one whole block”: units that are too large raise that peak, and units that are too small turn into many small collectives, dominated by latency</td></tr>
+      <tr><td><code>fsdp_backward_prefetch</code></td><td><code>BACKWARD_PRE</code></td><td>during the backward of one block, it already fires the all-gather of the next block to be processed</td><td>it overlaps network and compute, so the cable works while the node computes. The price is having two blocks gathered at the same time, that is, more peak memory</td></tr>
+      <tr><td><code>fsdp_state_dict_type</code></td><td><code>SHARDED_STATE_DICT</code></td><td>each node saves only its own shard in the checkpoint</td><td>avoids gathering the whole state on one node: in the 8B full FT that would be 128.5 GB, which does not fit on a Spark. The weights for serving are consolidated later, in a separate step</td></tr>
+      <tr><td><code>fsdp_use_orig_params</code></td><td><code>true</code></td><td>keeps the original parameters visible, instead of only the “flattened” parameter that FSDP1 creates per unit</td><td>required with PEFT: the same block mixes frozen and trainable parameters, and the flattened parameter requires the same <code>requires_grad</code> for all of them. It also allows parameter groups in the optimizer, for example no weight decay on the norms</td></tr>
+    </tbody>
+  </table>
+  <p>In TRL, the ready-made profiles are <code>--accelerate_config fsdp1|fsdp2|zero1|zero2|zero3|multi_gpu|single_gpu</code>. The RoCE precautions from Module 1 still apply: the right <code>NCCL_IB_HCA</code>, <code>NCCL_IB_GID_INDEX=3</code>, MTU 9000, and both PFs of the port. The playbook’s <code>docker-compose.yml</code> pins <code>NCCL_SOCKET_IFNAME</code> to a specific interface; swap in your own and test with <code>nccl-tests</code> before training.</p>
+  <h3>TP, PP, EP, and CP when there is a backward</h3>
+  <p>The other parallelisms from chapter 38 come back, now with twice the collectives, because the backward communicates too.</p>
+  <ul>
+    <li><b><span class="la-term" data-term="tensor-parallel">TP</span></b> (Megatron): the same column→row pair as in inference. Per layer, 2 all-reduces in the forward and 2 in the backward, each of \(s\cdot b\cdot h\cdot 2\) bytes. An 8B with TP = 2 across the Sparks and a microbatch of 8 × 2,048 moves 134 MB per all-reduce, × 4 × 32 layers ≈ 17.2 GB per microbatch: ~0.86 s at 20 GB/s versus ~7.9 s of compute per node at 50 TFLOPS, ~11% without overlap. Megatron’s <span class="la-term" data-term="sequence-parallel">sequence parallel</span> splits the norm and dropout activations across the TP ranks.</li>
+    <li><b><span class="la-term" data-term="pipeline-parallel">PP</span></b>: layers in stages. In the 1F1B schedule, the <span class="la-term" data-term="bolha-de-pipeline">bubble</span> costs \((p-1)/m\) of the ideal time, with \(p\) stages and \(m\) microbatches: 12.5% with 2 stages and 8 microbatches.</li>
+    <li><b><span class="la-term" data-term="expert-parallel">EP</span></b>: whole experts on different nodes; two <span class="la-term" data-term="all-to-all">all-to-all</span> operations per MoE layer in the forward (dispatch and return) and two in the backward. It is the natural way to train MoE across several nodes (Megatron-Core, DeepEP); Axolotl gained EP in 2026/06.</li>
+    <li><b><span class="la-term" data-term="context-parallel">CP</span></b> (ring attention, Ulysses): splits the sequence across ranks for long context. TRL 1.13 documented 1,048,576 tokens per step on Qwen3-8B on an 8×H100 node (~380 s/step), with <code>chunked_nll</code>, checkpointing offload, and YaRN, without packing.</li>
+  </ul>
+  <figure class="la-fig" id="fig-paralelos" data-title="Model parallelism with a backward">
+    <div class="la-fig-stage" style="height:430px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption><b>PP</b>: a 1F1B schedule that is actually simulated, with forward (mint) of duration 1 and backward (lilac) of duration 2; red is the bubble, the time a stage spends waiting. <b>TP</b>: a block split between two nodes, with the four collectives per layer and the numbers from the 8B example. <b>EP</b>: tokens traveling to the experts on the other node and back, twice in the forward and twice in the backward.</figcaption>
+  </figure>
+  <p>Interpretation for the Spark: for SFT of dense models up to ~8B, FSDP/ZeRO-3 on 2 nodes is the simplest path, and it is the playbook’s. TP across nodes is only justified when a node cannot hold even one layer with its activations. For large MoE, EP would be mandatory, but full FT of those models is already out of reach, as section 8 shows.</p>
+</section>
+
+<section class="la-sec">
+  <h2>LoRA: train only the difference, in low rank</h2>
+  <p>All the levers so far trim the \(16\Psi\) state from the outside. <span class="la-term" data-term="lora">LoRA</span> (Hu et al., 2021) goes after \(\Psi\) itself. The observation is that the <i>change</i> post-training makes to a weight matrix has a low “intrinsic dimension.” So, instead of learning the full correction \(\Delta W\), with \(d_{out}\times d_{in}\) numbers, you learn a <span class="la-term" data-term="baixo-posto">low-rank</span> factorization, \(\Delta W = BA\), and the original \(W_0\) stays frozen:</p>
+  <div class="la-eq">
+    \[ h \;=\; W_0\,x \;+\; \frac{\alpha}{r}\,B\,A\,x, \qquad A\in\mathbb R^{r\times d_{in}},\quad B\in\mathbb R^{d_{out}\times r},\quad r \ll \min(d_{in}, d_{out}) \]
+    <ul class="la-eq-legend">
+      <li>\(W_0\): the pretrained matrix, frozen (no gradient, no optimizer)</li>
+      <li>\(A\): projects the input down to \(r\) dimensions; \(B\): projects back up to \(d_{out}\)</li>
+      <li>\(r\): the adapter’s <span class="la-term" data-term="posto">rank</span>, typically 8–64</li>
+      <li>\(\alpha/r\): the <span class="la-term" data-term="escala-alfa-lora">scale</span> that multiplies the correction</li>
+      <li>trainable per matrix: \(r\,(d_{in} + d_{out})\) instead of \(d_{in}\,d_{out}\)</li>
+    </ul>
+  </div>
+  <p>It is the same idea as <code>q_lora_rank</code> and <code>kv_lora_rank</code> in <a data-ch="mla">MLA</a>, applied somewhere else: there, the low-rank bottleneck is part of the architecture; here, it sits in the <i>update</i>. In a 4096×4096 <code>q_proj</code> of Llama-3.1-8B, with \(r = 16\), that is \(16\times(4096+4096) = 131{,}072\) trainable numbers versus 16.8 million: 0.78%. In the original paper, on the 175B GPT-3, LoRA cut trainable parameters by 10,000× and GPU memory by 3× relative to full FT with Adam, and the adapter checkpoint (\(r = 4\), only on <code>q</code> and <code>v</code>) shrank from 350 GB to ~35 MB.</p>
+  <h3>Initialization: B starts at zero</h3>
+  <p>Matrix \(A\) is born random (in PEFT, Kaiming-uniform; in MLX, uniform in \(\pm 1/\sqrt{d_{in}}\)) and \(B\) is born <b>zeroed</b>. At step 0, \(\Delta W = 0\) and the model is <i>exactly</i> the base, which guarantees that the fine-tune starts from known behavior. Why not zero both? The gradients are \(\partial L/\partial B \propto (\ldots)\,A^\top\) and \(\partial L/\partial A \propto B^\top(\ldots)\). With both zeroed, both gradients would be zero forever. With a random \(A\), \(B\) receives gradient from the very first step, and \(A\) “wakes up” as soon as \(B\) stops being zero. The figure trains a real LoRA, with Adam, to reproduce a rank-3 target correction.</p>
+  <figure class="la-fig" id="fig-lora" data-title="Toy LoRA: W₀ + B·A">
+    <div class="la-fig-stage" style="height:500px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>An 8×8 toy: \(W_0\) frozen (padlock), \(A\) (\(r\times 8\)) random and \(B\) (\(8\times r\)) zeroed at the start. At each step, Adam adjusts only \(A\) and \(B\) so that \(\frac{\alpha}{r}BA\) approaches a rank-3 target correction \(T\) (singular values 2.0, 1.2, 0.5; <b>illustrative</b>). The bars compare the singular values of the target and of the learned \(\Delta W\): with \(r = 1\) only the strongest direction is captured, and the residual error sits exactly where the algebra says it must. “Merge” adds \(\Delta W\) into \(W_0\) and the adapters disappear. Hover over a cell to see its value.</figcaption>
+  </figure>
+  <p>Play with the rank. With \(r=1\) the error stops at ~55%, which is exactly \(\sqrt{1.2^2+0.5^2}/\sqrt{2^2+1.2^2+0.5^2}\): the best a rank-1 matrix can do is the dominant singular component (the Eckart–Young theorem). With \(r = 3\), the error goes to zero. The toy has a hard floor because the target is a single fixed matrix and the loss is the Frobenius error: Eckart–Young gives the best possible rank-\(r\) approximation. A real LLM has no fixed target \(\Delta W\). There are dozens of matrices in series, with nonlinearities, fitting a loss over tokens. What <i>LoRA Without Regret</i> observed is that an adapter too small for the dataset does not get stuck on a visible plateau; its loss curve just goes down more slowly than full FT’s. That is what “capacity-limited” means in practice.</p>
+  <h3>The α/r scale and the target modules</h3>
+  <p>With the \(1/r\) prefactor, the initial contribution of \(\frac{1}{r}\sum_{i=1}^{r} b_i a_i^\top\) does not grow with the number of terms, which is why the optimal LR barely changes with the rank: it varies by less than 2× between \(r = 4\) and \(r = 512\), according to <i>LoRA Without Regret</i> (Thinking Machines). <span class="la-term" data-term="rslora">rsLoRA</span> changes the scale to \(\alpha/\sqrt r\) to stabilize high ranks (<code>use_rslora=True</code>). Conventions vary: Thinking Machines uses a fixed α = 32; Unsloth, α = 2r; Axolotl, r16/α32 for LoRA and r32/α16 for QLoRA; NVIDIA’s playbook, r8/α16. In mlx-lm, the parameter <code>scale = 20</code> <b>is not</b> PEFT’s α: it multiplies \(BA\) directly, which is equivalent to \(\alpha/r = 20\) (α = 160 with r = 8). The code warns you if you pass <code>alpha</code>.</p>
+  <p>Where to put the adapters is the most important decision. The practical results from <i>LoRA Without Regret</i>:</p>
+  <ul>
+    <li>LoRA on <b>all</b> matrices, especially MLP/MoE. Attention-only is clearly worse <b>even with the same number of parameters</b>: attention with r = 256 loses to MLP with r = 128 on Llama-3.1-8B, and the same holds for Qwen3-30B-A3B.</li>
+    <li>LoRA matches full FT in sample efficiency when it is on all layers and is not capacity-limited.</li>
+    <li>In RL, it matches full FT <b>even at rank 1</b>. The argument is information-theoretic: a policy-gradient episode carries O(1) bits (the advantage), while an SFT example carries O(number of tokens) bits.</li>
+    <li>LoRA’s optimal LR is ≈ 10× that of full FT (≈ 15× in runs with fewer than ~100 steps).</li>
+  </ul>
+  <table>
+    <thead><tr><th>Model (all linear layers)</th><th>r = 8</th><th>r = 16</th><th>r = 64</th><th>r = 16 attention only</th><th>r = 16 MLP only</th></tr></thead>
+    <tbody>
+      <tr><td>Llama-3.2-3B</td><td>12.2 M</td><td>24.3 M (0.76%)</td><td>97.3 M</td><td>9.2 M</td><td>15.1 M</td></tr>
+      <tr><td>Llama-3.1-8B</td><td>21.0 M</td><td><b>41.9 M (0.52%)</b></td><td>167.8 M</td><td>13.6 M</td><td>28.3 M</td></tr>
+      <tr><td>Qwen3-8B</td><td>21.8 M</td><td>43.6 M (0.53%)</td><td>174.6 M</td><td>15.3 M</td><td>28.3 M</td></tr>
+      <tr><td>Llama-3.3-70B</td><td>103.5 M</td><td>207.1 M (0.29%)</td><td>828.4 M</td><td>65.5 M</td><td>141.6 M</td></tr>
+    </tbody>
+  </table>
+  <p>What LoRA saves is state, not weights. A Llama-3.1-8B with LoRA r=16 on all linear layers keeps 16.1 GB of frozen base (2 B/param) plus 41.9 M × 16 B ≈ 0.67 GB of adapter with gradients and Adam. In FLOPs, the backward does not compute the gradient of the frozen weights: ≈ \(4N\) per token (\(6N\) with checkpointing), “slightly more than ⅔” of full FT according to Thinking Machines. Two practical cautions. First, if the chat template introduces special tokens the base never trained on, LoRA on the linear layers does not learn their vectors: you need to train <code>embed_tokens</code> and <code>lm_head</code> (<code>modules_to_save=["embed_tokens","lm_head"]</code>) or stick to existing tokens. Second, in RL the reference can be “the same network with the adapter turned off,” with no second copy of the model.</p>
+  <table class="la-params">
+    <thead><tr><th>Parameter</th><th>Typical value</th><th>What it does</th><th>Why it matters</th></tr></thead>
+    <tbody>
+      <tr><td><code>--dtype bfloat16</code></td><td>always</td><td>loads the base in BF16</td><td>without it, <code>SFTTrainer</code> loads in FP32 and doubles the frozen base</td></tr>
+      <tr><td><code>--lora_r</code> / <code>--lora_alpha</code></td><td>16 / 32</td><td>rank and \(\alpha/r\) scale</td><td>the optimal LR barely depends on r; α decides the effective scale</td></tr>
+      <tr><td><code>--lora_target_modules</code></td><td><code>q_proj k_proj v_proj o_proj gate_proj up_proj down_proj</code></td><td>where to put adapters</td><td>attention-only loses even with the same number of parameters; MLP is where LoRA pays off</td></tr>
+      <tr><td><code>--learning_rate</code></td><td>~1e-4</td><td>Adam’s step</td><td>≈ 10× that of full FT (TRL’s tip for PEFT: ≈1e-4)</td></tr>
+      <tr><td><code>gradient_checkpointing</code></td><td>on</td><td>recomputes activations</td><td>4N → 6N FLOPs, activations from \(34sbhL\) down to \(2sbhL + 34sbh\)</td></tr>
+      <tr><td><code>lora_dropout</code></td><td>0 · 0.05</td><td>randomly zeroes part of the input to the \(BA\) path during training</td><td>the Spark playbook uses 0 and Axolotl’s <code>lora-1b.yml</code>, 0.05. It regularizes only the adapter. In an SFT of 1–3 epochs over varied data there is little to regularize, and with 0 the path is deterministic and has no extra mask in memory (interpretation). Raise it if the adapter starts memorizing a small dataset</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="la-sec">
+  <h2>QLoRA, DoRA, LoRA on experts, and merging</h2>
+  <p>LoRA cut the state, but the frozen base still takes 2 B/param: 141 GB for a 70B. <span class="la-term" data-term="qlora">QLoRA</span> (Dettmers et al., 2023) freezes the base in 4 bits and trains the adapters on top of it, with the promise to “fine-tune a 65B parameter model on a single 48GB GPU” without losing the performance of 16-bit fine-tuning. There are three ingredients.</p>
+  <ol class="la-steps">
+    <li><b><span class="la-term" data-term="nf4">NF4</span> (4-bit NormalFloat).</b> Pretrained weights are approximately Gaussian. Instead of 16 uniform levels, NF4 places the levels at the quantiles of an \(\mathcal N(0,1)\) normalized to \([-1, 1]\): more levels near zero, where there are more weights. They are asymmetric (8 positive, 7 negative, and an exact zero), with an absmax scale per block of 64 weights. It is the “codebook + per-block scale” family from <a data-ch="quantizacao-fundamentos">chapter 20</a>, but without tensor cores: the kernel dequantizes to BF16 before the GEMM.</li>
+    <li><b><span class="la-term" data-term="quantizacao-dupla">Double quantization</span>.</b> Each block of 64 weights has an FP32 scale, which costs 32/64 = 0.5 bit per parameter. QLoRA quantizes those scales to 8 bits, in blocks of 256 scales with one FP32 scale per block.</li>
+    <li><b><span class="la-term" data-term="otimizador-paginado">Paged optimizers</span>.</b> They use NVIDIA unified memory to page state between CPU and GPU at the peaks. Interpretation: on the GB10, this does not create memory (CPU and GPU share the same LPDDR5x); it only avoids OOM at peaks if there are pages to free.</li>
+  </ol>
+  <div class="la-eq">
+    \[ \text{bits/param} \;=\; \underbrace{4}_{\text{NF4 code}} \;+\; \underbrace{\frac{8}{64}}_{\text{8-bit scale}} \;+\; \underbrace{\frac{32}{64\cdot 256}}_{\text{scale of the scale}} \;=\; 4.127 \;\;(0.516\ \text{B/param}) \]
+    <ul class="la-eq-legend">
+      <li>64: weights per first-level block</li>
+      <li>256: scales per second-level block</li>
+      <li>without double quantization it would be \(4 + 32/64 = 4.5\) bits: the savings are 0.373 bit/param, ~3 GB on a 65B</li>
+    </ul>
+  </div>
+  <figure class="la-fig" id="fig-nf4" data-title="NF4: sixteen levels for a Gaussian">
+    <div class="la-fig-stage" style="height:470px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>A block of 64 Gaussian weights (8×8, real values in the matrix) is divided by its absmax and falls onto the nearest levels: the 16 values of QLoRA’s NF4 table (asymmetric, with an exact zero) or, for comparison, the 15 uniform levels of a symmetric INT4. The curve is the normal density: NF4 spends its levels where the weights are. On the right, the 4-bit codes and the error; the mean error is measured over 400 random blocks. Illustrative weights; the bit counter follows the equation above.</figcaption>
+  </figure>
+  <p>The real configuration, from the <code>Llama3_70B_qLoRA_finetuning.py</code> script in the Spark’s PyTorch playbook:</p>
+  <pre data-lang="python"><code>quantization_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_use_double_quant=True,
+    bnb_4bit_quant_type='nf4',
+    bnb_4bit_compute_dtype=args.dtype,      # bfloat16
+    bnb_4bit_quant_storage=args.dtype
+)
+model = prepare_model_for_kbit_training(model)
+peft_config = LoraConfig(r=args.lora_rank, target_modules="all-linear",
+                         lora_alpha=16, lora_dropout=0, task_type=TaskType.CAUSAL_LM)
+# SFTConfig: optim "adamw_torch", packing False, max_length = seq_length (2048 by default)</code></pre>
+  <p>The budget for Llama-3.3-70B in QLoRA on one Spark: the quantized part takes 35.3 GB; <code>embed_tokens</code> and <code>lm_head</code> stay in BF16 (bitsandbytes does not quantize them), another 4.2 GB, for a total of <b>39.5 GB</b>. LoRA r = 16 on all linear layers (207.1 M) × 16 B comes to 3.3 GB. Activations with checkpointing are ≈ 3.25 GB per 2,048-token sequence, and the logits up to ~1 GB per sequence without the chunked loss. With batch 1, ≈ 46–47 GB (with FP32 logits); with batch 8, 70–78 GB. The Spark NeMo playbook runs the <code>llama_3_3_70b_instruct_squad_peft_qlora_rtx_spark.yaml</code> recipe in a container with <code>--memory=64g</code>, consistent with this math. One variant is <span class="la-term" data-term="loftq">LoftQ</span>, which initializes \(A\) and \(B\) to compensate for the quantization error (<code>init_lora_weights="loftq"</code>).</p>
+  <h3>DoRA: separating size from direction</h3>
+  <p><span class="la-term" data-term="dora">DoRA</span> (Liu et al., ICML 2024) decomposes each weight column into <b>magnitude</b> and <b>direction</b>. LoRA acts only on the direction, and the magnitude becomes a trainable vector of its own:</p>
+  <div class="la-eq">
+    \[ W' \;=\; m \cdot \frac{W_0 + BA}{\lVert W_0 + BA\rVert_c}, \qquad m^{(0)} = \lVert W_0 \rVert_c \]
+    <ul class="la-eq-legend">
+      <li>\(\lVert\cdot\rVert_c\): the norm of each column</li>
+      <li>\(m\): trainable magnitude vector, one number per column</li>
+      <li>at the start, \(BA = 0\) and \(m = \lVert W_0\rVert_c\), so \(W' = W_0\)</li>
+    </ul>
+  </div>
+  <p>DoRA closes part of the gap to full FT, especially at low rank, and it is also mergeable, with zero cost after the merge. The price is more memory and time during training because of the norm. You turn it on with <code>LoraConfig(use_dora=True)</code> in PEFT or <code>--fine-tune-type dora</code> in mlx-lm, which does <b>not</b> support DoRA on expert layers (<code>SwitchLinear</code>). Other variants you will run into in configs: <span class="la-term" data-term="lora-plus">LoRA+</span> (LR of \(B\) = λ × LR of \(A\), λ ≈ 16, via <code>loraplus_lr_ratio</code>), PiSSA (initializes \(A\) and \(B\) with the principal singular components of \(W_0\)), OLoRA, EVA, and CorDA (other initializations), LoRA-FA (freezes \(A\) and reduces activation memory), and <code>rank_pattern</code>/<code>alpha_pattern</code> (rank and α per module, by regex).</p>
+  <h3>LoRA in an MoE</h3>
+  <p>There are four places to put the adapter in an <a data-ch="mixture-of-experts">MoE</a>. (1) Only on the attention and the shared expert: cheap, but that is precisely where LoRA pays off least. (2) <span class="la-term" data-term="lora-por-expert">One LoRA per expert</span>, with 3D adapters \([E, r, d_{in}]\) and \([E, d_{out}, r]\): this is what MLX does in <code>LoRASwitchLinear</code> (two <code>gather_mm</code> calls indexed by the routing) and what PEFT does with <code>target_parameters=["mlp.experts.gate_up_proj","mlp.experts.down_proj"]</code>. Thinking Machines used, per expert, rank = total rank ÷ active experts (8 in Qwen3 MoE), which keeps the LoRA/full ratio equal to that of the dense layers. (3) Factors shared across experts (“shared-outer”), which vLLM loads with <code>--enable-moe-shared-loras</code>. (4) The <span class="la-term" data-term="roteador">router</span> stays frozen. In Unsloth’s words, “it's not a good idea to fine-tune the router layer”, and MiMo-V2.6-Pro (384 experts per layer) showed why: in RL with a trainable router, the expert load collapsed within 20 steps (coefficient of variation from 0.78 to 2.0, “cold” experts from 0.5% to 22%), and restoring only the router recovered the balance without changing the benchmarks.</p>
+  <table>
+    <thead><tr><th>Model</th><th>Experts × MoE layers</th><th>r per expert</th><th>LoRA params on the experts</th><th>State (16 B/p)</th></tr></thead>
+    <tbody>
+      <tr><td>Qwen3-30B-A3B (\(h\) 2048, interm. 768)</td><td>128 × 48</td><td>1 / 2 / 16</td><td>51.9 M / 103.8 M / 830.5 M</td><td>0.8 / 1.7 / 13.3 GB</td></tr>
+      <tr><td>GLM-5.3-Flash (\(h\) 4096, interm. 2048)</td><td>288 × 42</td><td>1 / 8 / 16</td><td>0.22 B / 1.78 B / 3.57 B</td><td>3.6 / 28.5 / 57.1 GB</td></tr>
+    </tbody>
+  </table>
+  <p>The math is MoE layers × \(E\) × 3 matrices × \(r\) × (\(h\) + intermediate). In GLM, a per-expert LoRA of rank 16 already has 3.57 B parameters, half of a 7B model. Kernels matter: Unsloth advertises, in aggregate, “12x faster with &gt;35% less VRAM and 6x longer context” with grouped-GEMM + LoRA in Triton for MoE (Qwen3-30B-A3B 16-bit LoRA: ~1.7× faster and ~35% less memory on a B200). 4-bit bitsandbytes does not cover experts stored as <code>nn.Parameter</code>, and Unsloth advises against QLoRA on MoE. The 2026 alternative is LoRA on an <b>NVFP4</b> base in Axolotl: ScatterMoE (W4A16, “any CUDA GPU sm80+”) or SonicMoE (W4A4, SM100 only), with a merge back into an NVFP4 checkpoint (<code>nvfp4_merge_aware: true</code>).</p>
+  <h3>Merging the adapter, and the QLoRA problem</h3>
+  <p>The <span class="la-term" data-term="merge-de-adaptador">merge</span> is the LoRA equation added in one go: \(W = W_0 + \frac{\alpha}{r}BA\). Once merged, the inference cost is zero. The tools: <code>PeftModel.from_pretrained(base, id).merge_and_unload()</code> (and <code>add_weighted_adapter</code> to combine adapters by <code>linear</code>, <code>svd</code>, <code>ties</code>, <code>dare_ties</code>…), <code>mlx_lm.fuse</code>, <code>axolotl merge-lora</code>, and <code>llamafactory-cli export</code>, whose example warns: “DO NOT use quantized model or quantization_bit when merging lora adapters”. The reason is subtle (interpretation). A QLoRA adapter learned to correct \(\mathrm{deq}(W_{NF4})\), not \(W_{BF16}\). Merging into \(W_{BF16}\) gives \(W_{BF16} + BA \ne \mathrm{deq}(W_{NF4}) + BA\), and the difference is the quantization error the adapter may have been compensating for. Merging into \(\mathrm{deq}(W_{NF4})\) preserves the trained function, but “bakes” the NF4 error into the model. Either way, <b>measure the <span class="la-term" data-term="kld">KLD</span></b> against the trained model, as in <a data-ch="medindo-qualidade">chapter 25</a>.</p>
+  <p>You can also skip the merge and serve several adapters on top of the same base (<span class="la-term" data-term="multi-lora">multi-LoRA</span>). In vLLM: <code>--enable-lora</code>, <code>--lora-modules name=path</code>, <code>--max-loras</code> (default 1, distinct adapters in a batch), and <code>--max-lora-rank</code> (default 16; choices 1, 8, 16, 32, 64, 128, 256, 320, 512; it sizes the memory, so use the largest rank you will serve). The <a data-ch="prefix-caching">prefix caching</a> hash includes the LoRA ID, and CUDA graph dispatch separates batches with and without LoRA (<code>has_lora</code> in the <code>BatchDescriptor</code>).</p>
+</section>
+
+<section class="la-sec">
+  <h2>What fits where: 2× DGX Spark and a 24 GB Mac M4</h2>
+  <p>Now we can put it all together in a single calculation. Each machine’s budget:</p>
+  <dl class="la-kv">
+    <dt>DGX Spark (GB10)</dt><dd>128 GB of unified LPDDR5x, <b>121.69 GiB</b> visible as “GPU” (130.7 GB); practical budget for the training process ~100–110 GiB, leaving 10–20 GiB for the OS, page cache, dataloader, and peaks (interpretation, consistent with what the GLM recipe leaves for the OS). ~230 GB/s effective and ~125 TFLOPS of dense BF16 (Module 1 estimates).</dd>
+    <dt>2× Spark</dt><dd>~243 GiB, ~250 TFLOPS of BF16 combined, RoCE v2 at 200 Gb/s; multi-node training via Docker Swarm + Accelerate/FSDP in the playbook.</dd>
+    <dt>Mac M4 24 GB</dt><dd>MLX recommends a <b>19.07 GB</b> working set and a maximum single buffer of 14.3 GB (measured in Module 1); <code>sudo sysctl iogpu.wired_limit_mb=N</code> raises the ceiling, without persisting.</dd>
+  </dl>
+  <p>The calculator adds up weights, gradients, masters, optimizer, activations, and logits per node, for the chosen method and hardware, using this chapter’s formulas. The “map” mode shows the research note’s feasibility matrix. Click a cell to read the math; if the model exists in the calculator, its configuration is loaded.</p>
+  <figure class="la-fig wide" id="fig-calc" data-title="Training memory calculator">
+    <div class="la-fig-stage" style="height:470px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Stacked bar per node against the budget lines (Spark: 121.69 GiB visible and the practical band; Mac: 19.07 GB). Math: 16/12/8/6 B/param for full FT; BF16 base (2 B), NF4 with double quantization (0.516 B, embeddings and head in BF16), or MLX 4-bit g64 (0.5625 B) for LoRA; adapters at 16 B/param; activations via \(34sbh\) (Llama; an approximation for the others) with or without checkpointing, only on the last 16 layers in mlx-lm; logits \(s\,b\,V\) × 4 or × 2 bytes, counted once (the logits gradient can double that peak in the backward); FSDP divides the state per node. In MoE models, the rank per expert is \(r/8\) (Thinking Machines convention). QLoRA on an MoE never gets “fits”: at most “exp”, because 4-bit bitsandbytes does not quantize experts stored as <code>nn.Parameter</code>. For GLM-5.3-Flash, activations are not estimated (4 mHC streams escape the formula), the total appears as a lower bound (≥), and LoRA counts only the experts. Estimates; measure with <code>torch.cuda.max_memory_allocated</code>.</figcaption>
+  </figure>
+  <p>The reference points the calculator reproduces, all from the research note: Llama-3.1-8B full FT at 16 B/param = 128.5 GB (❌ on one node), 64.2 GB/node on 2 nodes with FSDP (✅); Llama-3.3-70B in QLoRA r16 = 39.5 + 3.3 GB + 3.25 GB of activations per sequence (✅ on one node); Qwen3-8B 4-bit on the Mac, batch 1, \(s\) = 2,048, checkpointing = 6.6 GB (✅); Qwen3-4B 4-bit, batch 4, no checkpointing = 18.8 GB (🟡 at the limit). The full matrix, in summary:</p>
+  <ul>
+    <li><b>Full FT</b>: up to ~3–4B on one Spark (the playbook runs Llama 3.2 3B), ~8B on 2 Sparks with FSDP. 14B only at 12 B/param (Muon) or 8 B/param.</li>
+    <li><b>BF16 LoRA</b>: ✅ up to ~14B per node, 🟡 on Qwen3-30B-A3B (61 GB of base); dense models of ~30–40B would be the extrapolation (estimate); 70B on 2 nodes (FSDP, ~70.6 GB/node + adapters + activations; there is a playbook).</li>
+    <li><b>QLoRA</b>: 70B on one node; gpt-oss-120b with Unsloth in “around 68GB”.</li>
+    <li><b>Large MoE</b> (GLM-5.3-Flash 320B, DeepSeek-V4-Flash 284B, Qwen3.8-Flash-Next 125.7B): neither full FT nor BF16 LoRA. QLoRA/LoRA on a 4-bit base only as an experiment on 2 nodes, dependent on framework support for the architecture.</li>
+    <li><b>Mac M4 24 GB</b>: QLoRA via <code>mlx_lm.lora</code> up to ~14B in 4-bit, with batch 1 and <code>--grad-checkpoint</code>; full FT up to ~1.7B.</li>
+  </ul>
+  <pre data-lang="bash"><code># Mac: data in ./data/train.jsonl (+ valid.jsonl), format {"messages":[...]}
+mlx_lm.lora --model mlx-community/Qwen3-4B-Instruct-2507-4bit --train --data ./data \
+  --iters 600 --batch-size 2 --num-layers 16 --mask-prompt --grad-checkpoint \
+  --max-seq-length 2048 --learning-rate 1e-5 --adapter-path ./adapters
+# quantized model ⇒ automatic QLoRA; --fine-tune-type dora | full; --optimizer adam|adamw|muon|sgd|adafactor
+mlx_lm.fuse --model mlx-community/Qwen3-4B-Instruct-2507-4bit --adapter-path ./adapters --save-path ./fused_model
+
+# Spark: 8B LoRA SFT with the TRL CLI (example values from the research note)
+trl sft --model_name_or_path Qwen/Qwen3-8B --dataset_name trl-lib/Capybara --dtype bfloat16 \
+  --use_peft --lora_r 16 --lora_alpha 32 \
+  --lora_target_modules q_proj k_proj v_proj o_proj gate_proj up_proj down_proj \
+  --assistant_only_loss True --max_length 4096 --learning_rate 1e-4 --lr_scheduler_type cosine \
+  --per_device_train_batch_size 2 --gradient_accumulation_steps 16 --num_train_epochs 1 \
+  --output_dir qwen3-8b-lora-sft
+# two nodes: --accelerate_config fsdp2 --num_processes 2</code></pre>
+  <h3>How long it takes</h3>
+  <p>Memory tells you whether it fits; FLOPs tell you how long it takes. With \(N\) = active parameters, one training token costs ≈ \(6N\) in full FT, \(8N\) with checkpointing, \(4N\) in LoRA, and \(6N\) in LoRA with checkpointing. A Spark’s ceiling is \(F/(kN)\) tokens per second:</p>
+  <div class="la-eq">
+    \[ t \;=\; \frac{\text{tokens}\times k\times N}{\text{MFU}\times F\times \text{nodes}} \]
+    <ul class="la-eq-legend">
+      <li>\(k \in \{4, 6, 8\}\): FLOPs per parameter per token (LoRA, full or LoRA+ckpt, full+ckpt)</li>
+      <li>\(F\): hardware peak (~125 TFLOPS of dense BF16 on the GB10, Module 1 estimate)</li>
+      <li><span class="la-term" data-term="mfu">MFU</span>: the fraction of the peak that training actually uses (the 40% below is an <b>assumption</b>; the GB10’s real training MFU has not been measured)</li>
+    </ul>
+  </div>
+  <table>
+    <thead><tr><th>Case</th><th>FLOPs/token</th><th>Ceiling at 100% MFU</th><th>At 40% MFU</th><th>10 M tokens at 40%</th></tr></thead>
+    <tbody>
+      <tr><td>3B full FT (ckpt, 8N)</td><td>2.57e10</td><td>4,863 tok/s</td><td>1,945 tok/s</td><td>1.4 h</td></tr>
+      <tr><td>8B LoRA (ckpt, 6N)</td><td>4.82e10</td><td>2,594 tok/s</td><td>1,038 tok/s</td><td>2.7 h</td></tr>
+      <tr><td>8B full FT (ckpt, 8N)</td><td>6.42e10</td><td>1,946 tok/s</td><td>778 tok/s</td><td>3.6 h</td></tr>
+      <tr><td>70B QLoRA (ckpt, 6N)</td><td>4.23e11</td><td>295 tok/s</td><td>118 tok/s</td><td>23.5 h</td></tr>
+    </tbody>
+  </table>
+  <div class="la-callout danger"><b class="t">Marketing numbers that do not add up</b><p>An NVIDIA post from 2025-10-24 gives fine-tuning “peak tokens/s” on the Spark: 82,739.2 (Llama 3.2 3B full), 53,657.6 (Llama 3.1 8B LoRA), and 5,079.4 (Llama 3.3 70B QLoRA). By the accounting above, that would require 1.60, 1.72, and 1.43 PFLOP/s, 11 to 14× the dense BF16 peak. The post does not define the metric. For planning, use FLOPs and measure.</p></div>
+  <p>A pleasant surprise: <b>training MoE on the Spark is compute-bound, not bandwidth-bound</b>. A 16K-token microbatch touches almost every expert of Qwen3-30B-A3B; reading ~61 GB of BF16 weights in three passes (forward, recompute, backward) takes ~0.8 s at 230 GB/s, versus \(6\times 3.35\times10^9\times 16{,}384 \approx 3.3\times10^{14}\) FLOPs, ~6.6 s at 50 TFLOPS. It is the opposite of Module 1’s decode. Training makes good use of the Spark.</p>
+  <div class="la-inrecipe" data-recipe="qwen"><div class="la-inrecipe-h"><span class="la-rb qwen"></span><span class="k">Model</span><code>Qwen3.8-Flash-Next</code></div><div class="la-inrecipe-b"><p>The recipe’s model has 125.7 B main parameters, plus the 51.2 B PLE table and the vision and MTP parts. Full FT and BF16 LoRA are out of reach (≥ 250 GB for the base alone). A QLoRA on 2 nodes would fit in theory (4-bit main weights ~65–71 GB + FP8 PLE ~51 GB, more than one node holds), but it requires support for GR, PLE, QSA, and GDN in the training stack, which has not been verified. Module 1’s serving checkpoints do not work as a training base either: the recipes’ packed formats have no backward kernel, so you would have to start from the official BF16. The viable path (interpretation) is to use the recipe as a <b>teacher</b>: serve Qwen3.8 with Module 1’s vLLM and distill a small student (4–14B) from the same tokenizer family (248,320-token vocabulary; check the <code>tokenizer.json</code>). And if you ever merge an adapter into it, remember that Qwen3.8 was pretrained with Muon and that the MTP head used as a drafter was trained against the <i>original</i> model: re-measure the speculative decoding acceptance rate (<a data-ch="especulacao-fundamentos">chapter 35</a>) before celebrating.</p></div></div>
+  <div class="la-callout tip"><b class="t">Minimal roadmap</b><p>(1) Do the math: state + activations + logits per node, against ~105 GiB on the Spark or ~19 GB on the Mac. (2) Pick the method from the column that gives ✅, not 🟡. (3) Turn on <code>--dtype bfloat16</code>, checkpointing, and LoRA on all linear layers, with an LR ~10× that of full FT. (4) On 2 nodes, use FSDP/ZeRO-3 and test the network first. (5) After training, merge in BF16, requantize to the recipe’s format, and measure the KLD and the task metric: the effect of the fine-tune has to survive quantization.</p></div>
+  <p>Now you know what training costs and how to make it fit. In the <a data-ch="sft">next chapter</a> comes the first real method: SFT, with a cross-entropy loss on the assistant tokens only, chat templates, data, and the real configurations that put all of this to use.</p>
+</section>

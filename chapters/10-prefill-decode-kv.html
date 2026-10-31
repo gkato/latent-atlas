@@ -1,0 +1,335 @@
+<p class="la-lead">Na receita DeepSeek, um prompt de 131.072 tokens levou <b>78,75 segundos</b> até o primeiro token da resposta: o modelo leu o texto a cerca de <b>1.665 tokens por segundo</b>. Logo em seguida, nas mesmas duas máquinas, escreveu a resposta a <b>65,2 tokens por segundo</b>, 25 vezes mais devagar do que tinha lido. Não é defeito, é física. Ler um prompt e escrever uma resposta são duas fases com gargalos diferentes, o <span class="la-term" data-term="prefill">prefill</span> e o <span class="la-term" data-term="decode">decode</span>. Entre elas mora uma estrutura de dados que decide quanto contexto e quantos usuários cabem na memória: o <span class="la-term" data-term="kv-cache">KV cache</span>. Neste capítulo você vai aprender a prever com lápis e papel por que o prefill esbarra no cálculo e o decode na banda de memória (o modelo de <i>roofline</i>), quantos bytes cada token de contexto custa em cada modelo, como contexto longo e concorrência disputam o mesmo pool e o que significam TTFT, TPOT e os dois tipos de “tokens por segundo” que aparecem em toda tabela de benchmark.</p>
+
+<section class="la-sec">
+  <h2>Duas fases, dois ritmos</h2>
+  <p>No capítulo anterior (<a data-ch="geracao-amostragem">Gerando texto</a>) vimos o laço <span class="la-term" data-term="autoregressivo">autoregressivo</span>: cada token novo exige um forward completo pelas camadas, e o token escolhido vira entrada do passo seguinte. Esse laço esconde uma assimetria. Os tokens do <b>prompt</b> já são conhecidos antes de começar, então não é preciso esperar um para processar o outro: eles atravessam o modelo todos juntos, num único forward. É o <b>prefill</b>, o “preenchimento”. Os tokens da <b>resposta</b> não existem até serem sorteados, porque o token 2 depende do token 1. Essa é a fase de <b>decode</b>: um token por sequência a cada passo.</p>
+  <p>Na linguagem de <a data-ch="tensores-algebra">tensores</a>, a diferença está no número de linhas da matriz de ativações que entra em cada camada. No prefill de um prompt de \(P\) tokens, cada projeção recebe \(X \in \mathbb R^{P\times d}\), com \(P\) linhas empilhadas. No decode ela recebe \(X \in \mathbb R^{B\times d}\), em que \(B\) é o número de sequências que o motor processa juntas naquele passo, muitas vezes uma só. Vamos chamar esse número de linhas de \(M\), que é o nome usado pelos kernels e pelos patches das receitas:</p>
+  <div class="la-eq">
+    \[ M_{\text{prefill}} = \min(P,\; C) \qquad\qquad M_{\text{decode}} = B \times (1 + k) \]
+    <ul class="la-eq-legend">
+      <li>\(P\): tokens do prompt ainda não processados</li>
+      <li>\(C\): tamanho do pedaço (chunk) de prefill por passo, o <code>--max-num-batched-tokens</code></li>
+      <li>\(B\): sequências em decode no mesmo passo</li>
+      <li>\(k\): tokens especulativos verificados por sequência (0 sem especulação)</li>
+    </ul>
+  </div>
+  <div class="la-callout analogy"><b class="t">Analogia: ler um livro × ditar uma carta</b><p>Um leitor dinâmico passa os olhos pela página inteira de uma vez. Quem dita uma carta só diz a palavra seguinte depois de decidir a anterior e, para cada palavra, consulta de novo todo o vocabulário e as anotações sobre o que já leu. O prefill é a leitura: todo o texto de entrada é conhecido e processado em bloco. O decode é o ditado, e cada palavra custa uma consulta completa.</p></div>
+  <p>Na figura abaixo, cada personagem é um token. Siga os passos: o prompt atravessa a fábrica de camadas de uma vez, cada camada guarda na sua estante o que vai precisar depois (o KV cache) e, em seguida, a resposta sai um token por vez.</p>
+  <figure class="la-fig wide" id="fig-duas-fases" data-title="A fábrica de duas fases">
+    <div class="la-fig-stage" style="height:400px"><canvas></canvas></div>
+    <figcaption>Miniatura ilustrativa: 6 tokens de prompt, 5 camadas. Cada camada tem uma estante (embaixo) em que cada quadradinho é o K e o V de um token. No prefill, as 6 linhas passam juntas (\(M = 6\)); no decode, uma de cada vez (\(M = 1\)). O pulso que sobe do banco de memória representa a leitura dos pesos de cada camada, e acontece uma vez por passo nas duas fases.</figcaption>
+  </figure>
+  <p>Repare em três coisas. No prefill a fábrica trabalha uma vez para seis tokens; no decode, uma vez para cada token. Nas duas fases, cada passo busca na memória os pesos de todas as camadas, mas no prefill essa busca é dividida entre muitos tokens. E a estante de cada camada só cresce: o prefill a enche de uma vez, e cada passo de decode acrescenta uma linha e relê todas as anteriores.</p>
+  <p>O intervalo até o primeiro token aparecer é o <span class="la-term" data-term="ttft">TTFT</span> (<i>time to first token</i>): fila, prefill e a primeira amostragem. Depois dele, a velocidade que o usuário percebe é a do decode. As seções 8 e 9 formalizam essas métricas. Por ora basta a intuição de que prompt longo se paga em TTFT e resposta longa se paga em decode.</p>
+  <div class="la-callout why"><b class="t">Por que isso importa</b><p>As receitas otimizam as duas fases separadamente, às vezes com escolhas opostas. No GLM, os kernels de experts “gordos” (E3) e a cópia BF16 do KDA só entram no prefill, enquanto o FP8 denso, o MoE cooperativo e a especulação miram o decode. A auditoria do DeepSeek resume o mesmo contraste: com um usuário, o decode é “~80% streaming de pesos”, e o prefill longo é dominado pelo indexador. Descobrir em que fase o tempo está sendo gasto é a primeira pergunta de qualquer otimização.</p></div>
+  <p>Um detalhe prático: um prompt de 100 mil tokens não entra de uma vez. O motor fatia o prefill em pedaços de até <span class="la-term" data-term="max-num-batched-tokens"><code>--max-num-batched-tokens</code></span> tokens por passo (7.168 no GLM, 8.192 no Qwen e no DeepSeek), o <span class="la-term" data-term="chunked-prefill">chunked prefill</span>, e pode misturar esses pedaços com passos de decode de outras conversas. A mecânica fica para o capítulo <a data-ch="scheduler-batching">Scheduler e batching</a>. Aqui importa que o \(M\) do prefill é o tamanho do pedaço, na casa dos milhares, e o do decode fica entre 1 e algumas dezenas.</p>
+</section>
+
+<section class="la-sec">
+  <h2>Quantas vezes cada peso trabalha: GEMM e GEMV</h2>
+  <p>Quase todo o trabalho de um LLM são multiplicações de matrizes: projeções Q, K e V, a saída da atenção, as três matrizes de cada expert, o <span class="la-term" data-term="lm-head">lm_head</span>. Todas têm a mesma forma, e duas contas simples dizem quanto cada uma custa em cálculo e em memória:</p>
+  <div class="la-eq">
+    \[ Y = X\,W,\quad X\in\mathbb R^{M\times K},\; W\in\mathbb R^{K\times N} \qquad \text{FLOPs} = 2\,M K N \qquad \text{Bytes} \approx b_w\,K N + b_a\,M\,(K+N) \]
+    \[ I \;=\; \frac{\text{FLOPs}}{\text{Bytes}} \;\approx\; \frac{2M}{b_w} \quad (\text{quando } M \ll K, N) \]
+    <ul class="la-eq-legend">
+      <li>\(M\): linhas (tokens) que passam pela matriz neste passo</li>
+      <li>\(K, N\): dimensões de entrada e de saída da projeção</li>
+      <li>\(b_w\): bytes por peso (2 em BF16, 1 em FP8, 0,5 em 4 bits)</li>
+      <li>\(b_a\): bytes por ativação (2 em BF16)</li>
+      <li>2: cada multiplicação-acumulação conta como dois <span class="la-term" data-term="flops">FLOPs</span></li>
+      <li>\(I\): <span class="la-term" data-term="intensidade-aritmetica">intensidade aritmética</span>, FLOPs por byte trazido da memória</li>
+    </ul>
+  </div>
+  <p>Com \(M = 1\), a multiplicação é uma <span class="la-term" data-term="gemv">GEMV</span> (matriz × vetor): cada peso sai da memória, participa de uma única multiplicação e é descartado. Com \(M\) grande, é uma <span class="la-term" data-term="gemm">GEMM</span> (matriz × matriz): cada peso lido serve \(M\) linhas. O cálculo cresce com \(M\); os bytes de pesos, não.</p>
+  <p>Um exemplo feito à mão (ilustrativo): uma projeção 4096 × 4096 em BF16 tem 16,8 milhões de pesos, ou 33,5 MB. Com \(M = 1\), são 33,5 milhões de FLOPs sobre 33,5 MB, 1 FLOP por byte. Com \(M = 1.024\), um pedaço de prefill, são 34,4 bilhões de FLOPs sobre os mesmos 33,5 MB de pesos mais 16,8 MB de ativações, cerca de 680 FLOPs por byte. É a mesma matriz fazendo 680 vezes mais trabalho por byte que chega da memória. Repare que a aproximação \(2M/b_w\) daria 1.024: com mil linhas, as ativações já pesam na conta.</p>
+  <p>Vale guardar a condição da aproximação. \(2M/b_w\) só funciona enquanto os bytes de ativação, \(b_a M (K+N)\), são pequenos perto dos bytes de peso, \(b_w K N\), ou seja, enquanto \(M \ll \frac{b_w}{b_a}\cdot\frac{KN}{K+N}\). Com pesos de 4 bits e ativações BF16, \(b_w/b_a = 1/4\): a condição fica quatro vezes mais apertada do que em BF16. Guarde isso para a próxima seção, porque é exatamente o que acontece com os experts de um MoE.</p>
+  <p>Na figura, a matriz de pesos \(W\) fica no alto e as linhas de \(X\) (os tokens) à esquerda. Cada coluna de \(W\) é trazida da memória uma única vez e depois usada por todas as \(M\) linhas. Aumente \(M\), troque o formato do peso e acompanhe os contadores.</p>
+  <figure class="la-fig" id="fig-gemv-gemm" data-title="Uma leitura, M usos">
+    <div class="la-fig-stage" style="height:420px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Multiplicação \(Y = XW\) com \(K = 4\) e \(N = 6\) (inteiros ilustrativos nas células, para você conferir as contas). O pacote que viaja do banco de memória é a leitura de uma coluna de \(W\); os flashes em \(Y\) são as multiplicações que a reaproveitam. As linhas apagadas são vagas para mais tokens. A intensidade no rodapé usa a aproximação \(2M/b_w\), que só conta os bytes de peso (aqui, com \(M \le 8\), ela vale). A balança (ao lado, ou embaixo em telas estreitas) compara, no GB10, o tempo de ler os pesos com o de fazer as contas: ela só se equilibra no ridge, em \(I \approx 458\).</figcaption>
+  </figure>
+  <p>Com \(M = 1\), a leitura, o pacote que viaja, é o evento dominante. Com \(M = 8\), a mesma leitura alimenta oito produtos. Em hardware real, o \(M\) do decode fica entre 1 e algumas dezenas (no Qwen, as GEMMs de decode têm \(K = 2560\), o <code>hidden_size</code>, e \(M\) entre 1 e 64), e o do prefill chega aos milhares.</p>
+  <div class="la-callout recipe" data-recipe="all"><b class="t"><span class="la-rb all"></span> Nas receitas: o kernel muda com M</b><p>Como o regime muda com \(M\), as receitas escolhem kernels diferentes conforme o número de linhas, o <span class="la-term" data-term="dispatch-por-m">dispatch por M</span>. No perfil EXL3 denso, o GLM mantém cópias BF16 das projeções para \(M &gt; 144\), e troca o kernel do KDA em \(M = 512\). Um plugin experimental do repositório DeepSeek (desligado por padrão, só para checkpoints ModelOpt NVFP4) alterna <span class="la-term" data-term="marlin">Marlin</span> W4A16 para \(M &lt; 128\) e CUTLASS W4A4 para \(M \ge 128\); o caminho servido, com experts MXFP4, usa b12x W4A16 em todos os \(M\). O Marlin desempacota pesos de 4 ou 8 bits dentro do kernel e brilha em GEMMs finas; em \(M\) grande perde para GEMMs densas. O capítulo <a data-ch="kernels">Kernels</a> abre cada um.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>O roofline: memória ou cálculo?</h2>
+  <p>Uma GPU tem dois limites: a velocidade com que faz contas, o pico de compute \(P_{\text{pico}}\) (FLOPs por segundo), e a velocidade com que a memória entrega bytes, a <span class="la-term" data-term="banda-de-memoria">banda</span> \(\beta\). Um kernel que precisa de \(F\) FLOPs e movimenta \(Q\) bytes não termina antes de \(F/P_{\text{pico}}\) nem antes de \(Q/\beta\):</p>
+  <div class="la-eq">
+    \[ t \;\ge\; \max\!\Big(\frac{F}{P_{\text{pico}}},\; \frac{Q}{\beta}\Big) \quad\Longrightarrow\quad \frac{F}{t} \;\le\; \min\big(P_{\text{pico}},\; I\cdot\beta\big), \qquad I^{*} = \frac{P_{\text{pico}}}{\beta} \]
+    <ul class="la-eq-legend">
+      <li>\(F\): FLOPs do kernel; \(Q\): bytes lidos e escritos na memória principal</li>
+      <li>\(P_{\text{pico}}\): pico de compute da GPU no formato usado</li>
+      <li>\(\beta\): banda de memória (bytes por segundo)</li>
+      <li>\(I = F/Q\): intensidade aritmética do kernel</li>
+      <li>\(I^{*}\): <span class="la-term" data-term="ridge-point">ridge point</span>, a intensidade em que os dois limites empatam</li>
+    </ul>
+  </div>
+  <p>O gráfico de \(\min(P_{\text{pico}}, I\beta)\) em escala log-log é o <span class="la-term" data-term="roofline">roofline</span> (Williams, Waterman e Patterson, 2009): uma rampa inclinada, a região <span class="la-term" data-term="memory-bound">limitada pela memória</span>, que encontra um teto plano, a região <span class="la-term" data-term="compute-bound">limitada pelo cálculo</span>, no ridge \(I^*\). À esquerda do ridge a GPU espera dados; à direita, os dados esperam a GPU.</p>
+  <p>No GB10 do DGX Spark, os relatórios das receitas trabalham com ~125 TFLOPS de pico BF16 denso (uma estimativa, não um microbenchmark) e ~273 GB/s de banda teórica da LPDDR5X, com 230 a 250 GB/s efetivos medidos. O ridge fica em \(125\times10^{12} / 273\times10^{9} \approx 458\) FLOPs por byte. Compare com a GEMV do decode: \(I \approx 1\) em BF16, \(\approx 4\) com pesos de 4 bits. São duas ordens de grandeza à esquerda do ridge, e por isso o decode é limitado pela memória com folga.</p>
+  <div class="la-callout analogy"><b class="t">Analogia: o chef e a despensa</b><p>Um chef (os tensor cores) cozinha muito rápido, mas os ingredientes vêm de uma despensa no fim do corredor (a memória), trazidos por um único carrinho (a banda). Se cada ingrediente que chega vira um prato só (GEMV), o chef passa o dia esperando o carrinho. Se cada ingrediente serve mil pratos (a GEMM do prefill), quem espera é o carrinho. O ridge é o número de pratos por ingrediente em que os dois empatam.</p></div>
+  <p>Na figura, mova \(M\) e troque o formato do peso. Depois ligue o modo MoE para ver o que acontece quando as \(M\) linhas são repartidas entre 288 experts, como no GLM.</p>
+  <figure class="la-fig" id="fig-roofline" data-title="Roofline do GB10">
+    <div class="la-fig-stage" style="height:450px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Roofline com os números que as receitas usam: ~125 TFLOPS BF16 (estimativa) e 273 GB/s. O ponto pulsante é uma projeção 4096 × 4096 com \(M\) linhas ou, no modo MoE, um expert do GLM em TP=2 (gate_up 4096 × 2048 e down 1024 × 4096). A intensidade conta pesos <b>e</b> ativações BF16, pela fórmula completa; o quadro no alto mostra também a aproximação só de pesos. No modo MoE, cada expert recebe \(r = Mk/D\) linhas, com \(D\) = experts distintos acesos (\(\approx Mk/E\) quando todos acendem; \(E = 288\), \(k = 8\)). As marcas fixas são casos das receitas, calculados da mesma forma. O pico FP4×FP8 (~4× o BF16) é a estimativa do relatório do DeepSeek.</figcaption>
+  </figure>
+  <p>O modo MoE traz a surpresa do capítulo. Um pedaço de prefill de 1.024 tokens parece grande, mas com top-8 entre 288 experts cada expert recebe em média só ~28 linhas:</p>
+  <div class="la-eq">
+    \[ r \;\approx\; \frac{M\,k}{E} = \frac{1024 \times 8}{288} \approx 28 \qquad\Longrightarrow\qquad I_{\text{expert}} \approx \frac{2r}{b_w} = \frac{2\times 28}{0{,}5} \approx 112\ \text{FLOP/B} \;<\; 458 \]
+    <ul class="la-eq-legend">
+      <li>\(r\): linhas que cada expert processa no passo</li>
+      <li>\(k\): experts por token (<code>num_experts_per_tok</code>)</li>
+      <li>\(E\): experts roteados por camada</li>
+      <li>\(b_w = 0{,}5\): pesos EXL3 de 4 bits por peso</li>
+    </ul>
+  </div>
+  <p>Mesmo no prefill, os experts ficam limitados por banda (~100 FLOP/B contando também as ativações). O estudo de prefill do repositório GLM <b>estima</b> ~75,6 GB lidos por GPU por pedaço (todos os 288 experts das 42 camadas MoE), ~330 ms de streaming a ~230 GB/s. O pedaço <b>medido</b> levava ~1,08 s (29/08), três vezes esse limite: o gargalo real era o kernel. O profiler pôs 63% do passo na camada MoE, que ainda desviava para um laço em Python, com sincronização da CPU, sempre que algum expert recebia mais de 128 linhas.</p>
+  <p>A receita atacou as duas frentes: pedaços de 7.168 tokens e kernels novos. Com ~199 linhas por expert, \(2r/b_w\) daria ~800 FLOP/B, quase o dobro do ridge, mas a aproximação já não vale: com pesos de 4 bits, \(r \approx 200\) não é pequeno perto de \(\tfrac14 \cdot KN/(K+N)\), e as ativações BF16 pesam quase tanto quanto os pesos. A conta completa, nas formas locais de um expert do GLM em TP=2:</p>
+  <div class="la-eq">
+    \[ \text{FLOPs} = 2 \times 199 \times 12{,}6\,\text{M} \approx 5{,}0\ \text{GFLOP} \qquad \text{Bytes} \approx \underbrace{6{,}3\ \text{MB}}_{\text{pesos, 4 bits}} + \underbrace{3{,}7\text{–}4{,}5\ \text{MB}}_{\text{ativações BF16}} \qquad I \approx 460\text{–}500\ \text{FLOP/B} \;\approx\; I^{*} \]
+    <ul class="la-eq-legend">
+      <li>12,6 M: pesos de um expert por rank, \(4096 \times 2048\) (gate_up) \(+\ 1024 \times 4096\) (down)</li>
+      <li>ativações: \(b_a\, r\,(K+N)\) somado nas duas projeções; o valor menor vale quando o kernel funde o intermediário e ele não volta inteiro à memória</li>
+      <li>\(I^{*} \approx 458\): o ridge do GB10 em BF16</li>
+    </ul>
+  </div>
+  <p>O MoE <b>chega</b> ao ridge e deixa de ser claramente limitado por banda, sem atravessá-lo com folga. A medição confirma: os kernels E3 para experts “gordos” levaram uma camada MoE de 7.168 tokens de 77–91 ms (kernels E2) para 31 ms, ~46 TFLOPS por rank, enquanto ler os ~3 GB de pesos e ativações da camada levaria ~13 ms (cálculo nosso). O limite passou a ser o cálculo e a eficiência do kernel. O prefill frio foi de 947 tok/s (100k, pedaços de 1.024, 29/08) para 1.428–1.587 tok/s (de 8k a 256k, 07/09), e ainda há folga: os 947 tok/s eram ~34 TFLOPS somados nos dois GB10, uns 14% do pico.</p>
+  <p>E o <span class="la-term" data-term="lm-head">lm_head</span>? No GLM é uma matriz BF16 de 154.880 × 4.096 que, no decode, recebe só as posições verificadas: \(M = 8\) num passo DFlash2 (7 rascunhos + 1), \(I \approx 2 \times 8/2 = 8\) FLOP/B, a marca “lm_head ×8”. Matriz grande, poucas linhas: por isso ela aparece no tanque de bytes da próxima seção.</p>
+  <div class="la-callout deep"><b class="t">Aprofundamento: o que o roofline não vê</b><p>O roofline é um limite superior, não uma previsão. Ele ignora lançamento de kernels, sincronizações com a CPU, ocupação baixa e reuso imperfeito dos dados no cache do chip, e com \(M\) grande as ativações também entram em \(Q\) (por isso \(I\) satura). Com pesos quantizados há mais uma pegadinha: se o kernel desquantiza para BF16 antes da multiplicação (W4A16), o teto de compute é o do BF16. O relatório do DeepSeek estima que tensor cores FP4×FP8 teriam ~4× esse pico, e é por isso que o caminho W4A16 do b12x serve bem ao decode (banda) e mal ao prefill (cálculo). Troque o pico na figura e veja o ridge andar para ~1.830 FLOP/B.</p></div>
+  <div class="la-inrecipe" data-recipe="glm"><div class="la-inrecipe-h"><span class="la-rb glm"></span><span class="k">Parâmetros</span><code>GLM53_KDA_BF16_LARGE_M=1 · KDA_BF16_LARGE_M_MIN_M = 512</code></div><div class="la-inrecipe-b"><p>A projeção de entrada do KDA (<code>in_proj_qkvbfg_a</code>) roda em FP8 weight-only pelo Marlin, que é ótimo com poucas linhas. No prefill, com \(M = 7.168\), o Marlin leva 27,21 ms; uma GEMM BF16 do cuBLAS, 7,36 ms. A receita guarda uma cópia BF16 do <b>mesmo peso lógico</b> (e4m3 × escala, exato em fp32 e arredondado uma vez para BF16) e despacha pelo número de linhas: acima de 512, cuBLAS BF16; até 512, Marlin. O limiar é fixo (não configurável), para que captura e replay de CUDA graphs concordem, e cai no vão entre as fases: nos passos medidos o decode nunca passou de \(M = 220\), e o prefill ficou sempre em \(M \ge 768\). Resultado: TTFT frio −11,4% (16k) e −12,3% (100k), ao custo de +3,29 GiB por rank. O <code>.env.example</code> liga (<code>1</code>); sem <code>.env</code>, o <code>start.sh</code> assume <code>0</code>, e o launcher TP3 também desliga.</p></div></div>
+</section>
+
+<section class="la-sec">
+  <h2>Decode: ler o modelo inteiro a cada passo</h2>
+  <p>Se o decode é limitado por banda, o tempo de um passo é, em primeira aproximação, o número de bytes que ele lê dividido pela banda efetiva:</p>
+  <div class="la-eq">
+    \[ t_{\text{passo}} \;\approx\; \frac{Q_{\text{passo}}}{\beta_{\text{ef}}} + t_{\text{fixo}} \qquad\qquad \text{tok/s por sequência} \;\approx\; \frac{\tau}{t_{\text{passo}}} \]
+    <ul class="la-eq-legend">
+      <li>\(Q_{\text{passo}}\): bytes lidos por GPU no passo (pesos ativos, <code>lm_head</code>, KV e estado, rascunhador)</li>
+      <li>\(\beta_{\text{ef}}\): banda efetiva (230–250 GB/s no GB10)</li>
+      <li>\(t_{\text{fixo}}\): lançamentos, coletivas de rede, passadas seriais do rascunhador, amostragem</li>
+      <li>\(\tau\): tokens entregues por passo (1 sem especulação; aceitos + 1 com especulação, porque a verificação sempre entrega um <span class="la-term" data-term="token-bonus">token bônus</span>)</li>
+    </ul>
+  </div>
+  <p>É a conta de guardanapo do <a data-ch="mapa-da-jornada">Mapa da jornada</a>, agora com o conteúdo real de \(Q\). Em modelos MoE, “pesos ativos” são as camadas densas inteiras mais os experts <i>distintos</i> escolhidos pelos tokens do passo. Nessa leitura contínua de pesos, o <span class="la-term" data-term="streaming-de-pesos">streaming de pesos</span>, cada byte vale tempo.</p>
+  <p>Na figura, escolha uma receita. O tanque é o que cada GPU lê num passo de decode com um usuário, e ele esvazia pelo cano da banda. Ajuste a banda, os tokens por passo e os custos fixos e compare três números: o teto só de streaming, a previsão com \(t_{\text{fixo}}\) e o valor medido.</p>
+  <figure class="la-fig" id="fig-bytes-passo" data-title="O tanque de bytes do decode">
+    <div class="la-fig-stage" style="height:420px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Composição dos bytes lidos por GPU num passo de decode com um usuário. Qwen: relatório de revisão (≈9,2 GiB, passo MTP=3, vocabulário completo), \(\tau \approx 3{,}2\) (2,2 aceitos + 1 bônus), medido 52,1 tok/s com MTP=3 e KV BF16. DeepSeek: relatório de auditoria (≈16,5–17 GB por rank), mediana de 56 tok/s em 02/09 (faixa de 51 a 67). GLM: estimativa didática do inventário (≈23 GB, passo DFlash2 com 8 posições), medido 65,1 tok/s em texto estruturado (30/08). O \(t_{\text{fixo}}\) inicial é o do relatório no DeepSeek (10–15 ms) e, no Qwen e no GLM, o que sobra do passo medido depois do streaming (inferido). Mudar “tokens por passo” altera só o numerador (simplificação: verificar mais posições também acende mais experts). O controle de contexto soma a leitura do KV de uma atenção densa GQA-8 BF16 <b>hipotética</b>.</figcaption>
+  </figure>
+  <p>No Qwen, o relatório de revisão soma ≈9,2 GiB (9,9 GB) por GPU por passo, e o <code>lm_head</code> lido 4 vezes (a verificação MTP de 4 posições mais os rascunhos) já responde por 26% disso. A 273 GB/s seriam 36 ms; aos 235–245 GB/s reais, 40–42 ms, ou 24–25 passos por segundo. E cada passo entrega quantos tokens? Com MTP=3, a aceitação medida por posição foi 89%, 74,5% e 60%, ou ≈2,2 rascunhos aceitos; com o token bônus da verificação, \(\tau \approx 3{,}2\). O teto só de streaming fica em ~75–80 tok/s, mas o medido com MTP=3, um usuário e amostragem gulosa foi <b>52,1 tok/s</b> (KV BF16 e vocabulário completo, a configuração do modelo de bytes). A diferença é o \(t_{\text{fixo}}\): o README mediu passos de ~60 ms com um stream (59,9 ms em prosa, 61,2 ms em código, 2,9 a 3,8 tokens por passo). O streaming explica uns dois terços do passo; o resto são as três passadas seriais do rascunhador, ~106 coletivas de rede (2–3 ms) e a amostragem. O relatório concluiu que o decode com um usuário “já está no roofline de banda”, mas comparou o modelo de bytes com uma medição antiga (55,8 tok/s, sem MTP e com outros pesos) e usou os 2,2 aceitos sem o bônus. Lição de método: antes de fechar a conta, confira de que configuração vem o número medido.</p>
+  <p>No DeepSeek, ≈16,5–17 GB por rank levam 68–74 ms a 230–250 GB/s, num passo que ainda paga ~10–15 ms fixos (≈108 coletivas, 3–5 ms, mais lançamentos e o laço serial do rascunhador): na conta da auditoria, ~80% do passo é streaming de pesos. Com \(\tau \approx 4{,}15\) (3,15 aceitos + 1 bônus: a soma da aceitação por posição medida na auditoria), só o streaming limitaria o decode a 56–61 tok/s. A auditoria atribuiu os 62–83 tok/s publicados a uma banda efetiva “um pouco melhor que a suposta”, mas eles vêm de prompts com aceitação maior: em código, 73,3% de aceitação dá \(1 + 6 \times 0{,}733 \approx 5{,}4\) tokens por passo (interpretação, detalhada em <a data-ch="benchmarking">Medindo desempenho</a>). A mediana de 02/09 foi 56 tok/s (51 a 67).</p>
+  <p>Essa equação explica, de uma vez, as quatro grandes alavancas de decode que voltam ao longo da plataforma:</p>
+  <ol class="la-steps">
+    <li><b>Menos bits por peso</b> (<a data-ch="quantizacao-fundamentos">quantização</a>). \(Q\) cai quase linearmente com os bits. As três receitas guardam os experts em ~4 bits.</li>
+    <li><b>Menos pesos ativos</b> (<a data-ch="mixture-of-experts">MoE</a>). Só os experts escolhidos entram em \(Q\): 8 de 288 por token no GLM, 10 de 512 no Qwen, 6 de 256 no DeepSeek, cada um somado a 1 expert compartilhado sempre ativo.</li>
+    <li><b>Mais tokens por leitura</b> (<a data-ch="especulacao-fundamentos">especulação</a>). \(\tau\) sobe sem que \(Q\) suba na mesma proporção: no Qwen, MTP=3 levou o decode de 24,5 para 52,1 tok/s (2,13×). Verificar posições demais também custa, porque cada posição acende experts: o <span class="la-term" data-term="adaptive-k">adaptive-k</span> do GLM verifica só 2, 4 ou 7 dos 7 rascunhos, conforme a aceitação recente, e rendeu +13–21% em prosa.</li>
+    <li><b>Menos bytes fora dos experts.</b> O GLM converte o KDA e as projeções densas para FP8 weight-only (~2,6 GB e ~11 ms a menos por passo); o Qwen encolhe o vocabulário do rascunhador para aliviar o <code>lm_head</code>.</li>
+  </ol>
+  <p>E há o \(t_{\text{fixo}}\), que a figura deixa você mexer. O Qwen faz ~106 coletivas de rede por passo (2–3 ms), o DeepSeek ≈108 (3–5 ms). Elas são pequenas e presas à latência, e não diminuem quando os bytes caem, assunto do capítulo <a data-ch="nccl-rdma">Comunicação</a>. Parte do que sobra é eficiência de kernel, e aí a alavanca é outra: o <i>thin-decode</i> do GLM (<code>GLM53_EXL3_MOE_FAST=1</code>, kernels MoE K4/N256 que eliminam os spills de registrador) rendeu +7,7% a +14,6% de decode com um stream sem mudar um byte lido.</p>
+  <div class="la-callout warn"><b class="t">Armadilha: contexto longo com atenção densa</b><p>Numa atenção densa, cada passo relê o KV inteiro da sequência, e \(Q\) cresce com o contexto. Com uma GQA-8 BF16 típica de 43 camadas (176 KB por token), uma conversa de 128 mil tokens somaria ~23 GB de KV relidos a cada passo, ~11,5 GB por GPU com TP=2, o equivalente a 70% de tudo o que o DeepSeek lê por rank (cálculo ilustrativo; use o controle de contexto da figura). As três receitas escapam disso pela arquitetura: <a data-ch="atencao-esparsa">atenção esparsa</a> ou <a data-ch="atencao-linear">híbrida</a> lê só uma fração do contexto. No Qwen, passar de 1 mil para 600 mil tokens de contexto custa só 2–8% de decode.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>KV cache: não recalcular o passado</h2>
+  <p>Relembre a <a data-ch="atencao">atenção</a> vista do token \(t\), numa camada e numa cabeça:</p>
+  <div class="la-eq">
+    \[ q_t = W_Q\,h_t,\quad k_j = W_K\,h_j,\quad v_j = W_V\,h_j \qquad s_{tj} = \frac{q_t\cdot k_j}{\sqrt{d_h}} \qquad \alpha_{t\cdot} = \operatorname{softmax}(s_{t\cdot}) \qquad o_t = \sum_{j\le t} \alpha_{tj}\, v_j \]
+    <ul class="la-eq-legend">
+      <li>\(h_j\): estado do token \(j\) na entrada da camada</li>
+      <li>\(q_t\): a query do token atual; \(k_j, v_j\): chave e valor do token \(j\)</li>
+      <li>\(d_h\): dimensão da cabeça</li>
+      <li>\(s_{tj}\): nota de afinidade; \(\alpha_{tj}\): peso depois da softmax</li>
+      <li>\(o_t\): saída da cabeça para o token \(t\)</li>
+    </ul>
+  </div>
+  <p>Olhe para o que o token \(t\) precisa: a própria query e as chaves e valores de todos os tokens \(j \le t\). Pela <span class="la-term" data-term="mascara-causal">máscara causal</span>, nenhum token enxerga o futuro, então \(h_j\) depende só dos tokens \(1,\dots,j\). Ele é o mesmo no passo \(t\) e no passo \(t + 1000\), e portanto \(k_j\) e \(v_j\) também são. Recalculá-los a cada passo seria trabalho jogado fora. O motor calcula uma vez, guarda e depois só lê. Esse arquivo, por camada e por cabeça, é o KV cache.</p>
+  <p>Daí vem o nome <i>prefill</i>: a primeira fase preenche o cache com os K e V de todos os tokens do prompt de uma só vez. Cada passo de decode calcula \(q\), \(k\) e \(v\) de um único token novo, arquiva \(k\) e \(v\) e lê todas as linhas anteriores. Na figura, um exemplo de brinquedo com uma cabeça de 4 dimensões e 4 tokens já no cache. Siga os passos com os números nas células; depois ligue “sem KV cache” e compare quantas projeções cada passo precisaria refazer.</p>
+  <figure class="la-fig wide" id="fig-kv-mecanismo" data-title="Um passo de decode, com e sem cache">
+    <div class="la-fig-stage" style="height:450px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Cabeça ilustrativa com \(d_h = 4\) e valores sintéticos. Linhas acinzentadas no cache foram calculadas em passos anteriores; a linha brilhante é a do token novo. Com o cache desligado, as projeções de todas as linhas se repetem a cada passo (contador no rodapé), embora o resultado seja idêntico. E a figura mostra só uma camada: como o \(h_j\) de cada linha vem das camadas de baixo, sem cache elas também teriam de ser refeitas.</figcaption>
+  </figure>
+  <p>Com o cache, cada passo faz uma projeção nova de K e V por camada e por cabeça e lê \(t\) linhas. Sem ele, o custo é bem maior do que refazer \(t\) projeções de K e V. O \(h_j\) que entra numa camada é a saída das camadas de baixo, então, para obter \(k_j\) e \(v_j\) de novo, é preciso refazer o forward completo dos \(t\) tokens em todas as camadas, com MLP, experts e atenção: um prefill inteiro por token gerado. Contando em token-forwards (um token atravessando o modelo inteiro):</p>
+  <div class="la-eq">
+    \[ \underbrace{\sum_{t=1}^{n} t \;=\; \frac{n(n+1)}{2}}_{\text{token-forwards sem cache}} \qquad\text{contra}\qquad \underbrace{n}_{\text{com cache}} \]
+    <ul class="la-eq-legend">
+      <li>\(n\): tokens processados na sequência (prompt + resposta)</li>
+      <li>com \(n = 100.000\): 100 mil token-forwards contra 5 bilhões</li>
+    </ul>
+  </div>
+  <p>O cache troca cálculo por memória. É o que torna o decode viável e, ao mesmo tempo, o maior consumidor de memória dinâmica em contexto longo. E como cada passo relê as linhas guardadas, ele também pesa na banda sempre que a atenção é densa.</p>
+  <div class="la-callout deep"><b class="t">Aprofundamento: o que exatamente fica guardado</b><p>Guarda-se K e V depois da projeção, por camada, por cabeça KV e por token. Nos modelos com <a data-ch="posicao-rope">RoPE</a>, a chave já vai com a rotação aplicada. A query não é guardada, porque só serve ao próprio token, e o estado \(h\) também não. Em camadas de atenção linear, em vez de uma linha por token guarda-se um <span class="la-term" data-term="estado-fixo">estado de tamanho fixo</span> (<a data-ch="atencao-linear">Atenção linear</a>); na <span class="la-term" data-term="mla">MLA</span>, um vetor latente comprimido do qual K e V são reconstruídos (<a data-ch="mla">Encolhendo o KV</a>). As duas ideias atacam o tamanho do cache, que é o assunto da próxima seção.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Quanto pesa um token de contexto</h2>
+  <p>Numa atenção clássica, cada camada guarda, por token, uma chave e um valor para cada cabeça KV. A conta de bytes por token de contexto é um produto de quatro fatores, e a de uma sequência inteira soma um custo fixo:</p>
+  <div class="la-eq">
+    \[ b_{\text{tok}} \;=\; L_{kv} \times n_{kv} \times (d_k + d_v) \times b \qquad\qquad \text{KV}_{\text{seq}}(c) \;=\; c\cdot b_{\text{tok}} + S_{\text{fixo}} \]
+    <ul class="la-eq-legend">
+      <li>\(b_{\text{tok}}\): <span class="la-term" data-term="bytes-por-token">bytes por token</span> de contexto (da mesma família de \(b_w\) e \(b_a\): bytes por alguma coisa)</li>
+      <li>\(L_{kv}\): camadas que guardam KV por token</li>
+      <li>\(n_{kv}\): cabeças de K/V por camada (<code>num_key_value_heads</code>)</li>
+      <li>\(d_k, d_v\): dimensões da chave e do valor (com \(d_k = d_v = d_h\), o fator vira \(2\,d_h\))</li>
+      <li>\(b\): bytes por número (2 em BF16, 1 em FP8)</li>
+      <li>\(c\): tokens no contexto da sequência</li>
+      <li>\(S_{\text{fixo}}\): estado que não cresce com \(c\) (camadas lineares, janelas deslizantes)</li>
+    </ul>
+  </div>
+  <p>O fator \(n_{kv}\) merece nome e sobrenome, porque é onde a arquitetura mais mexe. Na atenção multi-cabeça clássica, a <span class="la-term" data-term="mha">MHA</span>, cada cabeça de query tem o seu próprio par K/V, e \(n_{kv}\) é igual ao número de cabeças. Na <span class="la-term" data-term="gqa">GQA</span> (<i>grouped-query attention</i>), grupos de cabeças de query dividem o mesmo par: cada cabeça continua fazendo a sua pergunta \(q\), mas todas as do grupo consultam as mesmas chaves e valores. Na <span class="la-term" data-term="mqa">MQA</span> (<i>multi-query attention</i>), um único par serve a todas as cabeças. Como as queries não vão para o cache, só \(n_{kv}\) entra na conta: GQA e MQA encolhem o KV sem reduzir as cabeças que perguntam, ao preço de cabeças que dividem K/V verem o passado pela mesma lente (o capítulo <a data-ch="mla">MLA</a> mostra como contornar isso).</p>
+  <p><b>Qwen3.8-Flash-Next.</b> Só 13 camadas guardam KV por token: as 12 de atenção QSA (1 a cada 4 das 48) e a camada MTP. Cada uma tem \(n_{kv} = 2\) cabeças KV compartilhadas pelas 24 cabeças de query (uma GQA de 12 queries por par K/V) e <code>head_dim</code> = 256. Em BF16: \(13 \times 2 \times (256 + 256) \times 2 = 26.624\) bytes por token; em FP8, 13.312. Com TP=2, cada GPU fica com uma das duas cabeças, e o custo por GPU cai à metade (6.656 B em FP8). O pool medido dá 9.418 B por token por GPU em FP8, 41% acima da conta pura: o excesso vem do indexador e do compressor em BF16, do estado das camadas GDN e da PLE e do arredondamento de página.</p>
+  <p><b>Um GLM hipotético com MHA.</b> Se as 45 camadas do GLM-5.3-Flash fossem uma atenção multi-cabeça clássica em BF16 (64 cabeças, K e V de 256), seriam \(45 \times 64 \times 512 \times 2 = 2.949.120\) bytes, ~2,95 MB por token e ~2,95 TB para um milhão de tokens. Nenhuma receita sobreviveria.</p>
+  <p><b>O GLM como servido</b> guarda KV em só 11 das 45 camadas, e num formato comprimido (MLA): 656 bytes por camada no registro <code>fp8_ds_mla</code> mais 33 do cache do indexador, ou \(11 \times (656 + 33) = 7.579\) bytes por token por rank, 7,06 GiB por milhão de tokens. As 34 camadas KDA guardam um estado fixo (\(32\) cabeças × \(128 \times 128\) em FP32 por rank, mais o estado de convolução), ~76 MiB por requisição por rank. <b>O DeepSeek-V4-Flash</b> comprime o próprio KV (1 entrada a cada 4 ou a cada 128 tokens, conforme a camada) e chega a ≈3.850 bytes por token, mais ≈3,44 MB fixos por sequência das janelas deslizantes. Os capítulos <a data-ch="mla">MLA</a>, <a data-ch="atencao-esparsa">Atenção esparsa</a> e <a data-ch="kv-cache-quantizado">KV quantizado</a> desmontam cada um desses números.</p>
+  <p>Na figura, o KV cache de uma sequência aparece como um tensor 3D: cada placa é uma camada, cada linha um token, cada coluna uma fatia das cabeças. Embaixo, uma faixa mostra quem consulta o quê: as cabeças de query de cada modelo apontando para o K/V que compartilham. Troque o modelo e o número de tokens e ligue a divisão por TP.</p>
+  <figure class="la-fig" id="fig-kv-tensor" data-title="O KV cache como tensor">
+    <div class="la-fig-stage pad" style="min-height:340px"></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Tensor ilustrativo com 4 camadas × 12 posições × 8 colunas. Em “MHA”, todas as camadas crescem. Em Qwen e GLM vale o padrão 3:1 dos híbridos: só 1 camada a cada 4 guarda linhas por token (a placa da frente); as outras guardam um bloco de estado (listrado) que não cresce. Na faixa de baixo, cada bolinha é uma cabeça de query e cada caixa um par K/V guardado: na MHA, uma caixa por cabeça; na GQA do Qwen, 24 queries para 2 caixas; na MLA do GLM, todas as cabeças leem um único latente. Com TP=2, as cabeças de uma GQA se dividem entre as GPUs, mas o latente da MLA (uma cabeça só) fica <b>replicado</b>: as células bicolores são cópias nas duas GPUs. Os bytes nos mostradores são os reais de cada modelo.</figcaption>
+  </figure>
+  <p>O efeito de TP é o detalhe que mais engana quem monta uma receita pela primeira vez. Numa GQA com \(n_{kv}\) divisível pelo grau de TP, cada GPU guarda só as suas cabeças, e o KV por GPU cai na mesma proporção. Na MLA e na MQA há uma única “cabeça” de KV, que não dá para fatiar: cada rank guarda o latente inteiro. Por isso o KV do GLM e do DeepSeek por GPU <b>não</b> diminui com TP=2. Os dois ranks guardam cópias idênticas, e o ganho de TP vem de outro lugar: menos pesos por GPU deixam mais memória livre para o pool.</p>
+  <div class="la-table-wrap"><table>
+    <thead><tr><th>Configuração</th><th>O que cresce por token</th><th>Bytes por token</th><th>10⁶ tokens</th><th>Custo fixo por sequência</th></tr></thead>
+    <tbody>
+      <tr><td>MHA BF16 (GLM hipotético)</td><td>45 camadas × 64 cabeças × (256 + 256)</td><td>2.949.120</td><td>~2,95 TB</td><td>—</td></tr>
+      <tr><td>GQA-8 BF16 típica (43 camadas)</td><td>43 × 8 × (128 + 128)</td><td>176.128</td><td>~176 GB</td><td>—</td></tr>
+      <tr><td><span class="la-rb qwen"></span> Qwen, KV BF16</td><td>13 × 2 × (256 + 256)</td><td>26.624 (13.312/GPU)</td><td>~26,6 GB</td><td>estado GDN: 54 MiB/GPU em fp32 (27 em bf16)</td></tr>
+      <tr><td><span class="la-rb qwen"></span> Qwen, KV FP8</td><td>idem, 1 byte</td><td>13.312 (6.656/GPU)</td><td>~13,3 GB</td><td>idem</td></tr>
+      <tr><td><span class="la-rb glm"></span> GLM servido</td><td>11 × (656 MLA + 33 indexador)</td><td>7.579 por rank (replicado)</td><td>7,58 GB (7,06 GiB)/rank</td><td>KDA: ~76 MiB/rank</td></tr>
+      <tr><td><span class="la-rb ds"></span> DeepSeek servido</td><td>21 C4A + 20 C128A + indexador</td><td>≈3.850 por rank (replicado)</td><td>≈3,85 GB/rank</td><td>janelas SWA: ≈3,44 MB</td></tr>
+      <tr><td>MiMo-V2.6-Flash (tutorial)</td><td>9 camadas globais × 2 cabeças/rank × (192 + 128)</td><td>5.760/rank em FP8</td><td>~5,76 GB/rank</td><td>janelas SWA: ≈10–13 MB/rank</td></tr>
+    </tbody>
+  </table></div>
+  <div class="la-inrecipe" data-recipe="qwen"><div class="la-inrecipe-h"><span class="la-rb qwen"></span><span class="k">Parâmetro</span><code>KV_BYTES_PER_TOKEN=29482</code></div><div class="la-inrecipe-b"><p>O launcher de um Spark só (<code>tp1/start.sh</code>) calcula o orçamento de memória antes de subir o vLLM. Com TP=1, as duas cabeças KV ficam na mesma GPU, e a conta teórica em BF16 (26.624 B) mais indexador, estado e arredondamento dá os 29.482 B por token <b>medidos</b> (28,8 KiB) que o script usa: <code>kv_need = MAX_MODEL_LEN × KV_BYTES_PER_TOKEN × KV_MULT / 2³⁰</code>, com <code>KV_MULT = 0,5</code> para KV em FP8. Com o default <code>MAX_MODEL_LEN=65536</code> em BF16: \(65.536 \times 29.482 / 2^{30} \approx 1{,}80\) GiB por conversa cheia. O orçamento usa o maior entre esse valor e <code>KV_TARGET_GIB</code> (8 GiB por padrão; 20 GiB no exemplo, “~686 mil tokens”, e o boot registrou 685.825). Usar o número medido, e não o teórico, é o que impede o launcher de prometer um contexto que não cabe.</p></div></div>
+  <div class="la-callout why"><b class="t">Por que isso importa</b><p>A fórmula tem cinco alavancas, e cada receita puxou uma combinação diferente. \(L_{kv}\) encolhe nos modelos híbridos (Qwen e GLM guardam KV em 1 de cada 4 camadas). \(n_{kv}\) e \(d\) encolhem com GQA, MQA e MLA. \(b\) encolhe com o KV quantizado. E ler só uma parte do contexto (atenção esparsa) corta a banda sem mudar a capacidade. Diante de um <code>config.json</code> novo, essa conta, feita antes de baixar os pesos, diz se o contexto que você quer cabe.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Contexto longo × concorrência: a mesma memória</h2>
+  <p>A memória que o vLLM pode usar em cada nó se divide em fatias: os pesos; o pico de ativações (medido num <span class="la-term" data-term="profile-run">profile run</span> com o maior lote); os buffers de CUDA graphs e as alocações fora do PyTorch; e o que sobra, o <span class="la-term" data-term="pool-de-kv">pool de KV</span>. No GB10 essa conta ainda disputa espaço com o sistema operacional, porque a memória é <a data-ch="memoria-unificada">unificada</a>. O boot do Qwen com <code>--gpu-memory-utilization 0.835</code> mostra as fatias reais de uma GPU:</p>
+  <dl class="la-kv">
+    <dt>121,69 GiB</dt><dd>memória total visível ao CUDA no GB10</dd>
+    <dt>101,61 GiB</dt><dd>orçamento do vLLM (0,835 × total); o resto fica para o host</dd>
+    <dt>64,46 GiB</dt><dd>pesos (68,52 GiB somando as alocações fora do PyTorch)</dd>
+    <dt>1,07 GiB</dt><dd>pico de ativações; 0,54 GiB de CUDA graphs</dd>
+    <dt>32,02 GiB</dt><dd>pool de KV: 3.652.200 tokens em FP8</dd>
+  </dl>
+  <p>O pool é um só para todas as conversas. A regra que governa o que cabe é uma desigualdade:</p>
+  <div class="la-eq">
+    \[ N_{\text{tok}} = \frac{\text{Pool}}{b_{\text{tok}}} \qquad\qquad \sum_{i=1}^{n_{\text{seq}}} c_i \;\le\; N_{\text{tok}} \qquad\qquad \text{concorrência máx.}(L) = \frac{N_{\text{tok}}}{L} \]
+    <ul class="la-eq-legend">
+      <li>\(N_{\text{tok}}\): tokens que o pool comporta, somando todas as conversas</li>
+      <li>\(c_i\): tokens vivos da conversa \(i\) (prompt + gerados)</li>
+      <li>\(n_{\text{seq}}\): conversas ativas no motor</li>
+      <li>\(L\): comprimento por conversa usado no cálculo do boot (o <code>max_model_len</code>)</li>
+    </ul>
+  </div>
+  <p>No Qwen, 3.652.200 tokens a 262.144 por conversa dão 13,93 conversas cheias ao mesmo tempo. Com KV em BF16, o mesmo boot tinha 2.131.159 tokens, só 8,13 conversas: trocar o dtype do KV comprou +71% de capacidade (não 2×, porque o indexador, o compressor e o estado GDN continuam em BF16). A capacidade não saiu de graça: −5,3% de throughput médio (−1,4% em prosa, −9,2% em código), porque com chaves FP8 o indexador QSA escolhe blocos diferentes e os tokens por passo caem; e um aviso upstream relata um benchmark de raciocínio longo caindo de 6/6 para 2/6 na implementação de referência. Capacidade contra velocidade e fidelidade. No DeepSeek, 17,04 GiB viram 2.331.430 tokens e “2,22×” a 1M, pela contabilidade do alocador, que conta ≈7,8 KB por token (o custo físico é ≈3,85 KB, porque os quatro grupos de KV compartilham páginas do mesmo tamanho). No GLM, os pesos somam 163,6 GiB (79,65 GiB carregados por rank, 82,94 com a cópia BF16 do KDA), e o KV é fixado em 11 GiB por GPU (<code>--kv-cache-memory-bytes 11811160064</code>), o que dá 1.233.779 tokens e 1,45× a 850 mil.</p>
+  <p>Duas flags aparecem aqui e costumam ser mal lidas. <span class="la-term" data-term="max-model-len"><code>--max-model-len</code></span> (GLM 850.000; Qwen 262.144; DeepSeek 1.048.576) e <span class="la-term" data-term="max-num-seqs"><code>--max-num-seqs</code></span> (GLM 4; Qwen 8; DeepSeek 6) são <b>tetos, não reservas</b>. O primeiro limita o comprimento de uma conversa; o segundo, quantas o scheduler admite num passo. Nenhum dos dois separa memória. O limite real é a soma de tokens vivos contra o pool. Na figura, com os números medidos do Qwen, tente encaixar conversas longas e muitas conversas ao mesmo tempo.</p>
+  <figure class="la-fig" id="fig-pool" data-title="O pool de KV é um só">
+    <div class="la-fig-stage" style="height:362px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Em cima, o orçamento medido de uma GPU do Qwen (TP2, GMU 0,835). Embaixo, o pool de KV com as conversas (cores) ocupando espaço proporcional aos seus tokens. Quem passa de <code>max_num_seqs = 8</code> espera na fila; quem não cabe no pool também fica de fora (ou provoca preempção). Simplificações: toda conversa tem o mesmo comprimento, e o custo por token usado (9.418 B por GPU em FP8) já dilui o estado fixo de cada conversa (GDN, ~54 MiB por GPU) no contexto de 262 mil tokens do boot. Em contextos menores esse estado pesa mais por token, então cabem menos conversas do que a divisão sugere.</figcaption>
+  </figure>
+  <p>Contexto e concorrência competem pelo mesmo recurso. Uma única conversa de 1 milhão de tokens no DeepSeek ocupa quase metade do pool pela contabilidade do alocador; no Qwen, oito conversas de 262 mil tokens usam 57% do pool FP8, mas não caberiam na versão BF16 (98%, sem folga para crescer). É por isso que quem desenha a arquitetura comprime o KV, e quem monta a receita escolhe o dtype do KV e a fatia de memória reservada a ele antes de qualquer outro ajuste fino.</p>
+  <div class="la-callout warn"><b class="t">Armadilha: “GPU KV cache size” em modelos híbridos</b><p>Em modelos com grupos de KV diferentes (atenção, estado linear, janelas, rascunhador), o número impresso no boot como <code>GPU KV cache size: N tokens</code> é calculado como concorrência máxima × <code>max_model_len</code>, e não é o tamanho do cache de prefixos nem a soma física de linhas. A receita GLM ganhou um overlay só para imprimir o detalhamento por grupo. O capítulo <a data-ch="paged-attention-kv">PagedAttention</a> mostra como o pool é medido, paginado e dividido.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Medindo as duas fases: TTFT, TPOT e tokens por segundo</h2>
+  <p>As tabelas das três receitas usam sempre as mesmas métricas. Chame de \(t_0\) o envio da requisição, \(t_1\) a chegada do primeiro token, \(t_N\) a do último, \(P\) os tokens do prompt e \(N\) os gerados:</p>
+  <div class="la-eq">
+    \[ \text{TTFT} = t_1 - t_0 \qquad \text{prefill tok/s} = \frac{P}{\text{TTFT}} \qquad \text{TPOT} = \frac{t_N - t_1}{N - 1} \qquad \text{tok/s por stream} = \frac{1}{\text{TPOT}} \]
+    \[ \text{tok/s agregado} = \frac{\sum_i N_i}{\text{duração da rajada}} \qquad\qquad \text{E2EL} = t_N - t_0 = \text{TTFT} + (N-1)\,\text{TPOT} \]
+    <ul class="la-eq-legend">
+      <li><span class="la-term" data-term="ttft">TTFT</span>: fila + prefill + primeira amostragem</li>
+      <li><span class="la-term" data-term="prefill-tok-s">prefill tok/s</span>: só vale com servidor ocioso e cache de prefixo frio</li>
+      <li><span class="la-term" data-term="tpot">TPOT</span>: tempo médio por token de saída, sem o primeiro</li>
+      <li><span class="la-term" data-term="itl">ITL</span>: intervalo entre dois eventos do stream (com especulação, um evento traz vários tokens)</li>
+      <li><span class="la-term" data-term="tok-s-por-stream">tok/s por stream</span>: a experiência de um usuário</li>
+      <li><span class="la-term" data-term="tok-s-agregado">tok/s agregado</span>: a capacidade da máquina</li>
+      <li><span class="la-term" data-term="e2el">E2EL</span>: latência de ponta a ponta</li>
+    </ul>
+  </div>
+  <p>Na figura, escolha um cenário medido e o tamanho da resposta. A linha do tempo mostra onde cada fase gasta o relógio, e o cursor anda em tempo comprimido.</p>
+  <figure class="la-fig" id="fig-relogio" data-title="O relógio de uma requisição">
+    <div class="la-fig-stage" style="height:370px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>TTFT e taxa de decode medidos nas receitas (um usuário por vez): DeepSeek, varredura 0731 de 01/08, com cinco tamanhos de prompt (compare o prefill tok/s de 2.048 com o de 8.192 e o de 32.768); GLM, sparkDash de 28/08 (structured); Qwen, lane day-0 (prosa). A duração do decode é extrapolada para \(N\) tokens com a taxa medida. Âmbar = TTFT, menta = decode. “tok/s de parede” (\(N\)/E2EL) mistura as duas fases.</figcaption>
+  </figure>
+  <p>A varredura 0731 do DeepSeek resume o capítulo em três linhas. O prefill tok/s não é uma constante do modelo: ele sobe de 447 (256 tokens) para 2.563 (2.048 tokens) enquanto os custos fixos por requisição (tokenizar, montar o template, a rampa do primeiro pedaço) se diluem, e depois cai para 1.713 (8.192) e 1.428 (32.768), conforme a atenção e o indexador, que crescem com o contexto, passam a pesar em cada pedaço (e fica em 1.665 a 131.072). A mesma subida inicial aparece no GLM: 772 tok/s a 8k e 947 a 100k em 29/08. O decode quase não muda com o contexto (75,4 tok/s com 256 tokens, 65,2 com 131.072), porque a atenção esparsa lê pouco do cache. E o TTFT de 78,75 s de um prompt de 131k domina a experiência de qualquer resposta curta: com 512 tokens de saída, mais de 90% do relógio é prefill. Com especulação, o decode também depende do <i>conteúdo</i>. No mesmo dia e na mesma configuração (bancada do laboratório, 30/08), o GLM entregou 65,1 tok/s em texto estruturado, com aceitação de 0,959 (6,71 dos 7 rascunhos aceitos por passo), e 27,1 tok/s em prosa, com 0,341 (2,39 aceitos por passo). Os pesos lidos são os mesmos; o que muda é quantos rascunhos acertam, e isso depende da previsibilidade do texto.</p>
+  <div class="la-callout warn"><b class="t">Armadilhas de medição</b><p>Com o raciocínio ligado, o primeiro token de <i>conteúdo</i> só sai depois do <code>&lt;think&gt;</code> inteiro, e o “TTFT” passa a medir o pensamento, por isso os benchmarks das receitas desligam o thinking. Com especulação, cada evento do stream carrega vários tokens: contar eventos subestima a saída (a metodologia de avaliação do DeepSeek, em <code>scripts/EVAL.md</code>, mediu ~4,5×), então use <code>usage.completion_tokens</code>. E um prompt repetido acerta o prefix cache e “acelera” o prefill sem nada ter mudado. A metodologia completa está em <a data-ch="benchmarking">Medindo desempenho</a>.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Batching no decode: a carona dos pesos</h2>
+  <p>Se um passo de decode gasta quase todo o tempo lendo pesos, e os pesos são os mesmos para todas as conversas, processar \(B\) conversas no mesmo passo divide essa conta. É o <span class="la-term" data-term="amortizacao-de-pesos">batching</span> do decode, e com ele \(M\) passa a ser \(B\). Um modelo de custo de dois termos basta para prever o formato das curvas:</p>
+  <div class="la-eq">
+    \[ t_{\text{passo}}(B) \approx T_0 + B\,T_1 \qquad s(B) = \frac{\tau}{T_0 + B\,T_1} \qquad A(B) = B\cdot s(B) \;\xrightarrow{\;B\to\infty\;}\; \frac{\tau}{T_1} \]
+    <ul class="la-eq-legend">
+      <li>\(T_0\): parte do passo compartilhada por todos (pesos densos, <code>lm_head</code>, lançamentos)</li>
+      <li>\(T_1\): custo marginal por sequência (KV e estado próprios, experts extras, amostragem; com especulação, também os rascunhos e a verificação de cada sequência, que competem pelo passo, parte que as receitas não mediram por nível de concorrência)</li>
+      <li>\(s(B)\): tok/s por stream</li>
+      <li>\(A(B)\): tok/s agregado</li>
+      <li>\(\tau\): tokens por passo por sequência</li>
+    </ul>
+  </div>
+  <p>Enquanto \(B\,T_1 \ll T_0\), o agregado cresce quase linearmente e cada usuário perde pouco. Quando \(B\,T_1\) se aproxima de \(T_0\), o passo fica mais lento para todos e o agregado se achata. No Qwen (lane day-0, prosa), o agregado foi de 54,4 tok/s com 1 stream para 86,5, 128,1, 169,7 e 207,0 com 2, 4, 6 e 8: 3,8× mais capacidade, enquanto cada stream caiu de 54,4 para 26,7 tok/s (49%). O README avisa que a especulação normalmente contribui para essa queda por stream, mas que a aceitação não foi medida por nível de concorrência, então a divisão fica sem atribuição. No GLM (structured, 28/08): 62,9 tok/s com 1 stream; 51,7 por stream e 103,3 agregado com 2; 37,1 e 146,5 com 4. No DeepSeek (0731, prompt de 256 tokens): 75,4 tok/s de decode com 1 stream, 36,9 por stream e 191,2 agregado com 6.</p>
+  <p>Num MoE, a carona é menos generosa do que num modelo denso. Cada token escolhe os seus \(k\) experts, e mais tokens no passo acendem mais experts <i>distintos</i>, que também precisam ser lidos. Se o roteamento fosse uniforme e independente (uma aproximação; na prática os tokens se correlacionam), o número esperado de <span class="la-term" data-term="experts-distintos">experts distintos</span> por camada seria:</p>
+  <div class="la-eq">
+    \[ \mathbb E[D] = E\left(1 - \Big(1 - \frac{k}{E}\Big)^{T}\right) \]
+    <ul class="la-eq-legend">
+      <li>\(E\): experts roteados (512 no Qwen, 288 no GLM, 256 no DeepSeek)</li>
+      <li>\(k\): experts por token (10, 8 e 6)</li>
+      <li>\(T\): tokens no passo, \(B \times (1 + k_{\text{spec}})\)</li>
+      <li>\(D\): experts distintos lidos na camada</li>
+    </ul>
+  </div>
+  <p>Os relatórios confirmam a ordem de grandeza: ~32 experts únicos por camada no passo MTP=3 de um usuário do Qwen; no máximo 42 de 256 no DeepSeek; ~57 de 288 esperados num passo DFlash2 de 8 posições do GLM (cálculo do inventário). Na figura, cada quadradinho é um dos 512 experts de uma camada do Qwen. Aumente \(B\) e veja a grade acender, depois compare o modelo de custo com as medições.</p>
+  <figure class="la-fig wide" id="fig-carona" data-title="A carona dos pesos">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>À esquerda (ou em cima), os experts de uma camada do Qwen acesos pelos streams admitidos × 4 posições (MTP=3), com sorteio uniforme ilustrativo; acima de 8 streams, os excedentes esperam na fila (apagados) e não acendem nada. À direita, o modelo \(t(B) = t(1)\,[1 + \varphi(B-1)]\), em que \(\varphi\) é a fração do passo que escala por sequência, contra as medições reais do Qwen (lane day-0, prosa, <code>max_num_seqs = 8</code>). Acima de 8 as vagas estão cheias e as curvas ficam planas; o tracejado é o que o modelo daria sem teto de vagas (hipotético). O modelo é ilustrativo e tem 2 parâmetros.</figcaption>
+  </figure>
+  <p>Com \(\varphi \approx 0{,}15\text{–}0{,}2\), o modelo acompanha as medições: cada stream extra encarece o passo em ~15–20%, e o agregado continua subindo até o teto de vagas. Passando de <code>max_num_seqs</code>, o motor não processa mais sequências por passo, e o excedente espera na fila. Na lane v0.30 do Qwen, com 16 streams contra 8 vagas, o TTFT médio saltou para 6,5–9,7 s, contra 0,1–0,4 s, e o agregado em prosa caiu de 216,4 (×8) para 194,9 tok/s (×16) em vez de subir. A mesma lógica explica por que as otimizações de bytes por passo rendem mais com poucos usuários. No Qwen, o vocabulário reduzido do rascunhador deu +15,3% em código com 1 stream e só +4,0% com 8: com lote maior, o passo é menos dominado pela leitura do <code>lm_head</code>.</p>
+  <div class="la-callout tip"><b class="t">Regra de bolso</b><p>Otimize bytes por passo (quantização, FP8 denso, vocabulário do rascunhador) para <b>latência por usuário</b>; otimize vagas e memória de KV (<code>max_num_seqs</code>, dtype do KV, fatia de memória do pool) para <b>capacidade agregada</b>. O <a data-ch="scheduler-batching">scheduler</a> decide, a cada passo, como repartir o orçamento entre as duas.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Nas receitas: cada fase, sua otimização</h2>
+  <p>Juntando as peças: toda modificação de receita que envolve desempenho age sobre uma de três linhas, a do prefill (\(M\) grande, cálculo), a do decode (\(M\) pequeno, banda) ou a da memória de KV (capacidade). O mapa abaixo põe cada otimização das três receitas na sua linha. Clique numa estação para ler os números.</p>
+  <figure class="la-fig wide" id="fig-metro" data-title="Mapa de metrô das otimizações">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Três linhas, três gargalos. A cor do ponto indica a receita (GLM, Qwen, DeepSeek; âmbar = as três). A estação de baldeação é o dispatch por \(M\), que liga as linhas de prefill e decode pelo número de linhas do passo. Clique numa estação ou deixe o passeio automático.</figcaption>
+  </figure>
+  <div class="la-table-wrap"><table class="la-params">
+    <thead><tr><th>Parâmetro</th><th>Valor</th><th>Receita</th><th>O que faz</th><th>Por que importa</th></tr></thead>
+    <tbody>
+      <tr><td><code>--max-num-batched-tokens</code></td><td>7168 · 8192 · 8192</td><td><span class="la-rb glm"></span> <span class="la-rb qwen"></span> <span class="la-rb ds"></span></td><td>Tokens por passo, o <i>M</i> do prefill</td><td>GLM: 7.168 põe ~199 linhas por expert, I ≈ 460–500 FLOP/B contando as ativações (no ridge; 2r/b<sub>w</sub> daria ~800); 8.192 estoura a memória compartilhada do indexador</td></tr>
+      <tr><td><code>--max-num-seqs</code></td><td>4 · 8 · 6</td><td><span class="la-rb glm"></span> <span class="la-rb qwen"></span> <span class="la-rb ds"></span></td><td>Vagas de decode, o <i>B</i></td><td>Mais vagas = mais agregado e menos tok/s por stream; excedente vai para a fila</td></tr>
+      <tr><td><code>--max-model-len</code></td><td>850000 · 262144 · 1048576</td><td><span class="la-rb glm"></span> <span class="la-rb qwen"></span> <span class="la-rb ds"></span></td><td>Teto de contexto por requisição</td><td>Teto, não reserva: o limite real é a soma de tokens vivos contra o pool</td></tr>
+      <tr><td><code>--kv-cache-dtype</code></td><td><code>fp8</code> (→ <code>fp8_ds_mla</code>) · <code>fp8</code> · <code>nvfp4_ds_mla</code></td><td><span class="la-rb glm"></span> <span class="la-rb qwen"></span> <span class="la-rb ds"></span></td><td>Formato do KV (<i>b</i> na fórmula)</td><td>Qwen: +71% de tokens no pool ao custo de −5,3% de throughput médio (o indexador QSA escolhe blocos diferentes com chaves FP8), capacidade contra velocidade. GLM: 656 B por token por camada MLA; DS: 584 B por entrada comprimida (1 a cada 4 ou 128 tokens)</td></tr>
+      <tr><td><code>--kv-cache-memory-bytes</code></td><td><code>11811160064</code> (11 GiB)</td><td><span class="la-rb glm"></span></td><td>Fixa o pool por GPU</td><td>1.233.779 tokens (1,45× a 850k), sem depender de quanto o profile run mediu</td></tr>
+      <tr><td><code>GLM53_KDA_BF16_LARGE_M</code></td><td><code>1</code> no <code>.env.example</code></td><td><span class="la-rb glm"></span></td><td>Cópia BF16 do <code>in_proj</code> do KDA para <i>M</i> &gt; 512</td><td>TTFT −11,4% a −12,3%; +3,29 GiB por rank</td></tr>
+      <tr><td><code>KDA_BF16_LARGE_M_MIN_M</code></td><td><code>512</code> (fixo)</td><td><span class="la-rb glm"></span></td><td>Fronteira do dispatch</td><td>Decode medido até <i>M</i> = 220; prefill a partir de 768</td></tr>
+      <tr><td><code>KV_BYTES_PER_TOKEN</code></td><td><code>29482</code></td><td><span class="la-rb qwen"></span> (TP1)</td><td>Bytes por token medidos (BF16) no orçamento</td><td>Converte <code>MAX_MODEL_LEN</code> em GiB de KV com o custo real, não o teórico</td></tr>
+      <tr><td>especulação</td><td>MTP=3 · DFlash2 k=7 · DSpark</td><td><span class="la-rb qwen"></span> <span class="la-rb glm"></span> <span class="la-rb ds"></span></td><td>Vários tokens por leitura dos pesos</td><td>τ ≈ 3,2 (2,2 aceitos + 1 bônus) · ~7,7 (6,71 + 1, structured) · ~4,15 (3,15 + 1)</td></tr>
+      <tr><td><code>GLM53_ADAPTIVE_K</code></td><td><code>off</code> (opt-in <code>ema</code>, conjunto 2,4,7)</td><td><span class="la-rb glm"></span></td><td>Verifica só 2, 4 ou 7 dos 7 rascunhos, pela média móvel da aceitação</td><td>Menos posições verificadas acendem menos experts e encurtam o passo: prosa +13–21%. O k é o mínimo do lote, porque os CUDA graphs FULL exigem forma uniforme</td></tr>
+      <tr><td><code>GLM53_EXL3_MOE_FAST</code></td><td><code>0</code> (opt-in <code>1</code>)</td><td><span class="la-rb glm"></span></td><td>Kernels MoE de decode “thin-decode” K4/N256 (1 estágio de registradores, 8 de memória compartilhada)</td><td>Mesmos bytes, sem spills de registrador: +7,7% a +14,6% de decode com 1 stream; só TP2, validação numérica formal inconclusiva</td></tr>
+    </tbody>
+  </table></div>
+  <h3>Roteiro para a sua receita</h3>
+  <ol class="la-steps">
+    <li><b>Some os bytes de um passo de decode.</b> Pesos densos por GPU + experts distintos esperados + <code>lm_head</code> (× posições verificadas) + rascunhador. Divida por ~240 GB/s e multiplique pelos tokens por passo (aceitos + 1): é o teto por usuário. Some um \(t_{\text{fixo}}\) de 10–20 ms para coletivas, lançamentos e rascunhos seriais. Espere 50–65% do teto na prática antes da especulação, como no tutorial do <a data-ch="receita-do-zero">modelo novo</a>.</li>
+    <li><b>Calcule os bytes por token de contexto</b> com \(L_{kv} \times n_{kv} \times (d_k + d_v) \times b\), veja se o KV se divide por TP (GQA) ou se replica (MLA/MQA) e some o estado fixo por sequência.</li>
+    <li><b>Estime o pool</b>: GMU × memória visível − pesos − ativações − graphs/não-torch. Divida pelos bytes por token e confira com a linha <code>Available KV cache memory</code> do boot.</li>
+    <li><b>Escolha os tetos</b>: <code>--max-model-len</code> pelo contexto que o pool comporta com folga, <code>--max-num-seqs</code> pela concorrência que você quer servir.</li>
+    <li><b>Confira a intensidade do prefill</b>: com MoE, calcule as linhas por expert do seu <code>--max-num-batched-tokens</code> (\(r = Mk/D\)) e a intensidade com os dois termos, pesos e ativações, antes de comparar com o ridge. \(2r/b_w\) só serve enquanto \(r \ll \tfrac{b_w}{b_a}\cdot\tfrac{KN}{K+N}\).</li>
+    <li><b>Meça</b> TTFT e prefill tok/s com prompts frios, tok/s por stream e agregado numa escada de concorrência, e compare com as suas previsões. Se o número não fecha, algum byte ou alguma espera ficou fora da conta.</li>
+  </ol>
+  <p>Faltou abrir uma caixa: o que exatamente são os “experts distintos” que pesam em todas essas contas, e como um roteador escolhe, token a token, 8 de 288 especialistas. O próximo capítulo, <a data-ch="mixture-of-experts">Mixture-of-Experts</a>, abre a Parte III com essa arquitetura. Depois dele, <a data-ch="mla">MLA</a>, <a data-ch="atencao-esparsa">atenção esparsa</a> e <a data-ch="atencao-linear">atenção linear</a> mostram as três formas de encolher o KV que você acabou de aprender a medir.</p>
+</section>

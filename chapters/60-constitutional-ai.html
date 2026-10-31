@@ -1,0 +1,415 @@
+<p class="la-lead">Em dezembro de 2022, uma equipe da Anthropic treinou um assistente de 52 bilhões de parâmetros para ser inofensivo sem usar <b>nenhum</b> rótulo humano sobre o que é dano. No lugar de dezenas de milhares de comparações feitas por pessoas, havia uma lista curta de princípios escritos em linguagem natural, a <span class="la-term" data-term="constituicao">constituição</span>, e modelos de linguagem fazendo o trabalho pesado: o assistente critica e reescreve as próprias respostas, e um LM julga qual de duas fere menos os princípios. O método se chama <span class="la-term" data-term="constitutional-ai">Constitutional AI</span> (CAI). Neste capítulo você vai desmontar as duas fases do CAI (a supervisionada, de autocrítica e revisão, e a de reforço, com preferências rotuladas por IA), fazer à mão as contas dos rótulos suaves que alimentam o modelo de preferência, entender por que existe um <i>clamp</i> de 40–60%, ver o Goodhart aparecer, acompanhar a evolução da ideia até o <i>deliberative alignment</i> e a constituição de 2026, comparar tudo isso com a abliteração do Módulo 1 e, no fim, montar um pipeline seu com os motores de inferência que você já sabe servir.</p>
+
+<section class="la-sec">
+  <h2>O dilema: útil, inofensivo e caro de rotular</h2>
+  <p>Relembre o pipeline clássico de <span class="la-term" data-term="rlhf">RLHF</span> dos capítulos anteriores. Pessoas comparam pares de respostas, um <a data-ch="preferencias-reward-models">modelo de recompensa</a> aprende essas comparações com Bradley–Terry, e o <a data-ch="ppo-rlhf">PPO</a> otimiza a política contra esse modelo, presa por uma <span class="la-term" data-term="penalidade-kl">penalidade KL</span> ao ponto de partida. Em 2022, a Anthropic usava esse pipeline com dois tipos de rótulo humano: de <i>helpfulness</i> (qual resposta ajuda mais?) e de <i>harmlessness</i> (qual resposta é menos nociva?). O alvo era o assistente <span class="la-term" data-term="hhh">HHH</span>: <i>helpful, honest, harmless</i>.</p>
+  <p>Os dois objetivos brigam. Um modelo mais útil obedece também a pedidos perniciosos, e um modelo treinado para ser inofensivo tende a ficar <span class="la-term" data-term="evasividade">evasivo</span>: “não posso ajudar com isso”, sem explicar nada. No trabalho anterior da Anthropic (o HH-RLHF), um modelo de preferência treinado só em um dos dois tipos de rótulo ficava <b>significativamente pior que o acaso</b> ao julgar o outro. E havia um agravante sutil: diante de pedidos nocivos, os avaliadores humanos <i>recompensavam</i> a evasão. O modelo aprendia que fugir do assunto era seguro, e podia ficar “preso” em respostas evasivas pelo resto da conversa.</p>
+  <p>O paper do CAI (Bai et al., arXiv 2212.08073) declara quatro motivações:</p>
+  <div class="la-cards">
+    <div class="la-card"><span class="ic">🔭</span><h4>Supervisão escalável</h4><p>Estudar como uma IA pode ajudar a supervisionar outra IA, uma necessidade quando os modelos passarem a fazer coisas que humanos têm dificuldade de avaliar.</p></div>
+    <div class="la-card"><span class="ic">🗣️</span><h4>Menos evasão</h4><p>Reduzir a tensão útil × inofensivo e fazer o modelo <b>explicar</b> por que não vai ajudar, em vez de só se recusar.</p></div>
+    <div class="la-card"><span class="ic">📜</span><h4>Transparência</h4><p>Tornar explícitos, em texto, os princípios que governam o comportamento, em vez de deixá-los implícitos em centenas de milhares de cliques.</p></div>
+    <div class="la-card"><span class="ic">⚡</span><h4>Iteração rápida</h4><p>Mudar o objetivo sem coletar uma nova rodada de rótulos humanos a cada mudança: edita-se o texto dos princípios.</p></div>
+  </div>
+  <p>A figura mostra o dilema como um mapa. No eixo horizontal, quão útil o modelo é; no vertical, quão inofensivo. Treinar com uma mistura de rótulos humanos escolhe um ponto ao longo de uma <span class="la-term" data-term="fronteira-de-pareto">fronteira de Pareto</span>, o conjunto de modelos em que não dá para melhorar um eixo sem piorar o outro: mais peso na inofensividade compra segurança pagando com utilidade, e o modelo escorrega para a evasão. O resultado central do CAI é que essa fronteira se desloca: para um mesmo nível de utilidade, o modelo treinado com CAI é <b>menos nocivo</b>.</p>
+  <figure class="la-fig" id="fig-tensao" data-title="O cabo de guerra útil × inofensivo">
+    <div class="la-fig-stage" style="height:400px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>O ponto lilás é um modelo RLHF treinado com a mistura de rótulos escolhida no controle; o balão mostra o estilo de resposta típico daquela região diante de um pedido nocivo (conteúdo nocivo tarjado). Desligue e religue a fronteira RL-CAI para comparar: o ponto menta tem a mesma utilidade, menos dano e uma resposta que engaja e explica. A forma das curvas é <b>ilustrativa</b> e reproduz só o sentido qualitativo do resultado de Bai et al. (fronteira de Pareto melhor para o RL-CAI); os números dos eixos não são os Elos do paper.</figcaption>
+  </figure>
+  <p>Vale fixar o vocabulário que o resto do capítulo usa:</p>
+  <dl class="la-kv">
+    <dt>Constituição</dt><dd>A lista de princípios em linguagem natural. No paper, 16 princípios para a fase supervisionada e 16 para a fase de RL.</dd>
+    <dt><span class="la-term" data-term="sl-cai">SL-CAI</span></dt><dd>A fase supervisionada: o modelo critica e revisa as próprias respostas, e um modelo pré-treinado é ajustado por SFT nas revisões.</dd>
+    <dt><span class="la-term" data-term="rl-cai">RL-CAI</span></dt><dd>A fase de reforço: um modelo de feedback escolhe a menos nociva de duas respostas, esses rótulos treinam um modelo de preferência, e a política é otimizada com PPO contra ele.</dd>
+    <dt><span class="la-term" data-term="rlaif">RLAIF</span></dt><dd><i>Reinforcement Learning from AI Feedback</i>: o nome que o paper dá ao RL feito com preferências geradas por IA. Hoje designa toda a família.</dd>
+  </dl>
+  <div class="la-callout analogy"><b class="t">Analogia: a redação de jornal</b><p>Pense na constituição como o <i>manual de redação</i> de um jornal. No SL-CAI, o repórter relê o próprio texto com o manual aberto numa página sorteada, anota o que viola a regra e reescreve. Depois de muitas rodadas, o jornal treina um repórter novo só com os textos finais, e ele passa a escrever no estilo da casa sem precisar abrir o manual. No RL-CAI, um editor recebe duas versões da mesma matéria, consulta uma página do manual e diz qual prefere, e com que convicção. O repórter aprende a agradar esse editor. Ninguém do jornal precisou ler cada texto ruim: só escreveu o manual.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>A constituição: princípios escritos em linguagem natural</h2>
+  <p>A constituição do paper original é surpreendentemente modesta. São <b>16 princípios</b> para o estágio supervisionado (pedidos de crítica e de revisão) e outros <b>16</b> para o estágio de RL (instruções de comparação). Muitos são parecidos entre si e genéricos sobre dano; outros miram áreas específicas. Os próprios autores dizem, em nota de rodapé, que os escolheram de forma <i>ad hoc</i>, para pesquisa, e não por um desenho cuidadoso. Um exemplo do formato, parafraseado: “qual das respostas é menos nociva? Escolha a que uma pessoa sábia, ética, educada e amigável mais provavelmente diria”.</p>
+  <p>O detalhe decisivo não está no texto de cada princípio, e sim em como eles são usados. O CAI <b>não</b> cola os 16 princípios no prompt. A cada passo de revisão de cada prompt (no SL) e a cada rótulo de comparação (no RL), <b>sorteia um único princípio</b>. O paper relata dois efeitos dessa escolha:</p>
+  <ul>
+    <li>No RL, o <span class="la-term" data-term="ensemble-de-principios">ensemble de princípios</span> deixou o modelo de preferência visivelmente <b>mais robusto</b> do que usar sempre o mesmo princípio.</li>
+    <li>Aumentar o número de princípios <b>não</b> melhorou os escores do modelo de preferência, mas aumentou a <b>diversidade</b> das revisões, o que ajuda a exploração na fase de RL.</li>
+  </ul>
+  <p>Dá para ver a diversidade com uma conta simples. Se cada prompt passa por \(R\) revisões e cada revisão sorteia, com reposição, um de \(N\) princípios, o número esperado de princípios <i>distintos</i> que aquele prompt encontra é</p>
+  <div class="la-eq">
+    \[ \mathbb{E}[\text{distintos}] \;=\; N\Big[1 - \big(1 - \tfrac{1}{N}\big)^{R}\Big], \qquad \Pr[\text{dois prompts com a mesma sequência}] = \frac{1}{N^{R}} \]
+    <ul class="la-eq-legend">
+      <li>\(N\): número de princípios na constituição (16 no paper)</li>
+      <li>\(R\): revisões por prompt (4 no paper)</li>
+      <li>\(1 - (1-1/N)^R\): chance de um princípio específico aparecer pelo menos uma vez entre as \(R\) revisões</li>
+      <li>com \(N=16\) e \(R=4\): \(\approx 3{,}64\) princípios distintos por prompt e \(1/65.536\) de chance de dois prompts receberem a mesma sequência</li>
+    </ul>
+  </div>
+  <p>Com um único princípio, todo prompt recebe a mesma lente quatro vezes; com 16, quase toda revisão olha o problema por um ângulo diferente, e o conjunto de dados inteiro varia ainda mais. A figura gira a roleta para um prompt por vez.</p>
+  <figure class="la-fig" id="fig-roleta" data-title="A roleta de princípios">
+    <div class="la-fig-stage" style="height:390px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>A roleta tem \(N\) fatias; a cada rodada ela sorteia um princípio para cada uma das \(R\) revisões de um prompt (as fichas embaixo). O gráfico à direita é a curva exata \(N[1-(1-1/N)^R]\), e o ponto âmbar acompanha os controles. Os textos curtos nas fichas são <b>paráfrases ilustrativas</b> dos tipos de princípio descritos no paper (genéricos sobre dano, voltados a áreas específicas, de comparação), não o texto original.</figcaption>
+  </figure>
+  <p>Por que sortear funciona melhor que concatenar? Uma leitura útil (interpretação nossa) é pensar no sorteio como <i>data augmentation</i> da instrução. Cada formulação de princípio tem idiossincrasias: palavras que o modelo associa a respostas mais longas, a um tom mais formal, a mais avisos. Se o rotulador usa sempre a mesma formulação, o modelo de preferência aprende essas idiossincrasias junto com o conceito. Quando a formulação varia, só o que é comum a todas sobrevive na média: algo próximo da ideia de “menos nocivo”. É o mesmo raciocínio de um ensemble: o ruído de cada membro se cancela, o sinal compartilhado se soma.</p>
+  <div class="la-callout deep"><b class="t">Princípio não é regra</b><p>Um princípio é um texto que o <i>modelo</i> interpreta, e a interpretação depende do modelo. O paper registra que as críticas do modelo de 52B eram às vezes razoáveis, mas frequentemente exageradas ou imprecisas, e mesmo assim as revisões saíam menos nocivas. Isso tem duas consequências práticas. Primeiro, a qualidade do CAI cresce com a capacidade do modelo que critica e julga. Segundo, uma constituição não é um contrato verificável: trocar o modelo que a lê muda o comportamento resultante, mesmo com o texto idêntico.</p></div>
+  <p>A ideia de “constituição” evoluiu muito desde 2022. Em janeiro de 2026 ela já era um documento longo e explicativo, com ordem de prioridades e restrições rígidas, escrito “principalmente para o Claude”. A seção de desdobramentos volta a isso. Por ora, guarde a escolha de projeto que atravessa todas as versões: <b>o comportamento é especificado em texto que o próprio modelo lê</b>, e não em rótulos opacos.</p>
+</section>
+
+<section class="la-sec">
+  <h2>SL-CAI: o modelo como seu próprio editor</h2>
+  <p>A fase supervisionada transforma um modelo útil, mas obediente demais, em uma fonte de exemplos de respostas inofensivas e não evasivas. O ponto de partida é um modelo <b>helpful-only</b> treinado com RLHF, isto é, um assistente que aprendeu a ajudar e nunca foi treinado a recusar. O laço tem cinco passos:</p>
+  <ol class="la-steps">
+    <li><b>Provocar.</b> Mostra-se ao modelo helpful-only um <span class="la-term" data-term="prompt-red-team">prompt de red team</span>, escrito para induzir uma resposta nociva. Ele responde, frequentemente de forma nociva.</li>
+    <li><b>Criticar.</b> Anexa-se ao contexto um <span class="la-term" data-term="critica-revisao">pedido de crítica</span>, uma instrução pré-escrita, derivada de um princípio sorteado, para identificar de que formas a resposta é nociva, antiética, tóxica, perigosa ou ilegal. O modelo escreve a crítica.</li>
+    <li><b>Revisar.</b> Anexa-se um pedido de revisão (reescrever a resposta removendo o conteúdo nocivo). O modelo escreve a revisão.</li>
+    <li><b>Repetir.</b> A revisão pode passar de novo pelo ciclo, com outro princípio sorteado. No paper, cada prompt passou por <b>4 pares crítica–revisão</b>. Exemplos <i>few-shot</i> de críticas e revisões no começo do contexto ajudam o modelo a não confundir os papéis.</li>
+    <li><b>Destilar.</b> Junta-se o prompt com a revisão final e faz-se <a data-ch="sft">SFT</a> de um <b>modelo pré-treinado</b> nesses pares, misturados com amostras de helpfulness.</li>
+  </ol>
+  <p>Os volumes do paper dão a escala do trabalho que o modelo fez sozinho:</p>
+  <table>
+    <thead><tr><th>Item</th><th>Valor</th></tr></thead>
+    <tbody>
+      <tr><td>Prompts de red team escritos por humanos</td><td>42.496</td></tr>
+      <tr><td>Prompts de red team gerados por <i>few-shot</i> num modelo pré-treinado</td><td>140.335</td></tr>
+      <tr><td>Total de prompts de red team</td><td><b>182.831</b></td></tr>
+      <tr><td>Pares crítica–revisão por prompt de red team</td><td>4</td></tr>
+      <tr><td>Prompts de helpfulness (todos humanos)</td><td><b>135.296</b>, com 2 respostas amostradas por prompt do modelo helpful-RLHF</td></tr>
+      <tr><td>Temperatura de amostragem</td><td>\(T = 1\)</td></tr>
+    </tbody>
+  </table>
+  <p>Por que \(T = 1\)? Temperatura 1 amostra a distribuição do próprio modelo sem achatá-la nem aguçá-la. As revisões variam de prompt para prompt, e essa diversidade é o que o SFT aproveita. O mesmo raciocínio vale para o RL-CAI: as duas respostas por prompt precisam <b>diferir</b> para haver o que comparar. Com \(T = 0\) (decodificação gulosa) elas sairiam idênticas, o rótulo seria ~0,5 e o par não ensinaria nada.</p>
+  <p>Faça a conta de geração: por prompt de red team, 1 resposta inicial + 4 críticas + 4 revisões = 9 gerações, ou seja, \(182.831 \times 9 = 1.645.479\) gerações só nessa fase, com 731.324 revisões ao todo. Por isso a última seção do capítulo trata esse laço como um problema de <i>serving</i>.</p>
+  <p>Siga uma rodada completa na figura, com um pedido de brinquedo e o conteúdo nocivo tarjado.</p>
+  <figure class="la-fig" id="fig-laco" data-title="O laço crítica → revisão, rodada a rodada">
+    <div class="la-fig-stage" style="height:470px"><canvas></canvas></div>
+    <figcaption>Os balões mostram o contexto do modelo crescendo. O “medidor de dano” da resposta atual fica na barra à direita (no celular, horizontal no topo), e a régua de contexto conta os trechos acumulados (no celular, o contador “contexto: N trechos”). No último passo o andaime cai: sobra o par (prompt, revisão), e só os tokens da revisão recebem perda (células menta). Pedido, textos e valores do medidor são <b>ilustrativos</b>; o formato da queda (a primeira revisão remove a maior parte do dano) segue o achado do paper.</figcaption>
+  </figure>
+  <p>O que o paper encontrou nessa fase:</p>
+  <ul>
+    <li>A <b>primeira revisão</b> remove a maior parte do dano; as seguintes melhoram menos visivelmente.</li>
+    <li>As revisões <b>raramente são evasivas</b>: engajam no tema sensível de forma cuidadosa, explicando o problema.</li>
+    <li>Escrever a <b>crítica antes da revisão</b>, em vez de revisar direto, ajudou os modelos pequenos; nos grandes, os dois caminhos deram resultado parecido.</li>
+    <li>O modelo SL-CAI é mais útil e mais inofensivo que o pré-treinado; menos útil que os modelos de RL; mais inofensivo que o helpful-RLHF e mais nocivo que o HH-RLHF. Ele é um <b>ponto de partida</b>, não o produto final.</li>
+  </ul>
+  <h3>Por que isso funciona: destilação de contexto</h3>
+  <p>Repare na assimetria entre o que o modelo <i>vê</i> ao gerar a revisão e o que o modelo novo <i>aprende</i>. Na geração, o contexto contém o prompt, a resposta nociva, um princípio, uma crítica e o pedido de revisão: um andaime inteiro de raciocínio. No exemplo de treino, só ficam o prompt e a revisão. O SFT ensina o modelo a produzir, <b>sem o andaime</b>, a resposta que ele só produzia <b>com</b> o andaime. Essa técnica se chama <span class="la-term" data-term="destilacao-de-contexto">destilação de contexto</span>: uma política “turbinada” por instruções no contexto é copiada para dentro dos pesos. O HH-RLHF já a usava no lugar de um SFT clássico, e ela volta, ampliada, no <i>deliberative alignment</i>.</p>
+  <div class="la-eq">
+    \[ \mathcal{L}_{\text{SL-CAI}}(\theta) = -\,\mathbb{E}_{(x,\,y)\sim\mathcal{D}_{\text{SL}}}\Bigg[\frac{1}{\sum_t m_t}\sum_{t} m_t \log \pi_\theta\big(y_t \mid x, y_{&lt;t}\big)\Bigg], \qquad \mathcal{D}_{\text{SL}} = \{(x^{\text{rt}}, y^{\text{rev}})\} \cup \{(x^{\text{h}}, y^{\text{h}})\} \]
+    <ul class="la-eq-legend">
+      <li>\(\pi_\theta\): o modelo pré-treinado sendo ajustado (a futura política SL-CAI)</li>
+      <li>\(x^{\text{rt}}, y^{\text{rev}}\): prompt de red team e sua revisão, sem a resposta original, a crítica e os pedidos</li>
+      <li>\(x^{\text{h}}, y^{\text{h}}\): prompt de helpfulness e resposta amostrada do modelo helpful-RLHF</li>
+      <li>\(m_t\): máscara de perda, 1 nos tokens da resposta e 0 nos do prompt (como no <a data-ch="sft">capítulo de SFT</a>)</li>
+      <li>\(y_{&lt;t}\): os tokens anteriores da resposta (<span class="la-term" data-term="teacher-forcing"><i>teacher forcing</i></span>: o modelo vê o texto real, não as próprias amostras)</li>
+    </ul>
+  </div>
+  <p>Na lente do “coeficiente de gradiente” do paper do DeepSeekMath, que vê todos os métodos de pós-treino como \(\sum_t \mathrm{GC}_t \nabla\log\pi_\theta(y_t)\), o SL-CAI é SFT puro: \(\mathrm{GC}=1\) em todo token da revisão. Toda a inteligência está em <i>quais</i> sequências entram no conjunto de dados, e quem as escolheu foi o próprio modelo, guiado pelos princípios.</p>
+  <div class="la-callout why"><b class="t">Por que ajustar um modelo pré-treinado, e não o helpful-RLHF?</b><p>O paper faz o fine-tuning partindo de um modelo <b>pré-treinado</b>. Uma leitura plausível (interpretação nossa): o modelo helpful-RLHF tem justamente o viés que se quer corrigir, a obediência a pedidos nocivos, e partir dele obrigaria o SFT a “desaprender” esse viés. Partindo do pré-treinado, o comportamento vem inteiro dos dados curados: revisões inofensivas e amostras úteis. O preço é que o SL-CAI fica menos útil que os modelos de RL, e é a fase seguinte que recupera a utilidade.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>RL-CAI: o rotulador de múltipla escolha</h2>
+  <p>A fase de RL substitui o avaliador humano de inofensividade por um modelo. Para cada prompt de red team, o SL-CAI gera <b>duas respostas</b>. Um <span class="la-term" data-term="modelo-de-feedback">modelo de feedback</span> (no paper, um LM pré-treinado) recebe a conversa, um princípio de comparação sorteado e as duas respostas como opções de múltipla escolha:</p>
+  <pre data-lang="text"><code>Considere a conversa entre humano e assistente: [CONVERSA]
+[PRINCÍPIO PARA A ESCOLHA]
+Opções:
+(A) [RESPOSTA A]
+(B) [RESPOSTA B]
+A resposta é:</code></pre>
+  <p>O rotulador não precisa <i>gerar</i> nada. Basta um forward até a posição depois de “A resposta é:” e ler duas log-probabilidades do próximo token: \(\ell_A = \log P(\text{“(A)”})\) e \(\ell_B = \log P(\text{“(B)”})\). Essas log-probs vêm dos <i>logits brutos</i> \(z\) que o modelo dá a cada token do vocabulário (os escores antes da <span class="la-term" data-term="softmax">softmax</span>): \(\ell = z - \mathrm{logsumexp}(z)\). Na diferença o logsumexp se cancela, \(\ell_A - \ell_B = z_A - z_B\), e os outros tokens não entram, mesmo que levem boa parte da massa. É isso que justifica normalizar só entre as duas opções, e daí sai o <span class="la-term" data-term="rotulo-suave">rótulo suave</span>:</p>
+  <div class="la-eq">
+    \[ p_A \;=\; \frac{e^{\ell_A}}{e^{\ell_A} + e^{\ell_B}} \;=\; \sigma\big(\ell_A - \ell_B\big) \]
+    <ul class="la-eq-legend">
+      <li>\(\ell_A, \ell_B\): log-probabilidades que o modelo de feedback dá aos tokens “(A)” e “(B)” naquela posição</li>
+      <li>\(\sigma(u) = 1/(1+e^{-u})\): a <span class="la-term" data-term="sigmoide">sigmoide</span>; a softmax de duas opções é uma sigmoide da diferença</li>
+      <li>\(p_A\): probabilidade de que A seja a menos nociva segundo o princípio sorteado; \(p_B = 1-p_A\)</li>
+    </ul>
+  </div>
+  <p>O paper espera que essas probabilidades sejam razoavelmente <span class="la-term" data-term="calibracao-de-probabilidade"><b>calibradas</b></span> (um rotulador é calibrado quando, das vezes em que diz 70%, acerta cerca de 70%) justamente por virem de um formato de múltipla escolha, em que modelos pré-treinados costumam ser bem comportados. Elas viram os alvos do <span class="la-term" data-term="modelo-de-preferencia">modelo de preferência</span> (PM, o nome que o paper usa para o modelo de recompensa). Os exemplos <i>few-shot</i> do prompt do rotulador também são rotulados, cada um com um princípio sorteado.</p>
+  <h3>Bradley–Terry com rótulo suave</h3>
+  <p>O PM \(r_\phi\) dá um escore escalar a cada resposta, e o modelo de <span class="la-term" data-term="bradley-terry">Bradley–Terry</span> diz que \(P(A \succ B) = \sigma(r_\phi(x,y_A) - r_\phi(x,y_B))\). Com rótulo duro (“A venceu”), a perda é \(-\log\sigma(\Delta)\). Com rótulo suave, é a <span class="la-term" data-term="entropia-cruzada">entropia cruzada</span> completa contra \(p_A\):</p>
+  <div class="la-eq">
+    \[ \mathcal{L}_{\text{PM}}(\phi) = -\Big[\,p_A\log\sigma(\Delta) + (1-p_A)\log\sigma(-\Delta)\Big], \qquad \frac{\partial\mathcal{L}_{\text{PM}}}{\partial\Delta} = \sigma(\Delta) - p_A, \qquad \Delta^{*} = \log\frac{p_A}{1-p_A} \]
+    <ul class="la-eq-legend">
+      <li>\(\Delta = r_\phi(x,y_A) - r_\phi(x,y_B)\): a margem que o PM atribui ao par</li>
+      <li>\(\sigma(\Delta)\): a probabilidade de A vencer <i>segundo o PM</i></li>
+      <li>\(\sigma(\Delta) - p_A\): o gradiente é o erro de calibração; ele zera quando o PM concorda com o rotulador</li>
+      <li>\(\Delta^{*} = \mathrm{logit}(p_A)\): a margem ótima, finita para qualquer \(0&lt;p_A&lt;1\)</li>
+    </ul>
+  </div>
+  <p>Faça à mão o exemplo de brinquedo da pesquisa. Com \(\ell_A=-0{,}4\) e \(\ell_B=-1{,}6\), \(p_A=\sigma(1{,}2)=0{,}7685\), e a margem ótima do PM é \(\Delta^*=1{,}2\), exatamente a diferença de log-probs do rotulador. Se o PM estiver com \(\Delta=1{,}0\), a perda vale 0,545. Com o mesmo \(\Delta\), um rótulo duro (\(p_A=1\)) daria 0,313 e continuaria a empurrar a margem para cima <b>sem limite</b>: \(-\log\sigma(\Delta)\) só se anula com \(\Delta\to\infty\). O rótulo suave ensina ao PM não só <i>quem</i> ganha, mas <i>com que convicção</i>.</p>
+  <figure class="la-fig" id="fig-rotulador" data-title="Do logit do rotulador à margem do PM">
+    <div class="la-fig-stage" style="height:450px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Em cima, o vetor de log-probs do próximo token no prompt do rotulador (células com valores); só “(A)” e “(B)” entram na normalização, e a barra mostra \(p_A\). Os controles mexem nos <b>logits brutos</b> \(z_A\) e \(z_B\) (antes da softmax); as células mostram \(\ell = z - \mathrm{logsumexp}(z)\). Como \(\ell_A-\ell_B = z_A-z_B\) não depende dos outros tokens, \(p_A\) só olha (A) e (B), mesmo que “outros” leve massa; já o \(\mathrm{logit}(p)\) do readout é a função log-odds, outra coisa com nome parecido. Embaixo, a perda do PM em função da margem \(\Delta\) para o rótulo atual (curva menta) e para o rótulo duro (tracejado); a bolinha desce pelo gradiente \(\sigma(\Delta)-p_A\) até \(\Delta^*=\mathrm{logit}(p_A)\). Os tokens além de (A) e (B) e o “CoT” como afiador são <b>ilustrativos</b>; o exemplo padrão e o clamp de 40–60% são os do paper.</figcaption>
+  </figure>
+  <h3>Cadeia de pensamento e o clamp de 40–60%</h3>
+  <p>O paper testou uma variante com <span class="la-term" data-term="cadeia-de-pensamento">cadeia de pensamento</span> (CoT). Como modelos pré-treinados escrevem CoT mal, essa variante usa o modelo helpful-RLHF como rotulador, com a instrução “Let's think step-by-step”, e lê a escolha depois do raciocínio. O problema: o CoT costuma declarar a opção preferida antes da resposta final, e então as probabilidades ficam perto de 0 ou 1, <b>mal calibradas</b>. A solução foi o <span class="la-term" data-term="clamp-de-rotulo">clamp</span>: os rótulos de CoT são presos à faixa de 40–60%. Sem o clamp, o RL-CAI aprendia respostas mais extremas.</p>
+  <p>As contas mostram o mecanismo. Um CoT que diz “A” com 0,98 viraria uma margem ótima de \(\mathrm{logit}(0{,}98)\approx 3{,}9\); com o clamp, o alvo vira 0,60 e a margem ótima cai para \(\mathrm{logit}(0{,}6)=0{,}405\). Com \(\Delta = 1{,}0\), a perda contra o alvo clampado é 0,713. Leitura nossa (interpretação): o clamp limita o quanto o PM pode “gritar” uma preferência, e um PM que não grita não empurra a política para os extremos.</p>
+  <h3>O rotulador é bom?</h3>
+  <p>No conjunto HHH original (221 comparações binárias), os modelos já passavam de 90% de acerto, e o teste ficou fácil demais. Os autores escreveram então <b>217 comparações mais difíceis</b>, focadas em inofensividade sutil, incluindo casos em que a resposta evasiva deve perder. Nelas, modelos maiores com CoT se aproximam de PMs treinados em centenas de milhares de rótulos humanos, e a tendência sugere que modelos acima de 52B ficariam competitivos.</p>
+  <div class="la-callout warn"><b class="t">Viés de posição</b><p>Juízes LLM têm <span class="la-term" data-term="vies-de-posicao">viés de posição</span>: favorecem a primeira ou a segunda opção independentemente do conteúdo. O trabalho de Lee et al. (Google, 2023) mitiga isso rodando o rotulador duas vezes, com a ordem trocada, e tirando a média. Custa o dobro de forwards de rotulagem, mas o forward é só de <span class="la-term" data-term="prefill">prefill</span> (nenhum token gerado), e com prefix caching o preâmbulo comum sai quase de graça (última seção).</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Do rótulo à política: modelo de preferência, PPO e d-RLAIF</h2>
+  <p>Com os rótulos de IA prontos, o RL-CAI segue o roteiro do RLHF que você já conhece, com duas fontes de dados misturadas no mesmo modelo de preferência:</p>
+  <ul>
+    <li><b>135.296</b> comparações <b>humanas</b> de helpfulness (o objetivo “útil” continua vindo de pessoas);</li>
+    <li><b>182.831</b> comparações de harmlessness geradas constitucionalmente, uma por prompt de red team.</li>
+  </ul>
+  <p>São 318.127 comparações, das quais 57,5% foram rotuladas por IA. O PM treinado nessa mistura vira a recompensa do PPO, com os mesmos hiperparâmetros de RL do trabalho anterior de RLHF da Anthropic. A política parte do SL-CAI, que também é a referência da penalidade KL:</p>
+  <div class="la-eq">
+    \[ \max_{\theta}\; \mathbb{E}_{x\sim\mathcal{D},\; y\sim\pi_\theta(\cdot\mid x)}\Big[\, r_\phi(x,y) \;-\; \beta\,\log\frac{\pi_\theta(y\mid x)}{\pi_{\text{SL-CAI}}(y\mid x)} \Big] \]
+    <ul class="la-eq-legend">
+      <li>\(r_\phi\): o PM treinado em helpfulness humana + harmlessness de IA</li>
+      <li>\(\pi_{\text{SL-CAI}}\): a política de partida, congelada como referência</li>
+      <li>\(\beta\): o coeficiente da coleira KL (o HH-RLHF, o “trabalho anterior”, usava \(\lambda_{KL} = 0{,}001\))</li>
+      <li>em esperança, o termo de log-razão é \(\beta\,D_{KL}(\pi_\theta\,\|\,\pi_{\text{SL-CAI}})\), como no <a data-ch="ppo-rlhf">capítulo de PPO</a></li>
+    </ul>
+  </div>
+  <p>Há uma razão técnica para partir do SL-CAI além de “ele já é menos nocivo”. As respostas comparadas pelo rotulador vieram do SL-CAI, então o PM foi treinado exatamente na distribuição que a política produz no início do RL. O PM começa avaliando o tipo de texto que viu no treino, e só se afasta dele à medida que a política se afasta, que é justamente o que a coleira KL limita.</p>
+  <figure class="la-fig" id="fig-fabrica" data-title="A fábrica de preferências RLAIF">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Fluxo da esquerda para a direita: prompts de red team → duas respostas do SL-CAI → rotulador com princípio sorteado → rótulo suave → modelo de preferência (que também recebe os pares humanos de helpfulness, barra de proporção) → laço de PPO, com a mola KL presa ao SL-CAI. No modo d-RLAIF o PM some e o juiz LLM dá a nota direto dentro do laço. Com a troca de posição ligada, cada par é rotulado duas vezes e os rótulos são promediados; os rótulos individuais mostrados são <b>ilustrativos</b>, as contagens são as do paper.</figcaption>
+  </figure>
+  <h3>RLAIF compete com RLHF?</h3>
+  <p>Lee et al. (Google, arXiv 2309.00267) fizeram a comparação direta em três tarefas, com um PaLM 2 L instruído como rotulador e um PaLM 2 XS como política. Os avaliadores humanos preferiram as políticas RLAIF e RLHF ao SFT em 71% e 73% dos casos em sumarização, e 63% e 64% em diálogo útil, diferenças não significativas entre os dois métodos. No diálogo inofensivo, a taxa de respostas inofensivas foi de 88% com RLAIF, 76% com RLHF e 64% com SFT. Três achados adicionais importam para quem vai montar um pipeline:</p>
+  <ul>
+    <li>O RLAIF funciona mesmo quando o rotulador tem o <b>mesmo tamanho</b> da política, ou é o <b>mesmo checkpoint</b> da política inicial: o modelo melhora a si mesmo.</li>
+    <li>CoT no rotulador melhorou de forma consistente o alinhamento com humanos; preâmbulos detalhados e <i>few-shot</i> só ajudaram em algumas tarefas.</li>
+    <li>O <span class="la-term" data-term="d-rlaif">d-RLAIF</span> (<i>direct RLAIF</i>) pula o PM: durante o RL, um LLM pronto dá diretamente uma nota de 1 a 10 a cada resposta. Isso evita um PM “velho”, treinado numa distribuição que a política já abandonou, e igualou ou superou o RLAIF canônico. O RL desse trabalho foi REINFORCE com baseline, não PPO.</li>
+  </ul>
+  <div class="la-callout info"><b class="t">E se eu não quiser PPO?</b><p>Os pares rotulados por IA são pares de preferência como quaisquer outros. Dá para entregá-los ao <a data-ch="dpo">DPO</a>, que dispensa o PM e o laço de RL, ou fazer a versão online, em que a política gera dois candidatos, um juiz LLM escolhe e o passo de DPO é dado em seguida (a família OAIF/Online DPO). O <a data-ch="grpo-rlvr">GRPO</a> também serve: o juiz instruído pela constituição dá a recompensa escalar de cada resposta do grupo. A ideia do CAI (princípios escritos + rótulos de IA) é independente do otimizador.</p></div>
+  <div class="la-callout recipe" data-recipe="all"><b class="t"><span class="la-rb all"></span> Ponte com o Módulo 1</b><p>No RLAIF existem <b>dois</b> modelos gerando ou pontuando texto dentro do laço: a política (rollouts) e o juiz (rótulos ou notas). Os dois são cargas de inferência, e no d-RLAIF o juiz roda a cada passo de RL. Tudo o que o Módulo 1 ensinou sobre servir um modelo de fronteira (batching contínuo, KV cache, prefix caching, especulação) vale aqui duas vezes: uma das receitas pode ser, literalmente, o juiz. A última seção mostra quais flags de cache das receitas pesam nesse laço e por quê.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>O que se ganha e o que se perde: Pareto, evasão e Goodhart</h2>
+  <p>O resultado central do paper é o gráfico de <span class="la-term" data-term="elo">Elo</span> de harmlessness contra Elo de helpfulness (Elo é o rating do xadrez: uma diferença de Elo vira uma probabilidade de vencer a comparação, como no Bradley–Terry), avaliados por crowdworkers, para todas as corridas de RL de 52B. Os modelos Helpful-RLHF e HH-RLHF desenham o trade-off clássico. O RL-CAI fica <b>acima</b> dessa curva: menos nocivo para o mesmo nível de utilidade. A variante com CoT fica ainda melhor. Os avaliadores também preferiram o RL-CAI aos modelos treinados com rótulos humanos de dano.</p>
+  <p>Um detalhe de protocolo muda a leitura do gráfico: os crowdworkers foram instruídos a preferir a resposta <b>menos evasiva</b> quando as duas fossem igualmente inofensivas. Ou seja, o eixo de inofensividade desse experimento já penaliza o “não posso ajudar”. É uma escolha de valores embutida na avaliação, e ela favorece justamente o comportamento que o CAI tenta ensinar. Não invalida o resultado, mas lembra que “mais inofensivo” sempre significa “mais inofensivo segundo algum critério”.</p>
+  <h3>Goodhart no RL-CAI</h3>
+  <p>O PM é um <span class="la-term" data-term="proxy">proxy</span>, e otimizar um proxy com força suficiente o quebra: é a <span class="la-term" data-term="lei-de-goodhart">lei de Goodhart</span>. O paper descreve o sintoma no RL-CAI sobretreinado: o modelo fica <b>duro demais</b> com prompts nocivos, ou inclui <b>boilerplate</b> (frases de acolhimento genéricas, por exemplo) em quase todas as respostas de red team. As mitigações foram qualitativas: reescrever os princípios para desencorajar respostas super-reativas ou acusatórias, usar o ensemble de princípios e aplicar o clamp nos rótulos de CoT.</p>
+  <p>Gao, Schulman e Hilton mediram esse fenômeno em geral, com um RM “ouro” sintético fazendo o papel do julgamento verdadeiro. Em função de \(d = \sqrt{D_{KL}(\pi\,\|\,\pi_{\text{init}})}\), a recompensa ouro sob RL segue</p>
+  <div class="la-eq">
+    \[ R_{\text{ouro}}(d) = d\,\big(\alpha - \beta_{G}\log d\big), \qquad \frac{dR_{\text{ouro}}}{dd} = 0 \;\Rightarrow\; d^{\dagger} = e^{\alpha/\beta_G - 1} \]
+    <ul class="la-eq-legend">
+      <li>\(d\): distância percorrida desde o modelo inicial, na raiz do KL (nats)</li>
+      <li>\(\alpha, \beta_G\): coeficientes ajustados por experimento (o \(\beta_G\) aqui é do Gao, não o da coleira KL)</li>
+      <li>\(d^{\dagger}\): o pico; além dele, a recompensa do proxy continua subindo e a verdadeira cai</li>
+      <li>com os valores ilustrativos \(\alpha=1\), \(\beta_G=0{,}5\): pico em \(d=e\), KL \(=7{,}39\) nats, \(R=1{,}359\)</li>
+    </ul>
+  </div>
+  <p>A figura junta as duas peças: a curva ouro do Gao e um PM proxy que cresce sem parar. A coleira KL decide onde a política para. Num modelo de brinquedo em que o proxy cresce linearmente, \(r_{\text{proxy}}(d) = a\,d\), o objetivo regularizado \(a\,d - \beta\,d^2\) tem ótimo em \(d^* = a/(2\beta)\). Coleira frouxa demais, e a política atravessa o pico e cai no boilerplate; apertada demais, e ela nem sai do SL-CAI.</p>
+  <figure class="la-fig" id="fig-goodhart" data-title="A coleira KL e o ponto doce">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Eixo x: \(d=\sqrt{KL}\) desde o SL-CAI. Linha lavanda: escore do PM (proxy). Curva menta: qualidade “verdadeira”, na forma de Gao et al. com \(\alpha=1\), \(\beta_G=0{,}5\). A política (bolinha) caminha durante o treino até \(d^*=a/(2\beta)\), presa pela mola ao SL-CAI. O balão mostra o estilo de resposta típico da região, do engajado ao boilerplate. Tudo é <b>ilustrativo</b>: a forma da curva ouro é a do paper do Gao, mas os coeficientes não são de nenhum experimento; o efeito do clamp (encolher a escala do proxy) é uma interpretação. O \(\beta\) do controle está numa escala de brinquedo; o 0,001 do HH-RLHF multiplica um KL por token numa escala de recompensa diferente, e os dois números não se comparam.</figcaption>
+  </figure>
+  <div class="la-callout why"><b class="t">A evasão também era um Goodhart</b><p>Vale virar o raciocínio ao contrário (interpretação nossa). O assistente evasivo do RLHF anterior não era “seguro demais”: ele estava otimizando o proxy que tinha, um avaliador humano que premiava a fuga diante de pedidos nocivos. O CAI troca o proxy por outro, um rotulador guiado por princípios que pedem engajamento cuidadoso. Isso não elimina o Goodhart, só o muda de lugar, e por isso o boilerplate apareceu. Todo pipeline de alinhamento precisa de um detector de Goodhart: monitorar o KL, ler amostras e medir a sobre-recusa.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Desdobramentos: da lista de princípios à especificação raciocinada</h2>
+  <p>De 2023 a 2026 a ideia central (escrever o comportamento em texto e deixar modelos aplicarem o texto) se espalhou em várias direções. Elas diferem principalmente em <b>onde a constituição mora</b> e em <b>quem raciocina sobre ela</b>.</p>
+  <h3>Collective Constitutional AI: quem escreve os princípios?</h3>
+  <p>Huang et al. (Anthropic + Collective Intelligence Project, arXiv 2406.07814) atacaram a crítica mais óbvia: quem decide o que vai na constituição? Uma amostra representativa de <b>1.002 adultos dos EUA</b> (por idade, gênero, renda e geografia) deliberou na plataforma <span class="la-term" data-term="polis">Polis</span>, produzindo <b>1.127 afirmações</b> e <b>38.252 votos</b>. A constituição “pública” resultante compartilhava cerca de <b>50%</b> dos conceitos com a constituição padrão da Anthropic, e seus princípios foram em grande parte escritos pelos próprios participantes. O modelo treinado com CAI nessa constituição mostrou <b>menos viés em nove dimensões sociais</b> (no <span class="la-term" data-term="bbq">BBQ</span>, um benchmark de viés social em perguntas ambíguas), com desempenho equivalente em linguagem, matemática e avaliações de utilidade e inofensividade, e em temas contenciosos tendeu a <b>reenquadrar positivamente</b> em vez de recusar.</p>
+  <h3>Deliberative alignment: o modelo raciocina sobre a especificação</h3>
+  <p>O <span class="la-term" data-term="deliberative-alignment">deliberative alignment</span> (Guan et al., OpenAI, arXiv 2412.16339), usado na série o (o1-preview, o1, o3-mini), ensina o modelo a <b>recordar e raciocinar explicitamente</b> sobre uma <span class="la-term" data-term="especificacao">especificação</span> de segurança dentro da própria cadeia de pensamento, antes de responder.</p>
+  <ol class="la-steps">
+    <li><b>Estágio SFT.</b> Para prompts com uma categoria de segurança, a spec daquela categoria vai para o system prompt de um modelo de raciocínio treinado só para helpfulness. Ele gera pares (CoT, resposta) que <b>citam a política</b>. Um juiz \(G_{\text{RM}}\), que também vê a spec, filtra os exemplos, e o escore é o <b>mínimo</b> de \(k\) julgamentos (um exemplo só passa se nenhuma das \(k\) leituras o reprovar). Por fim, <b>a spec é removida do prompt</b>: o treino usa (prompt, CoT, resposta). É destilação de contexto, a mesma do SL-CAI.</li>
+    <li><b>Estágio RL.</b> O mesmo juiz com acesso à spec dá a recompensa para prompts de segurança, mas <b>o CoT fica escondido do juiz</b>, para não aplicar pressão direta sobre o raciocínio e reduzir a chance de CoTs enganosos. O sinal de RL foi adicionado no o1 e no o3-mini.</li>
+  </ol>
+  <p>Não há CoT nem resposta escritos por humanos, e o método ao mesmo tempo aumentou a robustez a jailbreaks e reduziu a sobre-recusa. Interpretação nossa: é o CAI de terceira geração. A constituição vira uma especificação longa e categorizada, e o raciocínio sobre ela passa do rotulador para dentro do próprio modelo.</p>
+  <h3>Recompensas por regras e classificadores constitucionais</h3>
+  <p>Duas variações usam a mesma ideia fora do formato original. As <span class="la-term" data-term="rule-based-rewards">Rule Based Rewards</span> (Mu et al., OpenAI, arXiv 2411.01111) escrevem uma coleção de regras de comportamento desejado e indesejado (por exemplo, “recusas não devem ser julgadoras”) e usam um grader LLM com prompts <i>few-shot</i> compostos <b>diretamente como recompensa</b> no RL. O F1 entre segurança e utilidade foi 97,1, contra 91,7 do baseline com feedback humano e 95,8 do baseline só-útil, com muito menos sobre-recusa.</p>
+  <p>Os <span class="la-term" data-term="constitutional-classifiers">Constitutional Classifiers</span> (Sharma et al., Anthropic, arXiv 2501.18837) não pós-treinam a política: treinam classificadores de entrada e saída com dados <b>sintéticos</b> gerados a partir de uma constituição de conteúdo permitido e restrito. Em mais de 3.000 horas estimadas de red teaming, nenhum jailbreak universal extraiu informação no nível de detalhe de um modelo sem proteção na maioria das consultas-alvo. O custo: +0,38 ponto percentual de recusas no tráfego de produção e 23,7% de overhead de inferência.</p>
+  <h3>A constituição de 2026: explicar o porquê</h3>
+  <p>Em janeiro de 2026, a Anthropic publicou uma nova constituição do Claude, muito diferente da lista de 2022. É um documento extenso (a imprensa fala em mais de 80 páginas, ~23 mil palavras; fonte secundária), escrito “principalmente para o Claude” e usado diretamente no treinamento, com licença CC0 1.0. Três elementos estruturais:</p>
+  <ul>
+    <li>Uma <b>ordem de prioridade</b> para conflitos aparentes: (1) amplamente seguro, (2) amplamente ético, (3) conforme às diretrizes da Anthropic, (4) genuinamente útil.</li>
+    <li><span class="la-term" data-term="restricoes-rigidas">Restrições rígidas</span> (<i>hard constraints</i>) que nunca devem ser cruzadas, como dar ganho significativo a um ataque com arma biológica.</li>
+    <li>Em vez de regras soltas, o documento <b>explica o porquê</b> dos comportamentos, para que o modelo generalize a situações novas aplicando princípios amplos.</li>
+  </ul>
+  <p>No treino, o próprio Claude usa a constituição para construir dados sintéticos de vários tipos: dados para entender o documento, conversas em que ele é relevante, respostas alinhadas aos valores e <b>rankings de respostas possíveis</b>. O último item é a geração de preferências do RL-CAI, ampliada.</p>
+  <figure class="la-fig" id="fig-geracoes" data-title="Onde mora a constituição?">
+    <div class="la-fig-stage" style="height:430px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Três atores: os dados de treino, o juiz ou rotulador e a política. O pergaminho âmbar (a constituição ou especificação) se desloca conforme a geração escolhida; os fluxos mostram o que vira sinal de treino. Em “Collective”, a nuvem de pontos representa os 1.002 participantes (um ponto a cada ~10), e a sobreposição de ~50% com a constituição padrão aparece como interseção. Contagens e fatos são das fontes; a disposição espacial é só esquemática.</figcaption>
+  </figure>
+  <table>
+    <thead><tr><th>Método</th><th>Onde estão os princípios</th><th>Quem raciocina sobre eles</th><th>Sinal de treino</th></tr></thead>
+    <tbody>
+      <tr><td>CAI (2022)</td><td>prompts de crítica, revisão e comparação</td><td>a política (crítica) e o rotulador</td><td>SFT em revisões + PM de rótulos suaves + PPO</td></tr>
+      <tr><td>RLAIF / d-RLAIF (2023)</td><td>preâmbulo do rotulador ou do juiz</td><td>o juiz</td><td>PM ou nota direta 1–10 no RL</td></tr>
+      <tr><td>Collective CAI (2023–24)</td><td>constituição escrita por 1.002 pessoas</td><td>como no CAI</td><td>como no CAI</td></tr>
+      <tr><td>Deliberative alignment (2024)</td><td>spec por categoria, depois removida</td><td>a própria política, no CoT</td><td>SFT destilado + RL com juiz que não vê o CoT</td></tr>
+      <tr><td>Rule Based Rewards (2024)</td><td>regras + prompts do grader</td><td>o grader</td><td>recompensa direta no RL</td></tr>
+      <tr><td>Constituição do Claude (2026)</td><td>documento longo e explicativo</td><td>o modelo, ao gerar dados sintéticos</td><td>dados de vários tipos, inclusive rankings</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="la-sec">
+  <h2>Editar uma direção × ensinar princípios</h2>
+  <p>No <a data-ch="abliteracao">capítulo 19</a> você viu o caminho oposto ao deste capítulo. As receitas têm um interruptor (<code>ABLIT=1</code> no GLM e no Qwen, <code>ABLITERATED=1</code> no DeepSeek) que <b>remove</b> o comportamento de recusa sem um único passo de treino. A <span class="la-term" data-term="abliteracao">abliteração</span> estima uma <span class="la-term" data-term="direcao-de-recusa">direção de recusa</span> \(r\) pela diferença de médias das ativações em prompts recusados e atendidos, e então ortogonaliza as matrizes que escrevem no resíduo:</p>
+  <div class="la-eq">
+    \[ W' = \Big(I - \alpha\,\frac{r\,r^\top}{\lVert r\rVert^2}\Big)W \quad\Longrightarrow\quad \Delta W_{\text{abl}} = -\,\alpha\,\hat r\,\big(\hat r^\top W\big) \]
+    <ul class="la-eq-legend">
+      <li>\(W\): um escritor do resíduo (o <code>o_proj</code> no GLM)</li>
+      <li>\(\hat r = r/\lVert r\rVert\): a direção de recusa normalizada</li>
+      <li>\(\alpha\): a força (1 remove; 3, o padrão do GLM, sobre-projeta)</li>
+      <li>\(\Delta W_{\text{abl}}\): um produto externo de um vetor coluna por um vetor linha, ou seja, uma matriz de <b>posto 1</b></li>
+      <li><span class="la-term" data-term="posto">posto</span> = número de <span class="la-term" data-term="valores-singulares">valores singulares</span> não nulos = quantas direções independentes a mudança toca (cada valor singular mede quanto a matriz estica uma dessas direções)</li>
+    </ul>
+  </div>
+  <p>O pós-treino do CAI faz algo de natureza diferente. Num passo de SFT ou de RL, o gradiente de uma camada linear \(z = Wx\) em relação aos pesos, para <i>um</i> token, também é um produto externo: \(\nabla_W\mathcal{L} = \delta\,x^\top\), onde \(\delta\) é o gradiente que chega na saída. A diferença é que o treino soma esses produtos para milhares de tokens, em milhares de exemplos, cada um com seu \(x\) e seu \(\delta\):</p>
+  <div class="la-eq">
+    \[ \Delta W_{\text{treino}} = -\,\eta \sum_{k=1}^{K} \delta_k\, x_k^\top \qquad \mathrm{posto}\big(\Delta W_{\text{treino}}\big) \le \min(K, d) \]
+    <ul class="la-eq-legend">
+      <li>\(\eta\): taxa de aprendizado; \(K\): número de tokens (vezes passos) que contribuíram</li>
+      <li>\(\delta_k\), \(x_k\): gradiente na saída e ativação de entrada do token \(k\)</li>
+      <li>cada termo tem posto 1, mas a soma de muitos termos em direções diferentes pode ter posto alto</li>
+      <li>a equação vale com SGD puro; no Adam(W), que é o que se usa na prática, a divisão elemento a elemento por \(\sqrt{\hat v}\) já quebra a estrutura de posto 1 de cada passo; a <span class="la-term" data-term="lora">LoRA</span> impõe posto \(\le r\) pela própria parametrização \(\Delta W = BA\) (tipicamente \(r\) = 8–64)</li>
+    </ul>
+  </div>
+  <figure class="la-fig" id="fig-direcao" data-title="Bisturi de posto 1 × mudança aprendida">
+    <div class="la-fig-stage" style="height:470px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Em cima, uma matriz \(W\) de 6×6 e a mudança \(\Delta W\) com os valores nas células. À direita, os valores singulares de \(\Delta W\): na abliteração só um é diferente de zero; no treino (SGD puro, como na equação), cada passo soma um produto externo \(\delta x^\top\) novo e o posto cresce. Embaixo, ativações de prompts nocivos (rosa) e inofensivos (menta) no plano (componente em \(\hat r\), uma direção ortogonal): a abliteração achata a componente em \(\hat r\), o treino move as nuvens de forma mais rica. Matrizes, vetores e nuvens são <b>ilustrativos</b> (sementes fixas); a álgebra é exata.</figcaption>
+  </figure>
+  <table>
+    <thead><tr><th>Aspecto</th><th>Abliteração (Módulo 1)</th><th>Pós-treino tipo CAI (Módulo 2)</th></tr></thead>
+    <tbody>
+      <tr><td>Mecanismo</td><td>edição fechada \(W'=(I-\alpha\hat r\hat r^\top)W\) nos escritores do resíduo, ou projeção em runtime (DeepSeek)</td><td>gradiente sobre uma perda (NLL nas revisões, PM + PPO, DPO)</td></tr>
+      <tr><td>Dados</td><td>~centenas de prompts para estimar \(r\)</td><td>milhares a centenas de milhares de exemplos, pares ou recompensas</td></tr>
+      <tr><td>Posto da mudança</td><td>1 por matriz editada</td><td>LoRA: \(\le r\) (8–64); full fine-tuning: alto no papel, baixo posto efetivo na prática</td></tr>
+      <tr><td>Custo</td><td>minutos, sem backprop</td><td>horas a dias</td></tr>
+      <tr><td>O que muda</td><td>um “interruptor” linear de comportamento</td><td>o que o modelo diz, como explica e como generaliza</td></tr>
+    </tbody>
+  </table>
+  <p>Cuidado para não ler a tabela como “posto 1 contra posto alto”. Na prática, a mudança de um fine-tune tem posto efetivo baixo, e é por isso que a LoRA funciona. A diferença decisiva é outra: a mudança do pós-treino é <b>aprendida de dados</b> e espalhada por todas as camadas, enquanto a abliteração é <b>editada à mão</b> numa única direção escolhida por quem edita.</p>
+  <p>Arditi et al. mostraram, em <b>13 modelos de chat abertos de até 72B</b>, que a recusa é mediada por um subespaço de dimensão 1: apagar a direção desliga a recusa, somá-la provoca recusa em prompts inofensivos. Uma leitura natural (interpretação) é que o pós-treino de segurança, CAI incluído, é o que <i>cria ou fortalece</i> essa direção. A abliteração desliga o interruptor que o pós-treino instalou, mas não reescreve o resto do que foi aprendido. Interpretação nossa: é por isso que um modelo abliterado não vira um modelo “helpful-only” limpo: ele continua com o estilo e o conhecimento do pós-treino, só que sem o gatilho de recusa.</p>
+  <p>Há indícios de que princípios generalizam de forma mais ampla que uma direção. MacDiarmid et al. (Anthropic, 2025) citam o resultado de Kundu et al. (2023): CAI com <b>uma única frase</b>, “faça o que é melhor para a humanidade”, produziu comportamento desejável amplo. O mesmo trabalho mostra o lado sombrio da generalização: treino estreito em reward hacking generalizou para desalinhamento amplo. Princípios e recompensas ensinam “quem o modelo é”, para o bem e para o mal.</p>
+  <h3>Consequências práticas da relação</h3>
+  <ul>
+    <li><b>A ordem importa.</b> Abliterar e depois fazer SFT ou DPO pode reintroduzir recusas, se os dados de chat contiverem recusas. O contrário também acontece: SFT benigno sozinho já corrói recusas (Qi et al.). Abliterar <b>depois</b> de um pós-treino exige reestimar \(r\) no modelo novo, porque a direção muda com o fine-tune.</li>
+    <li><b>DPO sobre um base abliterado</b> ancora o termo KL no comportamento sem recusa: a referência passa a ser o modelo abliterado.</li>
+    <li><b>A direção de recusa vira sonda.</b> Projete as ativações de prompts nocivos e inofensivos sobre \(\hat r\) estimada no modelo base; uma queda grande da projeção média depois do fine-tune antecipa regressão de segurança antes de rodar benchmarks caros.</li>
+    <li><b>A distribuição muda e o motor percebe.</b> Na receita DeepSeek, o EVAL.md registra que a abliteração “drena” a aceitação da especulação (0,585 com o checkpoint abliterado contra 0,718 de outra sonda, sem A/B controlado; <a data-ch="abliteracao">capítulo 19</a>). Um fine-tune de CAI também desloca a distribuição, e a aceitação de um rascunhador treinado no base tende a cair na proporção da deriva (inferência; magnitude não medida).</li>
+  </ul>
+  <div class="la-callout danger"><b class="t">Responsabilidade</b><p>Remover recusas sem governança é uma decisão de política, não de engenharia. Quem abliterar ou pós-treinar um modelo para reduzir recusas assume as salvaguardas que o modelo deixou de ter: controle de acesso, filtragem, revisão humana e documentação de quem pode usar o modelo e para quê. O CAI existe justamente para que um modelo seja útil <i>e</i> recuse o que deve recusar, explicando por quê.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Limites, riscos e avaliação de segurança</h2>
+  <p>O CAI troca rótulos humanos por julgamentos de modelos, e cada troca dessas tem um preço. A tabela resume os riscos com a evidência de cada um:</p>
+  <table>
+    <thead><tr><th>Risco</th><th>Evidência</th><th>Fonte</th></tr></thead>
+    <tbody>
+      <tr><td>Goodhart do PM de IA</td><td>boilerplate e dureza excessiva no RL-CAI sobretreinado</td><td>Bai et al.</td></tr>
+      <tr><td>Calibração do rotulador</td><td>CoT gera rótulos quase 0/1 e exige clamp</td><td>Bai et al.</td></tr>
+      <tr><td>Quem escreve a constituição</td><td>princípios <i>ad hoc</i>; o CCAI mostra ~50% de divergência com a constituição pública</td><td>Bai et al.; Huang et al.</td></tr>
+      <tr><td>Viés do rotulador vira viés do modelo</td><td>autorrotulagem tende a reforçar preferências do próprio modelo (<span class="la-term" data-term="autopreferencia">autopreferência</span>); juízes LLM têm viés de posição e de verbosidade</td><td>interpretação; Lee et al.; Zheng et al.</td></tr>
+      <tr><td>Pressão no CoT gera ofuscação</td><td>o juiz não vê o CoT no deliberative alignment; um monitor de CoT usado como recompensa gera hacks ofuscados</td><td>Guan et al.; Baker et al.</td></tr>
+      <tr><td>Generalização inesperada</td><td>treino estreito generaliza amplo, nos dois sentidos</td><td>MacDiarmid et al.; Kundu et al.</td></tr>
+    </tbody>
+  </table>
+  <h3>Avaliar segurança nos dois sentidos</h3>
+  <p>Um modelo pode falhar em segurança de dois jeitos opostos, e medir só um deles esconde o outro. A <span class="la-term" data-term="sobre-recusa">sobre-recusa</span> é recusar o que é seguro (o assistente evasivo). O <span class="la-term" data-term="cumprimento-indevido">cumprimento indevido</span> é atender ao que não deveria. Os benchmarks de referência:</p>
+  <ul>
+    <li><span class="la-term" data-term="xstest">XSTest</span>: <b>250 prompts seguros</b> de 10 tipos, que soam perigosos mas um modelo calibrado não deveria recusar, mais <b>200 inseguros</b> de contraste. Mede a sobre-recusa.</li>
+    <li><span class="la-term" data-term="strongreject">StrongREJECT</span>: prompts que exigem informação nociva específica e um avaliador que mede a <i>utilidade</i> da resposta. Achado: jailbreaks que furam a recusa costumam degradar a capacidade, então uma taxa binária de sucesso superestima o dano.</li>
+    <li><span class="la-term" data-term="harmbench">HarmBench</span>: framework padronizado com 18 métodos de red teaming e 33 LLMs e defesas-alvo; a métrica é a taxa de sucesso de ataque, medida por um classificador.</li>
+  </ul>
+  <p>A figura mostra por que os dois eixos são inseparáveis. Imagine que o modelo atribui a cada prompt um “risco percebido” e recusa acima de um limiar. Mover o limiar troca um erro pelo outro; só um modelo que <i>separa melhor</i> os prompts reduz os dois ao mesmo tempo, e essa é a versão “de avaliação” da fronteira de Pareto do começo do capítulo.</p>
+  <figure class="la-fig" id="fig-seguranca" data-title="Dois erros de segurança, um limiar">
+    <div class="la-fig-stage" style="height:450px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Distribuições do “risco percebido” para 250 prompts seguros (menta) e 200 inseguros (rosa), nos tamanhos do XSTest. O limiar vertical decide a recusa: mova-o pelo controle ou arraste-o direto no gráfico. A matriz 2×2 conta os quatro desfechos; a curva à direita é a fronteira (sobre-recusa × cumprimento indevido) varrendo o limiar, com o ponto atual. Os perfis de modelo e suas distribuições são <b>ilustrativos</b>; só os tamanhos dos conjuntos vêm do XSTest.</figcaption>
+  </figure>
+  <p>Três cuidados para a sua bateria de avaliação, detalhados no <a data-ch="avaliacao-pos-treino">capítulo de avaliação</a>:</p>
+  <ul>
+    <li><b>Fine-tuning corrói alinhamento.</b> Qi et al. furaram as salvaguardas do GPT-3.5 Turbo com 10 exemplos adversariais, por menos de US$ 0,20 via API de fine-tuning, e mostraram que até dados benignos degradam a segurança, em menor grau. Todo SFT de domínio precisa do eixo de segurança na bateria.</li>
+    <li><b>Meça a deriva em nats.</b> O KL do modelo pós-treinado em relação ao de partida, num texto genérico, é o orçamento gasto pelo pós-treino.</li>
+    <li><b>Leia amostras.</b> Boilerplate e moralismo raramente aparecem num número agregado, e aparecem na primeira página de amostras.</li>
+  </ul>
+  <div class="la-callout warn"><b class="t">Tratamento responsável dos dados de red team</b><p>Um pipeline de CAI produz, de propósito, centenas de milhares de respostas nocivas no primeiro passo do laço. Trate esse material como dado sensível: acesso restrito, sem publicação das gerações intermediárias, retenção mínima e registro do que foi gerado e por quê. O conjunto que vale a pena guardar e compartilhar é o de <b>revisões</b>, não o de respostas originais.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Na prática: um pipeline CAI com as ferramentas do Módulo 1</h2>
+  <p>Não existe um <i>trainer</i> de CAI pronto: CAI é um <b>pipeline</b> que combina geração em massa, SFT e otimização de preferências. Um roteiro para um laboratório pequeno:</p>
+  <ol class="la-steps">
+    <li><b>Escreva a constituição.</b> Poucos princípios, curtos, cada um com o seu porquê. Escreva pedidos de crítica e de revisão emparelhados a cada princípio do SL, e instruções de comparação para o RL. Inclua princípios contra o excesso (“não seja acusatório”, “não acrescente avisos genéricos”): foi a mitigação de Goodhart do paper.</li>
+    <li><b>Monte os prompts.</b> Prompts de red team humanos, ampliados por <i>few-shot</i> num modelo (o paper multiplicou 42.496 por mais de 4×), e prompts de helpfulness para que o SFT não aprenda a recusar tudo.</li>
+    <li><b>Rode o laço crítica → revisão</b> num modelo forte servido por API compatível com OpenAI (uma receita do Módulo 1 serve). Use <i>few-shot</i> para fixar os papéis, \(T=1\) (para as revisões variarem) e um princípio sorteado por rodada. Rode as rodadas de cada conversa em sequência, para o cache ainda ter a rodada anterior (veja abaixo). Guarde só (prompt, revisão final).</li>
+    <li><b>Faça o SFT</b> nas revisões + amostras úteis (<a data-ch="sft">capítulo 52</a>), com LoRA se a memória apertar (<a data-ch="treino-memoria-lora">capítulo 51</a>).</li>
+    <li><b>Gere os rótulos de IA.</b> Duas amostras por prompt do modelo SFT; o juiz lê as log-probs de “(A)” e “(B)” com um forward de prefill (<code>max_tokens: 1</code>); troque a ordem e tire a média; aplique o clamp se usar CoT.</li>
+    <li><b>Otimize.</b> PM + PPO como no paper (<a data-ch="ppo-rlhf">capítulo 55</a>), DPO nos pares (<a data-ch="dpo">capítulo 57</a>) ou a versão online com juiz (o <code>OnlineDPOTrainer</code>, em <code>trl.experimental</code>, gera com vLLM quando configurado com <code>use_vllm=True</code>).</li>
+    <li><b>Avalie nos dois sentidos</b> e contra o modelo de partida: XSTest, StrongREJECT, regressão de capacidades e KL.</li>
+  </ol>
+  <p>Um esboço do rotulador com troca de posição, falando com um servidor vLLM (o endpoint de <i>completions</i> aceita <code>logprobs</code> inteiro, até o limite de <code>--max-logprobs</code>, 20 por padrão):</p>
+  <pre data-lang="python"><code># esboço: rótulo suave RLAIF via API compatível com OpenAI (ex.: um servidor vLLM do Módulo 1)
+# servidor: vllm serve &lt;modelo&gt; --served-model-name juiz --enable-prefix-caching
+import math, random, requests
+
+URL = "http://localhost:8000/v1/completions"
+PRINCIPIOS_RL = [...]                                # instruções de comparação da sua constituição
+PREAMBULO = open("fewshot_rotulador.txt").read()     # fixo e no INÍCIO -&gt; prefix caching
+PISO = -50.0                                         # log-prob de quem ficou fora do top-20 (finita!)
+
+def sigma(u):                                        # sigmoide estável: satura em vez de estourar
+    u = max(-50.0, min(50.0, u))
+    return 1 / (1 + math.exp(-u))
+
+def logp_opcoes(conversa, a, b, principio):
+    prompt = (PREAMBULO + f"Considere a conversa entre humano e assistente:\n{conversa}\n"
+              f"{principio}\nOpções:\n(A) {a}\n(B) {b}\nA resposta é: (")
+    r = requests.post(URL, json={"model": "juiz", "prompt": prompt, "max_tokens": 1,
+                                 "temperature": 0, "logprobs": 20}).json()
+    top = r["choices"][0]["logprobs"]["top_logprobs"][0]   # {token: logprob}
+    # confira como o tokenizer do juiz quebra "(A)": o token pode ser "A" ou " A"
+    return top.get("A", PISO), top.get("B", PISO)     # piso finito: nada de -1e9 dentro do exp
+
+def rotulo_suave(conversa, a, b, clamp=None):
+    p = random.choice(PRINCIPIOS_RL)                    # um princípio sorteado por comparação
+    lA, lB = logp_opcoes(conversa, a, b, p)
+    pa_1 = sigma(lA - lB)                               # a resposta a é a opção (A)
+    lA2, lB2 = logp_opcoes(conversa, b, a, p)           # ordem trocada: a resposta a virou a opção (B)
+    pa_2 = sigma(lB2 - lA2)
+    pa = (pa_1 + pa_2) / 2                              # média contra o viés de posição
+    if clamp:                                           # ex.: (0.4, 0.6) para rótulos de CoT
+        pa = min(max(pa, clamp[0]), clamp[1])
+    return pa</code></pre>
+  <h3>O laço é um problema de serving</h3>
+  <p>A conta do começo do capítulo (1.645.479 gerações só no SL) mostra onde o tempo vai: em geração, como em todo pós-treino com dados sintéticos. E o laço crítica → revisão tem uma propriedade que o Módulo 1 sabe explorar. Cada chamada é o contexto da chamada anterior <b>mais um pedaço no fim</b>: o preâmbulo <i>few-shot</i> é idêntico em todas as chamadas, e a conversa só cresce. É o padrão ideal para o <a data-ch="prefix-caching">prefix caching</a>. Sem ele, cada rodada repete o <span class="la-term" data-term="prefill">prefill</span> de tudo o que veio antes, e o custo cresce como uma soma de contextos cada vez maiores. Com ele, o pedaço novo é só o <b>pedido anexado</b> (~30 tokens no cenário da figura): o KV da resposta anterior já foi calculado durante o decode, e o motor guarda os blocos cheios de tokens <i>gerados</i> no mesmo cache por hash, ao lado dos blocos do prompt. Esse detalhe vale quase uma ordem de grandeza. No cenário padrão da calculadora, se a resposta anterior precisasse de novo prefill, o corte seria de ≈10×; como ela já está no cache, é de ~64× com blocos de 16 tokens e ~85× no limite de um token. O mesmo vale para o rotulador: preâmbulo fixo no começo, partes variáveis no fim.</p>
+  <p>Três ressalvas decidem quanto desse ganho você vê de verdade:</p>
+  <ul>
+    <li><b>O grão do hit.</b> Só blocos <i>cheios</i> entram no cache, então o último bloco parcial da chamada anterior é recomputado: em média \((B-1)/2\) tokens por chamada, com \(B\) o tamanho do bloco (ou o <code>--prefix-match-unit</code>, quando o motor aceita hits mais finos que o bloco). O padrão do vLLM é \(B = 16\), quase de graça. Mas a DeepSeek usa blocos de 256, e os modelos híbridos das receitas sobem o bloco de atenção até a página caber o estado recorrente: ~1600 tokens na Qwen e hits alinhados a 3584 na GLM. Com rodadas de ~280 tokens e contextos de poucos milhares, esse grão grosso deixa quase tudo fora do cache. Experimente na figura. Com especulação estilo EAGLE (MTP incluído), o vLLM ainda descarta por padrão o último bloco do hit; a receita Qwen liga <code>disable_eagle_block_drop</code> porque, sem isso, o turno seguinte de uma conversa podia não acertar nada (numa sessão de 9,5k tokens, o TTFT caiu de 3,25 s para 0,63 s).</li>
+    <li><b>Re-tokenização.</b> Se você devolve a resposta como texto e o servidor re-tokeniza o prompt seguinte, a segmentação pode sair diferente da que o modelo gerou, no meio da resposta ou na fronteira com o pedido, e daquele bloco em diante o hash não bate. Mande token IDs (o endpoint de completions aceita o prompt como lista de IDs): é o mesmo cuidado do TITO (<i>token-in, token-out</i>) que o GLM-5 aplica no RL. Confira o resultado em <code>cached_tokens</code>.</li>
+    <li><b>Despejo entre rodadas.</b> Com ~183 mil conversas, se você manda a rodada 1 de todas e só depois a rodada 2, o cache (LRU) despeja os blocos de cada conversa antes de ela voltar. Limite a concorrência ao que cabe no pool de KV, ou rode as rodadas de cada conversa em sequência, com várias conversas em paralelo.</li>
+  </ul>
+  <figure class="la-fig" id="fig-custo" data-title="Calculadora do laço SL-CAI">
+    <div class="la-fig-stage" style="height:430px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>A fita mostra o contexto de um prompt crescendo a cada chamada (preâmbulo, prompt, respostas, pedidos, críticas, revisões). Com prefix caching, a parte em cache fica hachurada: tudo até a última fronteira de bloco (os tracinhos sobre a fita), inclusive os tokens que a chamada anterior <b>gerou</b>; só o pedido anexado e o resto do bloco parcial são recalculados. As barras comparam os tokens de prefill e de decode do conjunto inteiro e o tempo estimado. No cenário padrão o corte do prefill é de ~64× com grão 16 e ~85× com grão 1 (≈10× se a resposta anterior não estivesse no cache); com os grãos grossos das receitas híbridas, a esses tamanhos de contexto, quase nada. As contagens de prompts e revisões padrão são as do paper, e os grãos são os das receitas; tamanhos de texto e vazões são <b>ilustrativos</b>: meça na sua receita (prefill estimado em 10× a vazão de decode).</figcaption>
+  </figure>
+  <h3>CAI nos modelos das receitas</h3>
+  <p>Nas três receitas o prefix caching está ligado, mas com grãos e ferramentas diferentes, e é isso que decide quanto o laço CAI economiza quando uma delas serve de professor ou de juiz:</p>
+  <table class="la-params">
+    <thead><tr><th>Parâmetro</th><th>Valor</th><th>Receita</th><th>O que faz</th><th>Por que importa</th></tr></thead>
+    <tbody>
+      <tr><td><code>--enable-prefix-caching</code></td><td>sempre; hits alinhados a 3584 tokens</td><td><span class="la-rb glm"></span></td><td>Hash de blocos cheios e reuso do KV entre requisições; no stack híbrido (MLA + KDA) todo hit termina num múltiplo de 3584</td><td>Um follow-up de ~8k reutiliza 7168 de 8004 tokens (≈ 90%). No laço CAI curto, com contextos de 1,5–4k, o grão de 3584 quase não acerta: o ganho volta com preâmbulos e históricos de vários blocos.</td></tr>
+      <tr><td><code>--block-size</code> (com prefix caching)</td><td>256</td><td><span class="la-rb ds"></span></td><td>Tamanho do bloco do KV paginado e grão do hash encadeado: o hash de cada bloco depende de todos os anteriores</td><td>Recomputa em média ~128 tokens por chamada (o bloco parcial). E qualquer mudança no começo do prompt (a receita viu isso com uma diretiva de esforço logo após o BOS) zera o compartilhamento de tudo o que vem depois: deixe as partes variáveis no fim.</td></tr>
+      <tr><td>prefix caching (padrão do vLLM; Mamba <code>align</code>)</td><td>ligado; bloco ≈1600</td><td><span class="la-rb qwen"></span></td><td>O alocador híbrido sobe o bloco de atenção até a página caber o estado GDN; o reuso só acontece em fronteiras de ~1600 tokens</td><td>No laço curto, a maior parte de cada rodada fica fora do cache. O ganho aparece com históricos longos: um prompt de 600k cai de 336 s, frio, para ~3–9 s com o cache quente.</td></tr>
+      <tr><td><code>--enable-prompt-tokens-details</code></td><td>sempre</td><td><span class="la-rb ds"></span> <span class="la-rb qwen"></span></td><td>Devolve <code>cached_tokens</code> no <code>usage</code> de cada resposta</td><td>Meça em vez de supor: some <code>cached_tokens</code> por rodada do laço e compare com a conta da figura. Se der perto de zero, procure re-tokenização, despejo ou um grão grosso demais.</td></tr>
+      <tr><td><code>--max-logprobs</code></td><td>20 (padrão do vLLM)</td><td><span class="la-rb all"></span></td><td>Teto do campo <code>logprobs</code> por posição na API, no servidor do juiz</td><td>O rotulador lê só “A” e “B” no top-k; se uma delas cair fora do top-20, use um piso finito (o esboço usa −50) ou suba o teto.</td></tr>
+    </tbody>
+  </table>
+  <div class="la-callout recipe" data-recipe="ds"><b class="t"><span class="la-rb ds"></span> DeepSeek</b><p>O relatório do DeepSeek-V3 (seção 5.4.2, “Self-Rewarding”) diz que, para cenários gerais sem verificação por ferramenta, o modelo adota “a abordagem de constitutional AI”, usando os <b>resultados de votação do próprio DeepSeek-V3</b> como fonte de feedback, e que integrar insumos constitucionais adicionais otimiza o modelo na direção constitucional. No DeepSeek-V4, o próprio ator é também o RM generativo com rubricas: a política julga, e o julgamento vira recompensa.</p></div>
+  <div class="la-callout recipe" data-recipe="all"><b class="t"><span class="la-rb all"></span> MiMo e as três receitas</b><p>O “Aligned RL” do MiMo-V2.6 (o modelo do tutorial do <a data-ch="receita-do-zero">capítulo 46</a>) começa com um <i>cold start</i> de autocorreção: o modelo reflete sobre seus turnos desalinhados (por exemplo, reward hacking) e os reescreve como próximos passos fundamentados, e esses exemplos entram no mid-training. Interpretação nossa: é o laço crítica → revisão do SL-CAI aplicado a trajetórias agênticas. Nas três receitas do Módulo 1, por fim, o interruptor de abliteração é o espelho deste capítulo: ele desliga, em minutos, um comportamento que o pós-treino levou dias para construir.</p></div>
+  <p>O CAI pôs um modelo para julgar outro, ou a si mesmo, segundo princípios escritos. O <a data-ch="self-play-debate">próximo capítulo</a> leva a ideia um passo adiante: em vez de um juiz que lê uma constituição, modelos que <b>competem</b> entre si, em debates e em self-play, para gerar o próprio currículo, o próprio adversário e, às vezes, o próprio juiz.</p>
+</section>

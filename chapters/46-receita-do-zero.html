@@ -1,0 +1,794 @@
+<p class="la-lead">No dia 27 de setembro de 2026 apareceu no Hugging Face o <b>MiMo-V2.6-Flash-MOPD</b>, a variante do MiMo-V2.6-Flash com uma etapa extra de pós-treino (a “MOPD”, explicada na primeira seção): 309 bilhões de parâmetros, 15 bilhões ativos por token, atenção híbrida com janela de 128 tokens, K e V de tamanhos diferentes, experts já gravados em MXFP4 e dois rascunhadores embutidos. O suporte “day-0” no vLLM existe, e esconde três bugs silenciosos. Você tem dois DGX Spark. Este capítulo é o roteiro completo, em onze passos, para transformar esse lançamento numa <b>receita</b> reproduzível no padrão das três do laboratório: cada flag com motivo, cada patch auditável, cada número marcado como <b>medido</b>, <b>estimado</b> ou <b>a medir</b>.</p>
+
+<section class="la-sec">
+  <h2>O método: onze passos, um critério de saída em cada</h2>
+  <p>Nos capítulos anteriores você desmontou três receitas prontas (<a data-ch="receita-glm">GLM</a>, <a data-ch="receita-qwen">Qwen</a> e <a data-ch="receita-deepseek">DeepSeek</a>) e aprendeu a <a data-ch="benchmarking">medir</a> o que elas entregam. Agora o problema se inverte: o modelo saiu ontem, ninguém escreveu a receita, e as instruções oficiais foram pensadas para H200 e B200, nunca para um GB10. Por onde começar?</p>
+  <p>A resposta é um <b>método</b>. São onze passos com a mesma forma: <i>objetivo → conceito → como fazer → aplicado ao modelo → critério de saída</i>. O critério de saída é a parte que mais importa. É um artefato verificável (uma tabela, uma linha de log, um teste verde), e sem ele você não avança. É isso que separa uma receita reproduzível de um “funcionou na minha máquina”.</p>
+  <p>Na figura abaixo, cada passo é uma estação de metrô. Avance com o stepper e observe duas coisas: a cor da linha e as setas de volta.</p>
+  <figure class="la-fig wide" id="fig-metro" data-title="O metrô da receita: 11 estações">
+    <div class="la-fig-stage" style="height:330px"><canvas></canvas></div>
+    <figcaption>As cores agrupam as três fases: <b>planejar no papel</b> (passos 0–3, sem ligar GPU nenhuma), <b>fazer subir certo</b> (4–7) e <b>medir e entregar</b> (8–10). As setas tracejadas são os caminhos de volta mais comuns: um teste que falha na validação manda você de volta ao motor, e o tuning volta aos argumentos de lançamento. O texto de cada estação traz o objetivo, o critério de saída e os capítulos de conceito.</figcaption>
+  </figure>
+  <p>Repare que quatro passos inteiros acontecem antes de qualquer <code>docker run</code>. Não é burocracia: o download tem ~175 GB e um boot frio leva uns 11 minutos <b>[medido: tonyd2wild]</b>. Descobrir no papel que algo não cabe, ou que um kernel não existe para o seu hardware, é ordens de grandeza mais barato do que descobrir no log.</p>
+
+  <div class="la-callout deep"><b class="t">Três selos para cada número</b>
+    <p>As receitas do laboratório seguem uma regra dura: todo número publicado é uma medição, não um palpite. O tutorial em que este capítulo se baseia marca cada valor com um de três selos, e você deve fazer o mesmo no seu README:</p>
+    <dl class="la-kv">
+      <dt>[medido: X]</dt><dd>lido de um log ou benchmark publicado por X, no hardware indicado;</dd>
+      <dt>[estimativa]</dt><dd>conta feita a partir do <code>config.json</code> e dos cabeçalhos safetensors. Serve para planejar e deve ser substituída pelo valor medido no seu kit;</dd>
+      <dt>[a medir]</dt><dd>ninguém publicou ainda: é trabalho seu.</dd>
+    </dl>
+  </div>
+
+  <h3>Por que este modelo é um bom caso de ensino</h3>
+  <p>O alvo são dois GB10 (sm_121, 128 GB de LPDDR5X unificada por nó a ~273 GB/s), dos quais o CUDA enxerga <b>121,69 GiB</b> <b>[medido: README Qwen3.8 do laboratório]</b>, ligados por ConnectX-7 com RoCE de 200 Gb/s. Na prática cabem ~160–170 GiB de pesos no par. Entre os lançamentos de agosto e setembro de 2026, o MiMo-V2.6-Flash-MOPD foi escolhido por cinco motivos:</p>
+  <div class="la-cards">
+    <div class="la-card"><span class="ic">🧮</span><h4>Cabe apertado</h4><p>São ~161 GiB de pesos para 2 × 121,7 GiB. Sobram ~15–20 GiB de KV por rank, e isso obriga a fazer a conta de memória direito. Um Spark sozinho não roda o formato nativo.</p></div>
+    <div class="la-card"><span class="ic">🧩</span><h4>Quebra suposições</h4><p>K e V com dimensões diferentes (192 × 128), KV heads que mudam com o tipo de camada (8 nas SWA, 4 nas globais), sinks só nas SWA, QKV pré-fatiado para TP=4 e experts MXFP4 com escala E8M0.</p></div>
+    <div class="la-card"><span class="ic">🐛</span><h4>Day-0 com bugs silenciosos</h4><p><code>--kv-cache-dtype fp8</code> ignorado sem aviso; QKV zerado com certos carregadores; verify especulativo num kernel lento em contexto longo. Todos com PR aberto.</p></div>
+    <div class="la-card"><span class="ic">🔁</span><h4>MOPD, não RL</h4><p><span class="la-term" data-term="mopd">MOPD</span> e RL são duas variantes de <b>pós-treino</b> do mesmo modelo base. O RL saiu do aprendizado por reforço; o MOPD é esse mesmo checkpoint com uma etapa a mais de destilação on-policy a partir de vários professores especializados (o card descreve a versão nova como <i>Multi-Prefix Multi-Teacher On-Policy Distillation</i>). Arquitetura, <code>config.json</code> (idêntico byte a byte) e drafter são os mesmos; só os pesos mudam. A etapa extra foi feita para mitigar a repetição de tool calls, o defeito que mais aparece com agentes.</p></div>
+    <div class="la-card"><span class="ic">📐</span><h4>Tem gabarito</h4><p>Existem kits comunitários para 2× Spark (SGLang e vLLM) e um para SM120. Use-os só para <b>conferir</b> a resposta de cada passo, nunca para copiar.</p></div>
+  </div>
+  <table>
+    <thead><tr><th>Candidato (set/2026)</th><th>Total / ativos</th><th>Pesos oficiais</th><th>Cabe em 2× Spark?</th><th>Veredito</th></tr></thead>
+    <tbody>
+      <tr><td><b>MiMo-V2.6-Flash-MOPD</b></td><td>309B / 15B</td><td>172,9 GB (MXFP4 + FP8 + BF16)</td><td>Sim, no limite: ~82,7 GiB por rank <b>[medido: MiaAI-Lab, SGLang]</b></td><td>Escolhido</td></tr>
+      <tr><td>Naive-N0.5-Flash</td><td>309B / 15,5B</td><td>BF16 617,8 GB; FP8 ~310 GB</td><td>Só em 4 bits</td><td>Desafio no fim do capítulo</td></tr>
+      <tr><td>IQuest-Q1</td><td>320B / 15B</td><td>BF16 650 GB</td><td>Só quantizando você mesmo</td><td>Cru demais: zero quants, zero relatos</td></tr>
+      <tr><td>DeepSeek-V4.1-Flash</td><td>Engram: 2 tabelas de ~384M linhas (~203 GB)</td><td>~510 GB (as tabelas do Engram incluídas)</td><td>Não com os pesos nativos (set. 2026). Desde out. 2026, sim a 2,9 bpw: EXL3 EAQ v1 no TensorFold (196 GiB, ~98 GiB por Spark), com as tabelas do Engram lidas do disco de cada Spark (<a data-ch="receita-deepseek" data-sec="ds41-cinco-implantacoes">cinco implantações</a>)</td><td>A família DSV4 já tem receita</td></tr>
+      <tr><td>GLM-5.3 (completo)</td><td>753B / 40B</td><td>756 GB em FP8</td><td>Não</td><td>O GLM-5.3-Flash já tem receita</td></tr>
+    </tbody>
+  </table>
+  <div class="la-callout recipe" data-recipe="all"><b class="t"><span class="la-rb all"></span> Nas três receitas</b><p>O esqueleto é sempre o mesmo, só muda onde o esforço se concentra. No <span class="la-rb glm"></span> o peso está no checkpoint (EXL3 da comunidade) e numa imagem com patches de build. No <span class="la-rb qwen"></span> está nos overlays montados por bind-mount que corrigem metadados e kernels. No <span class="la-rb ds"></span> está numa imagem fixada por digest e numa cadeia de hotfixes <i>fail-closed</i> no entrypoint. O método deste capítulo é a generalização dos três.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Passo 0 — Triagem: ler o modelo antes de baixá-lo</h2>
+  <p><b>Objetivo.</b> Antes de baixar 170 GB, descobrir o que o modelo tem de diferente e onde o motor vai quebrar.</p>
+  <p><b>Conceito.</b> Um checkpoint se descreve em três camadas. (1) O <b>card</b> traz a intenção e os comandos oficiais. (2) O <b><code>config.json</code></b> traz a geometria, que determina memória, paralelismo e kernels. (3) Os <b>cabeçalhos safetensors</b> trazem os dtypes e shapes reais, que às vezes contradizem o config. No MiMo, por exemplo, <code>quant_method: fp8</code> convive com experts em MXFP4.</p>
+  <p>O truque que torna a triagem barata é o formato do arquivo (visto em <a data-ch="checkpoints">Checkpoints</a>). Um <span class="la-term" data-term="cabecalho-safetensors">.safetensors</span> começa com 8 bytes que formam um inteiro sem sinal de 64 bits, little-endian, com o tamanho \(N\) do cabeçalho. Em seguida vêm \(N\) bytes de JSON com, para cada tensor, <code>dtype</code>, <code>shape</code> e <code>data_offsets</code>. Só depois vêm os dados. Uma <span class="la-term" data-term="range-request">range request</span> HTTP pede apenas um trecho do arquivo, e com duas delas você lê o “sumário” de um shard de ~1,3 GB sem baixá-lo.</p>
+  <pre data-lang="bash"><code># 0.1 Metadados: descubra o commit atual e FIXE-O para o resto da triagem
+REPO=XiaomiMiMo/MiMo-V2.6-Flash-MOPD
+curl -s https://huggingface.co/api/models/$REPO | jq '{sha,lastModified,tags}'
+REV=2479e2d0029eca9a34cc7e7f55a121925f81908e   # o "sha" da resposta acima (commit de 2026-09-27)
+curl -s "https://huggingface.co/api/models/$REPO/tree/$REV?recursive=true" \
+  | jq '[.[]|.size] | add / 1e9'            # ~177.8 GB no repo
+
+# 0.2 Arquivos pequenos, na mesma revisão e com o caminho preservado
+mkdir -p triage/dflash
+for f in config.json generation_config.json chat_template.jinja tokenizer_config.json dflash/config.json; do
+  curl -sfL "https://huggingface.co/$REPO/raw/$REV/$f" -o "triage/$f" || echo "FALHOU: $f"
+done
+python3 -c "import json; [json.load(open(p)) for p in ('triage/config.json', 'triage/dflash/config.json')]; print('JSON ok')"
+
+# 0.3 Cabeçalhos safetensors (dtypes/shapes reais), ainda na mesma revisão
+python3 triage.py $REPO $REV</code></pre>
+  <p>A primeira chamada só serve para descobrir o commit. A partir dela, tudo usa <code>$REV</code>: <code>2479e2d0…</code> é o commit do MOPD em 2026-09-27, e um checkpoint “main” muda embaixo de você. Dois detalhes do laço valem ouro. O <code>-o "triage/$f"</code> preserva o subdiretório; com <code>basename</code>, o <code>dflash/config.json</code> sobrescreveria o <code>config.json</code> do modelo, e o <code>mem_budget.py</code> do Passo 1 morreria com <code>KeyError</code>. E o <code>curl -f</code> transforma um 404 em erro, em vez de gravar a página de erro como se fosse JSON. A validação lê os <b>dois</b> configs porque o <code>dflash/config.json</code> do release do RL chegou com uma vírgula sobrando <b>[medido: tonyd2wild]</b>. O <code>triage.py</code> (testado contra o MOPD) faz o resto:</p>
+  <pre data-lang="python"><code>#!/usr/bin/env python3
+"""Triagem de um checkpoint no Hub sem baixar os pesos: config, índice e cabeçalhos por range request."""
+import collections, json, re, struct, sys, urllib.request
+REPO = sys.argv[1]; REV = sys.argv[2] if len(sys.argv) &gt; 2 else "main"
+BASE = f"https://huggingface.co/{REPO}/resolve/{REV}"
+
+def get(url, rng=None):
+    req = urllib.request.Request(url, headers={"Range": f"bytes={rng}"} if rng else {})
+    with urllib.request.urlopen(req, timeout=120) as r:
+        return r.read()
+
+def header(fname):
+    n = struct.unpack("&lt;Q", get(f"{BASE}/{fname}", "0-7"))[0]      # 8 bytes: tamanho N do JSON
+    return json.loads(get(f"{BASE}/{fname}", f"8-{8 + n - 1}"))      # N bytes: o sumário do shard
+
+cfg = json.loads(get(f"{BASE}/config.json"))
+idx = json.loads(get(f"{BASE}/model.safetensors.index.json")); wm = idx["weight_map"]
+print("arch:", cfg["architectures"], "| índice:", idx.get("metadata"), "| tensores:", len(wm))
+pat = cfg.get("hybrid_layer_pattern") or []
+print("globais:", [i for i, x in enumerate(pat) if x == 0], "| SWA:", pat.count(1))
+q = cfg.get("quantization_config", {})
+print("quant:", {k: v for k, v in q.items() if k != "ignored_layers"},
+      collections.Counter(re.sub(r"\.\d+\.", ".N.", x) for x in q.get("ignored_layers", [])))
+wanted = ["model.layers.0.self_attn.qkv_proj.weight", "model.layers.1.self_attn.qkv_proj.weight",
+          "model.layers.1.mlp.experts.0.gate_proj.weight", "model.mtp.layers.0.self_attn.qkv_proj.weight"]
+for f in dict.fromkeys(wm[t] for t in wanted if t in wm):          # cada shard uma vez só
+    for k, v in header(f).items():
+        m = re.match(r"model\.(layers\.[01]|mtp\.layers\.0)\.", k)
+        if k != "__metadata__" and m and (".experts." not in k or ".experts.0." in k):
+            print(f"  {k:66s} {v['dtype']:8s} {v['shape']}")</code></pre>
+  <ul>
+    <li><code>get()</code> envia o cabeçalho HTTP <code>Range: bytes=a-b</code>; o Hub responde só com aquele trecho.</li>
+    <li><code>header()</code> faz a leitura em dois tempos: <code>struct.unpack("&lt;Q")</code> decodifica os 8 primeiros bytes como <code>uint64</code> little-endian (<code>&lt;</code> = little-endian, <code>Q</code> = 64 bits sem sinal), e a segunda requisição traz exatamente o JSON.</li>
+    <li>O <code>weight_map</code> do índice diz em que arquivo mora cada tensor. Quatro tensores-sonda bastam: a camada 0 (global, MLP densa), a camada 1 (SWA + MoE), um expert e o MTP.</li>
+    <li>O <code>Counter</code> com a regex <code>\.\d+\.</code> → <code>.N.</code> resume os 49 <code>ignored_layers</code> em dois padrões, em vez de imprimir 49 linhas.</li>
+  </ul>
+  <p>A saída real, resumida:</p>
+  <pre data-lang="text"><code>arch: ['MiMoV2ForCausalLM'] | índice: {'save_format': 'mxfp4', 'total_size': 172923364096, 'tp_size': 4}
+globais: [0, 5, 11, 17, 23, 29, 35, 41, 47] | SWA: 39
+quant: {'quant_method': 'fp8', 'store_dtype': 'mxfp4', 'mxfp4_block_size': 32, 'weight_block_size': [128,128], ...}
+       Counter({'model.layers.N.self_attn.o_proj': 48, 'model.decoder.self_attn.o_proj': 1})
+  model.layers.0.self_attn.qkv_proj.weight            F8_E4M3  [13568, 4096]   # GA: 4×(3072 Q + 192 K + 128 V)
+  model.layers.0.self_attn.qkv_proj.weight_scale_inv  F32      [108, 32]       # 4 chunks × 27 blocos
+  model.layers.1.self_attn.qkv_proj.weight            F8_E4M3  [14848, 4096]   # SWA: 4×(3072 + 384 + 256)
+  model.layers.1.self_attn.qkv_proj.weight_scale_inv  F32      [116, 32]       # 4 × 29
+  model.layers.1.self_attn.attention_sink_bias        BF16     [64]
+  model.layers.1.mlp.experts.0.gate_proj.weight       U8       [2048, 2048]    # MXFP4: 2 nibbles/byte
+  model.layers.1.mlp.experts.0.gate_proj.weight_scale U8       [2048, 128]     # E8M0 por 32
+  model.layers.0.self_attn.o_proj.weight              BF16     [4096, 8192]    # ignored_layers → BF16
+  model.mtp.layers.0.self_attn.qkv_proj.weight        F8_E4M3  [14848, 4096]   # MTP é do tipo SWA (tem sink)</code></pre>
+  <p>Cada linha dessa saída é uma pista. Na figura abaixo, escolha um tensor e veja o que a forma dele revela: como o arquivo é lido por range request, como as 13.568 linhas do QKV se dividem em quatro chunks, como um byte guarda dois pesos MXFP4.</p>
+  <figure class="la-fig" id="fig-raiox" data-title="Raio-X do checkpoint: o que cada shape conta">
+    <div class="la-fig-stage" style="height:430px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>No topo, o shard como está no disco: 8 bytes com o tamanho do cabeçalho, o cabeçalho JSON e os dados. As duas range requests trazem só as duas primeiras faixas. Embaixo, o tensor escolhido desenhado com as proporções reais das suas dimensões. As cores separam Q, K e V; as grades mostram os blocos de escala. Valores numéricos dentro das células são ilustrativos; formas, dtypes e contagens são os do checkpoint.</figcaption>
+  </figure>
+  <p>Repare no que a figura prova. O QKV das camadas globais tem 13.568 linhas porque é a concatenação de <b>quatro</b> fatias de \(16 \times 192 = 3072\) linhas de Q, \(1 \times 192\) de K e \(1 \times 128\) de V. Isso é o <span class="la-term" data-term="pre-sharding">pré-sharding</span> para TP=4 (o <code>tp_size: 4</code> do índice). A forma U8 <code>[2048, 2048]</code> de um expert só faz sentido quando você lembra que cada byte guarda dois valores E2M1 de 4 bits: a matriz lógica é \(2048 \times 4096\), e a escala E8M0 a cada 32 valores dá os 128 bytes de escala por linha (<a data-ch="fp8-fp4-microescala">FP8, FP4 &amp; microescala</a>). O QKV do MTP tem a forma do QKV SWA, então o MTP é uma camada do tipo SWA, com sink.</p>
+
+  <h3>O <code>config.json</code> que importa</h3>
+  <p>O config tem 66 chaves no nível de topo. Algumas mudam a receita; a tabela lista essas, com a consequência de cada uma e onde o conceito é ensinado.</p>
+  <table class="la-params">
+    <thead><tr><th>Campo</th><th>Valor</th><th>Consequência na receita</th></tr></thead>
+    <tbody>
+      <tr><td><code>architectures</code> / <code>auto_map</code></td><td><code>MiMoV2ForCausalLM</code>, remote code</td><td>Classe procurada no registry do vLLM; exige <code>--trust-remote-code</code>. O <code>modeling_mimo_v2.py</code> do HF é a referência numérica do Passo 4.</td></tr>
+      <tr><td><code>hidden_size</code></td><td>4096</td><td>Largura do residual: em TP=2 cada all-reduce de decode move 4096 × 2 B = 8 KB por token (<a data-ch="paralelismos">Paralelismos</a>).</td></tr>
+      <tr><td><code>hybrid_layer_pattern</code></td><td>48 posições; 0 = global</td><td>9 globais em 0, 5, 11, 17, 23, 29, 35, 41, 47; 39 SWA. Decide a conta de KV do Passo 1.</td></tr>
+      <tr><td><code>sliding_window</code></td><td>128</td><td>Janela das SWA. O valor global contamina o <code>cache_config</code> compartilhado e pode encolher as globais (bug do Passo 4).</td></tr>
+      <tr><td><code>num_key_value_heads</code> / <code>swa_num_key_value_heads</code></td><td>4 / 8</td><td>TP=2 → 2 e 4 por rank; TP ∈ {1, 2, 4} sem replicação. O 4 também é o número de chunks do QKV pré-fatiado.</td></tr>
+      <tr><td><code>head_dim</code> / <code>v_head_dim</code></td><td>192 / 128</td><td>K e V de tamanhos diferentes: exige backend <span class="la-term" data-term="diffkv">DiffKV</span>. O vLLM tem dois, e o <code>FLASH_ATTN_DIFFKV</code> precisa de FlashAttention 3/4, que não existe no sm_121; no GB10 sobra o <code>TRITON_ATTN_DIFFKV</code> (<a data-ch="kernels">Kernels</a>).</td></tr>
+      <tr><td><code>add_swa_attention_sink_bias</code></td><td><code>true</code> (globais: <code>false</code>)</td><td>64 logits extras por camada SWA, um por head (<span class="la-term" data-term="attention-sink">attention sink</span>, visto em <a data-ch="atencao">Atenção</a>). O backend precisa aceitar <code>sinks=</code> por camada.</td></tr>
+      <tr><td><code>partial_rotary_factor</code>, <code>rope_theta</code></td><td>0,334; 10⁷ (GA) e 10⁴ (SWA)</td><td>RoPE em ~64 de 192 dims (<a data-ch="posicao-rope">Posição &amp; RoPE</a>). Sem YaRN: não há <code>--hf-overrides</code> de rope para chegar a 1M.</td></tr>
+      <tr><td><code>attention_value_scale</code></td><td>0,707</td><td>V é multiplicado por 0,707 antes da atenção. O drafter DFlash tem o seu (0,612).</td></tr>
+      <tr><td><code>n_routed_experts</code> / <code>num_experts_per_tok</code></td><td>256 / 8, sem expert compartilhado</td><td>Top-8 define os bytes lidos por token; sem shared expert, o EP fica mais sensível ao desbalanceamento (<a data-ch="mixture-of-experts">MoE</a>).</td></tr>
+      <tr><td><code>moe_intermediate_size</code></td><td>2048</td><td>Em TP=2 vira 1024 por rank, múltiplo de 32 (o bloco MXFP4).</td></tr>
+      <tr><td><code>scoring_func</code> / <code>topk_method</code></td><td><code>sigmoid</code> / <code>noaux_tc</code></td><td>Gate sigmoid com bias de correção sem perda auxiliar; <code>moe_router_dtype: bfloat16</code> já vem no config (no V2.5 era preciso um <code>--hf-overrides</code>).</td></tr>
+      <tr><td><code>quantization_config</code></td><td><code>fp8</code> + <code>store_dtype: mxfp4</code></td><td>Experts MXFP4 (4,25 bits/peso), QKV e MLP densa em FP8 com blocos 128×128, 49 <code>o_proj</code> em BF16 (3,2 GB lidos a cada passo).</td></tr>
+      <tr><td><code>max_position_embeddings</code></td><td>1.048.576</td><td>Contexto nativo de 1M; acima de 262.144 alguns builds pedem <code>VLLM_ALLOW_LONG_MAX_MODEL_LEN=1</code>.</td></tr>
+      <tr><td><code>num_nextn_predict_layers</code></td><td>3</td><td>Três camadas MTP: limita o método <code>mtp</code> a k ≤ 3 (<a data-ch="ngram-mtp">N-gram &amp; MTP</a>).</td></tr>
+      <tr><td><code>vocab_size</code> / <code>tie_word_embeddings</code></td><td>152.576 / <code>false</code></td><td><code>lm_head</code> separado (1,25 GB BF16), lido em todo passo de decode.</td></tr>
+    </tbody>
+  </table>
+  <p>O <b>template de chat</b> também é triagem. O MiMo usa ChatML; <code>&lt;think&gt;</code> e <code>&lt;/think&gt;</code> <i>não</i> são tokens especiais, então vazam no texto se o reasoning parser não os separar; o thinking vem <b>ligado por padrão</b>; e os tool calls no histórico são renderizados compactos, sem quebras de linha, parecidos com os do Qwen3-Coder mas sem os <code>\n</code> obrigatórios. Por isso o parser estrito precisou de uma variante própria (PR #58019). O <code>generation_config.json</code> recomenda <code>temperature</code> 1,0 e <code>top_p</code> 0,95. Guarde esses fatos para o Passo 5 (<a data-ch="api-tools-estruturado">API, tools &amp; JSON</a>).</p>
+  <table>
+    <thead><tr><th>Pergunta da triagem</th><th>MiMo-V2.6-Flash</th></tr></thead>
+    <tbody>
+      <tr><td>Arquitetura registrada no motor?</td><td>Sim no <code>main</code> e na imagem <code>mimo-v26</code>; <b>não</b> no v0.30.0</td></tr>
+      <tr><td>Tipos de atenção e dims</td><td>GA + SWA-128, DiffKV 192/128, sinks só nas SWA, RoPE parcial</td></tr>
+      <tr><td>KV heads por tipo e divisibilidade</td><td>4 (GA) e 8 (SWA): TP ∈ {1, 2, 4} sem replicação</td></tr>
+      <tr><td>Formato dos pesos / pré-sharding</td><td>MXFP4 + FP8 bloco 128 + BF16 / <b>sim, <code>tp_size: 4</code></b></td></tr>
+      <tr><td>Speculators embutidos</td><td>MTP de 3 camadas e DFlash de 5 camadas SWA (bloco 8)</td></tr>
+      <tr><td>Esquisitices</td><td><code>attention_chunk_size</code> ignorado; <code>max_pixels</code> divergente entre dois arquivos; <code>sliding_window</code> global</td></tr>
+    </tbody>
+  </table>
+  <div class="la-callout tip"><b class="t">Critério de saída</b><p>Uma tabela como a de cima e uma lista de riscos no motor (“DiffKV sem FP8”, “QKV pré-fatiado”, “MXFP4 no sm_121”), cada risco ligado a um PR ou issue. O Passo 4 vai transformar essa lista em overlays.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Passo 1 — A matemática da memória</h2>
+  <p><b>Objetivo.</b> Saber, antes de lançar, quanto sobra para KV e, com isso, quanto contexto e quantas requisições simultâneas cabem.</p>
+  <p><b>Conceito.</b> No GB10 a memória é <span class="la-term" data-term="memoria-unificada">unificada</span> (<a data-ch="memoria-unificada">Memória unificada</a>): o sistema operacional, o page cache, o Docker e o vLLM disputam os mesmos 128 GB. O <span class="la-term" data-term="gmu"><code>--gpu-memory-utilization</code></span> (GMU) é uma fração dos 121,69 GiB que o CUDA enxerga, e o vLLM divide esse orçamento assim (<a data-ch="paged-attention-kv">PagedAttention &amp; KV</a>):</p>
+  <div class="la-eq">
+    \[ \underbrace{\mathrm{GMU}\cdot M_{\text{vis}}}_{\text{orçamento}} \;=\; W_{\text{rank}} \;+\; O \;+\; P_{\text{KV}} \]
+    <ul class="la-eq-legend">
+      <li>\(M_{\text{vis}}\): memória visível ao CUDA por nó (121,69 GiB no GB10)</li>
+      <li>\(W_{\text{rank}}\): pesos carregados por rank</li>
+      <li>\(O\): ativações de pico + memória “non-torch” + CUDA graphs</li>
+      <li>\(P_{\text{KV}}\): o pool de KV, que é <b>o que sobra</b>, compartilhado por todas as requisições</li>
+    </ul>
+  </div>
+  <h3>Pesos por componente</h3>
+  <p>A primeira parcela sai direto dos shapes do Passo 0 <b>[estimativa, conferida com o medido]</b>:</p>
+  <table>
+    <thead><tr><th>Componente</th><th>Parâmetros</th><th>Formato</th><th>Total</th><th>Por rank (TP=2)</th></tr></thead>
+    <tbody>
+      <tr><td>Experts (47 × 256 × 3 × 2048 × 4096)</td><td>302,8B</td><td>MXFP4 (4,25 bits)</td><td>160,9 GB (149,8 GiB)</td><td>74,9 GiB</td></tr>
+      <tr><td><code>qkv_proj</code> (39 SWA + 9 GA)</td><td>2,87B</td><td>FP8</td><td>2,87 GB</td><td>1,34 GiB</td></tr>
+      <tr><td><code>o_proj</code></td><td>1,61B</td><td>BF16</td><td>3,22 GB</td><td>1,50 GiB</td></tr>
+      <tr><td>MLP densa (camada 0) + router</td><td>0,25B</td><td>FP8 / BF16</td><td>0,30 GB</td><td>0,18 GiB</td></tr>
+      <tr><td>Embedding + <code>lm_head</code></td><td>1,25B</td><td>BF16</td><td>2,50 GB</td><td>1,16 GiB</td></tr>
+      <tr><td>Encoders de visão e áudio (replicados)</td><td>~0,8B</td><td>BF16</td><td>~1,7 GB</td><td>~1,6 GiB</td></tr>
+      <tr><td>DFlash (drafter)</td><td>~1,47B</td><td>BF16</td><td>2,94 GB</td><td>~1,4 GiB</td></tr>
+      <tr><td><b>Total por rank</b></td><td></td><td></td><td></td><td><b>≈ 82,0 GiB [estimativa]</b> contra <b>82,7 GiB [medido: MiaAI-Lab, SGLang TP2]</b></td></tr>
+    </tbody>
+  </table>
+  <p>Para o backbone inteiro, compare formatos: BF16 ≈ 620 GB, FP8 ≈ 310 GB, NVFP4 ≈ 187 GB (repositórios da comunidade), <b>MXFP4 oficial ≈ 173 GB</b>, EXL3 2,27 bpw ≈ 92 GB. Só os formatos de ~4 bits ou menos cabem em dois Sparks.</p>
+
+  <h3>KV: o que cresce e o que é fixo</h3>
+  <p>Um modelo híbrido tem dois tipos de custo de KV (<a data-ch="prefill-decode-kv">Prefill, decode &amp; KV</a>, <a data-ch="atencao-esparsa">Atenção esparsa</a>). As 9 camadas globais guardam K e V de <i>todo</i> o contexto; as 39 SWA guardam só a janela. Por rank, com \(s\) bytes por elemento:</p>
+  <div class="la-eq">
+    \[ b_{\text{GA}} = L_{\text{GA}}\cdot\tfrac{H^{\text{GA}}_{kv}}{TP}\cdot(d_k+d_v)\cdot s = 9\cdot 2\cdot 320\cdot s \qquad b_{\text{SWA}} = 39\cdot 4\cdot 320\cdot s \]
+    \[ \text{req}(L) \;=\; L\cdot b_{\text{GA}}\cdot\rho \;+\; b_{\text{SWA}}\cdot B\!\left(\left\lceil \tfrac{W+k}{B}\right\rceil+1\right) \;+\; b_{\text{draft}}\cdot B\!\left(\left\lceil \tfrac{W_d+k}{B}\right\rceil+1\right), \qquad \rho=\frac{\lceil L_{\text{GA}}/g\rceil\,g}{L_{\text{GA}}} \]
+    <ul class="la-eq-legend">
+      <li>\(b_{\text{GA}}\): bytes/token/rank que crescem com o contexto: 11.520 B em BF16, <b>5.760 B em FP8</b></li>
+      <li>\(b_{\text{SWA}}\): 99.840 B/token (BF16) ou 49.920 B (FP8), mas só para a janela</li>
+      <li>\(b_{\text{draft}}\): o KV do drafter DFlash, 5 camadas SWA com 8 KV heads (4 por rank) de 128 + 128: \(5\cdot 4\cdot 256\cdot 2 = 10.240\) B/token em BF16, com janela \(W_d = 1024\)</li>
+      <li>\(L\): tokens da requisição; \(W = 128\): janela; \(k\): tokens especulativos; \(B = 64\): tokens por bloco</li>
+      <li>o \(+1\) cobre o bloco parcial: uma janela de \(W+k\) tokens que desliza raramente começa numa fronteira de bloco, então pode tocar \(\lceil (W+k)/B\rceil + 1\) blocos ao mesmo tempo</li>
+      <li>\(\rho\): enchimento do <span class="la-term" data-term="alocador-kv-hibrido">alocador híbrido</span>; grupos de \(g=5\) camadas → 9 globais ocupam 10 “slots”: \(\rho = 10/9\), +11%</li>
+    </ul>
+  </div>
+  <p>Com k = 7, a parte SWA custa \(49.920 \times 64 \times (\lceil 135/64\rceil + 1) = 49.920 \times 256\) ≈ 12,8 MB por requisição em FP8, fixos. O drafter soma outro custo fixo: \(10.240 \times 64 \times (\lceil 1031/64\rceil + 1) = 10.240 \times 1152\) ≈ 11,8 MB <b>[estimativa]</b>, em BF16, como o tutorial-fonte assume para o GB10 (se o seu build puser o KV do drafter em FP8, é a metade; confira no log). Juntos, ~24,6 MB fixos por requisição: o drafter quase dobra o custo fixo. A parte global custa 6.400 B por token (5.760 × 10/9). Duas consequências: <b>o custo que cresce com o contexto é pequeno</b> (para comparar, 13,3 KB/token no Qwen3.8 em TP2 BF16, e 656 B por camada MLA no GLM), e <b>o alocador desperdiça</b> ~11% das páginas globais. O PR #58175 mediu +10,57% de capacidade ao passar para grupos de 3 (1.606.781 → 1.776.588 tokens, MiMo BF16 TP2).</p>
+  <p>O script <code>mem_budget.py</code> faz essas contas a partir do próprio <code>config.json</code>:</p>
+  <pre data-lang="python"><code>#!/usr/bin/env python3
+"""Orçamento de KV por rank. Uso:
+python3 mem_budget.py triage/config.json --draft triage/dflash/config.json --tp 2 --kv fp8 --gmu 0.85"""
+import argparse, json, math
+ap = argparse.ArgumentParser(); ap.add_argument("config")
+ap.add_argument("--draft", help="dflash/config.json: soma o KV fixo do drafter")
+ap.add_argument("--draft-kv", choices=["bf16", "fp8"], default="bf16")
+ap.add_argument("--tp", type=int, default=2); ap.add_argument("--kv", choices=["bf16", "fp8"], default="fp8")
+ap.add_argument("--gmu", type=float, default=0.85); ap.add_argument("--visible-gib", type=float, default=121.69)
+ap.add_argument("--weights-gib", type=float, default=82.7); ap.add_argument("--overhead-gib", type=float, default=4.0)
+ap.add_argument("--group-size", type=int, default=5); ap.add_argument("--block", type=int, default=64)
+ap.add_argument("--spec-k", type=int, default=7)
+ap.add_argument("--ctx", type=int, nargs="*", default=[32768, 131072, 262144, 1048576])
+a = ap.parse_args(); c = json.load(open(a.config)); b = 2 if a.kv == "bf16" else 1
+blocks = lambda win: (math.ceil((win + a.spec_k) / a.block) + 1) * a.block   # janela + k, com o bloco parcial
+pat = c["hybrid_layer_pattern"]; n_ga, n_swa = pat.count(0), pat.count(1)
+ga_tok = n_ga * (c["num_key_value_heads"] // a.tp) * (c["head_dim"] + c["v_head_dim"]) * b
+swa_tok = n_swa * (c["swa_num_key_value_heads"] // a.tp) * (c["swa_head_dim"] + c["swa_v_head_dim"]) * b
+swa_req = swa_tok * blocks(c["sliding_window"]); draft_req = 0
+if a.draft:
+    d = json.load(open(a.draft)); bd = 2 if a.draft_kv == "bf16" else 1
+    d_tok = d["num_hidden_layers"] * (d["num_key_value_heads"] // a.tp) * (d["head_dim"] + d.get("v_head_dim", d["head_dim"])) * bd
+    draft_req = d_tok * blocks(d.get("sliding_window") or 1024)
+pad = math.ceil(n_ga / a.group_size) * a.group_size / n_ga
+kv_gib = a.visible_gib * a.gmu - a.weights_gib - a.overhead_gib
+print(f"KV global {ga_tok} B/tok/rank (x{pad:.2f} enchimento) | fixo/req: SWA {swa_req/1e6:.1f} MB"
+      f" + drafter {draft_req/1e6:.1f} MB | pool {kv_gib:.2f} GiB")
+cap = kv_gib * 2**30 / (ga_tok * pad); print(f"capacidade ~{cap/1e6:.2f} M tokens")
+for L in a.ctx:
+    print(f"  ctx {L:&gt;8}: {kv_gib*2**30/(L*ga_tok*pad + swa_req + draft_req):6.2f} requisições cheias")</code></pre>
+  <p>Leia o script como a equação de cima escrita em Python: <code>ga_tok</code> é \(b_{\text{GA}}\), <code>blocks()</code> é o \(B(\lceil (W+k)/B\rceil+1)\), <code>swa_req</code> e <code>draft_req</code> são os dois termos fixos, <code>pad</code> é \(\rho\) e <code>kv_gib</code> é \(P_{\text{KV}}\). O <code>--draft</code> lê o <code>triage/dflash/config.json</code> do Passo 0 (por isso o caminho precisava ser preservado); como o drafter é um <code>qwen3</code> com um só <code>head_dim</code> (128 para K e V), sem <code>v_head_dim</code>, o script reusa o <code>head_dim</code> para o V. Os pesos entram como medidos (82,7 GiB) e o overhead como um chute inicial (4 GiB) que você recalibra com o log. Na calculadora abaixo, o mesmo código roda ao vivo.</p>
+  <figure class="la-fig wide" id="fig-calc" data-title="Calculadora de memória do MiMo (por rank)">
+    <div class="la-fig-stage" style="height:392px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>A barra de cima é a memória visível de um rank: pesos (82,7 GiB medidos), overhead, pool de KV e o que fica fora do orçamento para o host. A barra do meio enche o pool com requisições do contexto escolhido. Cada ladrilho é uma requisição cheia, com a parte global (cresce com o contexto) e as duas partes fixas: a janela das SWA e o KV do drafter DFlash (5 camadas SWA de janela 1024, em BF16; desligue o toggle para ver a receita sem DFlash). Embaixo, a anatomia de uma requisição. Todos os números são <b>[estimativa]</b> do <code>mem_budget.py</code>; a linha de referência vem do PR #58128 <b>[medido]</b>.</figcaption>
+  </figure>
+  <p>Mexa no GMU e veja o problema do UMA: cada 0,01 de GMU vale ~1,2 GiB, e esse GiB sai da folga do host. Troque o KV para BF16 e a capacidade cai pela metade. Com contexto de 32K, as partes fixas (SWA + drafter) são ~10% de cada requisição, e desligar o drafter devolve ~5% de requisições simultâneas; em 1M, quase nada. Ligue <code>--language-model-only</code> para ver o que a lane só texto ganha.</p>
+  <table>
+    <thead><tr><th>GMU</th><th>Orçamento</th><th>Pool de KV</th><th>FP8: tokens</th><th>FP8: requisições de 256K (com drafter)</th><th>BF16: tokens</th></tr></thead>
+    <tbody>
+      <tr><td>0,80</td><td>97,35 GiB</td><td>10,65 GiB</td><td>~1,79 M</td><td>~6,7</td><td>~0,89 M</td></tr>
+      <tr><td><b>0,85</b></td><td>103,44 GiB</td><td><b>16,74 GiB</b></td><td><b>~2,81 M</b></td><td><b>~10,6</b></td><td>~1,40 M</td></tr>
+      <tr><td>0,88</td><td>107,09 GiB</td><td>20,4 GiB</td><td>~3,42 M</td><td>~13</td><td>~1,71 M</td></tr>
+      <tr><td>0,90</td><td>109,52 GiB</td><td>22,8 GiB</td><td>~3,8 M</td><td>~14,4</td><td>~1,9 M</td></tr>
+    </tbody>
+  </table>
+  <p>Confira com as medições. O PR #58128 (2× Spark, pool de 17 GiB) mediu <b>1.365.757 tokens em BF16 e 2.731.530 em FP8</b>: bate com ~1,40 M e ~2,81 M. Já o kit tonyd2wild (GMU 0,90, <code>max-model-len</code> 300K, omni + DFlash-7) mediu <b>13,89 GiB / 1.835.052 tokens</b> num par de Sparks (o outro par, com a mesma configuração, reporta 1.867.302), bem abaixo da estimativa. Dois motivos: o <i>profiling</i> multimodal infla o pico de ativações, e o vLLM informa “tokens” de modelos híbridos como <code>blocos / blocos-por-requisição × max_model_len</code>, um número que muda com o <code>max_model_len</code>.</p>
+  <div class="la-callout warn"><b class="t">Três regras de ouro do GB10</b>
+    <p><b>1. O log manda.</b> Leia <code>Available KV cache memory</code> e <code>GPU KV cache size</code> e recalibre o <code>--overhead-gib</code>.</p>
+    <p><b>2. Deixe folga no host.</b> O processo da API, o processor multimodal (o cache padrão é de 4 GiB de RAM; use <code>--mm-processor-cache-gb 1</code>), o page cache e o SO usam a mesma memória. Mantenha <code>MemAvailable</code> ≥ 4–6 GiB no pico e libere o page cache do checkpoint com <code>posix_fadvise(DONTNEED)</code> antes do boot.</p>
+    <p><b>3. O vLLM recusa subir</b> se, no início, a memória livre for menor que GMU × total. Com GMU 0,90 são necessários 109,5 GiB livres. Por isso a comunidade usa 0,80–0,85 e, depois do primeiro boot, fixa o pool com <code>--kv-cache-memory &lt;bytes&gt;</code>.</p>
+  </div>
+  <div class="la-compare">
+    <div data-recipe="glm"><h4>GLM-5.3-Flash</h4><p>GMU 0,85 e pool <b>fixado</b> em 11 GiB (<code>--kv-cache-memory-bytes 11811160064</code>) para 850K de contexto: “cada 0,01 é 1,2 GiB de folga do host”.</p></div>
+    <div data-recipe="qwen"><h4>Qwen3.8-Flash-Next</h4><p>GMU caiu de 0,835 para <b>0,80</b>: a 0,835 o <code>MemAvailable</code> chegou a 0,3–0,9 GiB, zona de hard-reset do GB10.</p></div>
+    <div data-recipe="ds"><h4>DeepSeek-V4-Flash</h4><p>GMU 0,835 → <code>Available KV cache memory: 17.04 GiB</code>, 2.331.430 tokens, concorrência 2,22× para 1M.</p></div>
+  </div>
+  <p>Com FP8 e GMU 0,85 <b>[estimativa]</b>, 1M de contexto cabe ~2,7 vezes ao mesmo tempo e 8 agentes de 128K cabem com folga de ~2,6×. Nessas condições quem limita é o <code>--max-num-seqs</code>, não o cache. Com BF16, 1M cabe só 1,3×.</p>
+  <div class="la-callout tip"><b class="t">Critério de saída</b><p>Uma tabela “previsto × medido” para pesos, pool e tokens. O desvio aceitável é de ±10%; acima disso, descubra o motivo antes de seguir.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Passos 2 e 3 — Qual arquivo de pesos, e como dividi-lo</h2>
+  <h3>Passo 2 — Quantização e checkpoint</h3>
+  <p><b>Objetivo.</b> Escolher o arquivo de pesos com a melhor relação entre qualidade, memória e velocidade <i>para este hardware</i>, e ter um jeito de medir a perda.</p>
+  <p><b>Conceito.</b> Num MoE com decode limitado por banda, importam duas coisas (<a data-ch="quantizacao-fundamentos">Fundamentos de quantização</a>): os <b>bytes lidos por token</b> (os experts ativos mais tudo o que é denso) e o <b>erro em relação à referência</b>, medido como <span class="la-term" data-term="kld">KLD</span> entre as distribuições do próximo token. Perplexidade sozinha esconde erros que se cancelam. E requantizar algo que já está em 4 bits (MXFP4 → NVFP4, por exemplo) soma um segundo erro de arredondamento ao primeiro.</p>
+  <table>
+    <thead><tr><th>Opção</th><th>Por rank</th><th>Qualidade</th><th>Kernels no sm_121</th><th>Decisão</th></tr></thead>
+    <tbody>
+      <tr><td><b>Oficial (MXFP4 + FP8 + BF16)</b></td><td>82,7 GiB</td><td>É a referência (KLD 0 por definição)</td><td>Marlin MXFP4 (<span class="la-term" data-term="w4a16-w4a8-w4a4">W4A16</span>) ou W4A8 com <code>VLLM_MARLIN_INPUT_DTYPE=fp8</code> (+15% de prefill no SM120 <b>[medido: diffbot]</b>)</td><td><b>Padrão</b></td></tr>
+      <tr><td>Oficial + <code>o_proj</code> FP8 online (#59083)</td><td>−0,8 GiB</td><td>Erro por tensor <b>[a medir]</b></td><td>FP8 por tensor</td><td>Lane opcional, como o <code>FP8_DENSE</code> do Qwen</td></tr>
+      <tr><td>NVFP4 da comunidade</td><td>~87 GiB</td><td>Requantização dupla <b>[a medir: KLD]</b></td><td>W4A4 NVFP4</td><td>Experimento de prefill</td></tr>
+      <tr><td>EXL3 2,27–4 bpw</td><td>43–80 GiB</td><td>2,27 bpw: GPQA −6,2%</td><td>ExLlamaV3; em vLLM exige overlay</td><td>Lane de 1 Spark ou de contexto enorme</td></tr>
+      <tr><td>GGUF MXFP4 / Q2_K</td><td>80 / 60 GiB</td><td>Q2_K <b>[a medir]</b></td><td>llama.cpp</td><td>Segunda referência de KLD</td></tr>
+    </tbody>
+  </table>
+  <p><b>Por que o oficial:</b> é o menor formato de 4 bits disponível (4,25 bits contra 4,5 do NVFP4), é exatamente o que o fabricante avaliou e dispensa calibração. O custo é depender de kernels MXFP4 no sm_121: o Marlin funciona segundo os dois kits vLLM, e o DeepGEMM precisa ficar desligado.</p>
+  <p>Essa decisão parece óbvia para o MiMo, mas não é universal. A árvore abaixo junta as perguntas dos Passos 2 e 3; escolha um modelo e siga o caminho que acende.</p>
+  <figure class="la-fig" id="fig-arvore" data-title="Árvore de decisão: formato e topologia">
+    <div class="la-fig-stage" style="height:470px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Coluna da esquerda: as perguntas, na ordem em que você as responde. Coluna da direita: as decisões às quais cada saída leva. O ponto luminoso percorre o caminho do modelo escolhido, e a lista abaixo do desenho explica cada resposta com os números daquele modelo. Os presets GLM, Qwen e DeepSeek reproduzem as decisões que as receitas do laboratório tomaram.</figcaption>
+  </figure>
+  <p>Repare que o GLM é o caso oposto do MiMo: o FP8 oficial (305,8 GiB) não cabe, então a receita usa um EXL3 de 4 bpw da comunidade e paga um overlay para plugar o kernel. O Qwen usa o NVFP4 publicado pela NVIDIA (133 GB), menor que o FP8 oficial. O Naive-N0.5, do desafio final, não tem nenhum arquivo que caiba: é o único que manda você quantizar.</p>
+  <pre data-lang="bash"><code>export MODEL_ID=XiaomiMiMo/MiMo-V2.6-Flash-MOPD
+export MODEL_REV=2479e2d0029eca9a34cc7e7f55a121925f81908e
+export MODEL_DIR=/models/MiMo-V2.6-Flash-MOPD
+hf download "$MODEL_ID" --revision "$MODEL_REV" --local-dir "$MODEL_DIR" \
+   --exclude "*.pdf" "assets/*"           # ~175 GB; o PDF e as imagens não são necessários
+python3 verify-weights.py "$MODEL_DIR"    # tamanho de cada arquivo = API do Hub; todos os shards do índice existem</code></pre>
+  <p>O <code>verify-weights.py</code> segue o padrão da receita Qwen: compara o tamanho de cada arquivo com a árvore da API, confere que todos os arquivos citados no <code>model.safetensors.index.json</code> existem e calcula o sha256 dos arquivos pequenos (configs e template).</p>
+  <h4>Quantizar você mesmo, e medir</h4>
+  <p>Se o arquivo não é o oficial (ou se você gerou um, com <code>llm-compressor</code>, <code>nvidia-modelopt</code>, <code>exllamav3</code> ou <code>llama-quantize</code>), você deve uma medição de KLD. O detalhe crucial: <b>a referência precisa rodar no mesmo motor</b>. Não existe BF16 público do MiMo e o HF não roda 173 GB num Spark, então sirva o oficial no vLLM e compare o candidato contra ele pelas <i>prompt logprobs</i> (<a data-ch="medindo-qualidade">Medindo qualidade</a>):</p>
+  <div class="la-eq">
+    \[ D_{\mathrm{KL}}(P\,\|\,Q) \;=\; \sum_{t\in \mathcal{T}_k} \tilde P(t)\,\big(\log \tilde P(t) - \log Q(t)\big), \qquad \tilde P(t) = \frac{P(t)}{\sum_{u\in\mathcal{T}_k} P(u)} \]
+    <ul class="la-eq-legend">
+      <li>\(P\): distribuição do próximo token na referência (oficial)</li>
+      <li>\(Q\): a do candidato, na mesma posição do mesmo texto</li>
+      <li>\(\mathcal{T}_k\): os top-\(k\) tokens da referência (\(k=20\))</li>
+      <li>\(\tilde P\): \(P\) renormalizada nesse suporte; tokens ausentes em \(Q\) recebem um piso</li>
+    </ul>
+  </div>
+  <pre data-lang="python"><code># kld_topk.py — KLD aproximada (suporte top-k) entre dois servidores vLLM com o mesmo tokenizer
+import json, math, sys, requests
+REF, CAND, MODEL_REF, MODEL_CAND, K = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], 20
+docs = [json.loads(l)["text"] for l in open("kld_corpus.jsonl")]   # ex.: 64 janelas de 2048 tokens
+
+def plp(url, model, text):
+    r = requests.post(f"{url}/v1/completions", json={"model": model, "prompt": text, "max_tokens": 1,
+                      "temperature": 0, "prompt_logprobs": K}, timeout=600).json()
+    return r["choices"][0]["prompt_logprobs"][1:]            # posição 0 não tem distribuição
+
+tot, n, top1 = 0.0, 0, 0
+for d in docs:
+    for p, q in zip(plp(REF, MODEL_REF, d), plp(CAND, MODEL_CAND, d)):
+        P = {t: v["logprob"] for t, v in p.items()}; Q = {t: v["logprob"] for t, v in q.items()}
+        zP = math.log(sum(math.exp(v) for v in P.values()))   # renormaliza no suporte top-k
+        kl = sum(math.exp(lp - zP) * ((lp - zP) - Q.get(t, min(Q.values()) - 2.0)) for t, lp in P.items())
+        tot += kl; n += 1; top1 += max(P, key=P.get) == max(Q, key=Q.get)
+print(f"KLD média ≈ {tot/n:.4f} nats | concordância top-1 {top1/n:.3%} | {n} posições")</code></pre>
+  <p>O truque é o <code>prompt_logprobs</code>: com <code>max_tokens: 1</code>, o vLLM devolve, para <i>cada posição do prompt</i>, as \(k\) maiores log-probabilidades. Cada documento do corpus vira milhares de amostras de distribuição. A linha do <code>kl</code> é a equação de cima; o piso <code>min(Q) − 2</code> evita \(\log 0\) quando o candidato não tem aquele token no seu top-k. Limites: a KLD top-k subestima a real, a chave do token depende da versão (ID ou string), e o corpus precisa ser exatamente o mesmo dos dois lados.</p>
+  <div class="la-callout recipe" data-recipe="glm"><b class="t"><span class="la-rb glm"></span> A escala de referência</b><p>O painel de KLD da receita GLM mediu o EXL3 de 4 bpw servido a <b>0,0246 nats</b>, praticamente igual ao FP8 oficial daquele stack (0,0246), com 54% dos bytes; o NVFP4 ficou em <b>0,061</b>. Heurística razoável: <b>&lt; 0,03 ótimo, 0,03–0,06 aceitável, &gt; 0,1 aparece em uso</b>. Confirme sempre com evals de tarefa (GSM8K, HumanEval+, needle).</p></div>
+  <div class="la-callout tip"><b class="t">Critério de saída (Passo 2)</b><p>Checkpoint baixado, verificado e com revisão fixada. Se não é o oficial: uma tabela de KLD e evals contra o oficial.</p></div>
+
+  <h3>Passo 3 — Topologia (TP, EP, PP)</h3>
+  <p><b>Objetivo.</b> Decidir como dividir o modelo entre os dois GB10 (<a data-ch="paralelismos">Paralelismos</a>, <a data-ch="nccl-rdma">NCCL &amp; RDMA</a>).</p>
+  <ul>
+    <li><b><span class="la-term" data-term="tensor-parallel">TP</span></b> corta cada matriz. Exige 2 all-reduces por camada (atenção e MoE), cada um sensível à latência do link (8 KB por token no decode), e pede divisibilidade: heads % TP, KV heads % TP (ou replicação), <code>moe_intermediate/TP</code> múltiplo do bloco de quantização.</li>
+    <li><b>EP</b> põe experts inteiros em cada rank e troca tokens por all-to-all ou allgather/reduce-scatter. Sem expert compartilhado, a carga depende do roteamento: com poucos tokens (decode, batch 1), um rank pode receber 6 dos 8 experts.</li>
+    <li><b>PP</b> corta as camadas em fatias (24/24). Passa só ativações, mas com batch 1 um nó fica ocioso enquanto o outro trabalha. Serve para throughput com muitos streams, não para latência.</li>
+  </ul>
+  <table>
+    <thead><tr><th>Checagem</th><th>TP=2</th><th>TP=4 (4 Sparks)</th></tr></thead>
+    <tbody>
+      <tr><td>Q heads 64</td><td>32/rank ✔</td><td>16 ✔</td></tr>
+      <tr><td>KV heads GA 4 / SWA 8</td><td>2 / 4 ✔</td><td>1 / 2 ✔</td></tr>
+      <tr><td>Experts 256 (EP)</td><td>128/rank ✔</td><td>64 ✔</td></tr>
+      <tr><td><code>moe_intermediate</code> 2048 (TP)</td><td>1024 = 32 × 32 ✔</td><td>512 ✔</td></tr>
+      <tr><td>QKV pré-fatiado em 4</td><td><b>cada rank junta 2 chunks</b></td><td>encaixe exato</td></tr>
+      <tr><td>DFlash (64 Q / 8 KV)</td><td><code>draft_tensor_parallel_size</code> 2 ✔</td><td>4 ✔</td></tr>
+    </tbody>
+  </table>
+  <p>Tudo divide. O único “quase ✘” é o pré-sharding: o checkpoint foi salvo fatiado para TP=4, e você vai rodar TP=2. A figura mostra o que isso significa, linha a linha, no QKV.</p>
+  <figure class="la-fig" id="fig-qkv" data-title="QKV pré-fatiado: 4 chunks no disco, 2 ranks na máquina">
+    <div class="la-fig-stage" style="height:450px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>À esquerda, o <code>qkv_proj</code> como está no disco: quatro chunks, cada um com Q, K e V de 1/4 dos heads, e as linhas horizontais marcando os blocos de escala FP8 de 128 linhas. À direita, o shard que cada rank precisa montar. Em TP=4 cada chunk vai inteiro para um rank. Em TP=2 cada rank junta dois chunks. No caminho <b>requantizar</b> (o loader stock), ele reordena os pedaços para o layout [Q | K | V] que o vLLM espera, e os blocos marcados em âmbar juntam linhas que no disco tinham escalas diferentes. No caminho <b>exato</b>, as camadas globais ganham 64 linhas de zero por chunk, e cada segmento K | V | pad começa numa fronteira de 128. O zoom mostra, bloco a bloco, de qual bloco de origem vem cada escala.</figcaption>
+  </figure>
+  <p>Repare nos blocos âmbar das camadas globais. Cada chunk tem 3072 + 192 + 128 = 3392 linhas, que não é múltiplo de 128: o bloco de escala 25 cobre as últimas 64 linhas de K e as primeiras 64 de V, e o bloco 26 é meio vazio. Um bloco de 128 linhas tem <b>um único</b> fator F32, então, quando o layout [Q | K | V] do rank junta linhas de blocos de origem diferentes, não existe escala do checkpoint que sirva. O loader stock resolve isso da forma cara: desquantiza e requantiza as linhas de QKV de cada rank. Neste checkpoint, em TP2, isso muda <b>18% dos pesos de Q, ~51% dos de K e 73–81% dos de V</b> nas camadas globais, com erro relativo L2 de 1,3–2,5% <b>[medido: diffbot]</b>. Até o Q, que alinha, muda. A explicação provável: requantizar recalcula a escala de cada bloco a partir dos valores desquantizados, e ela não precisa coincidir com a que foi gravada <b>[interpretação]</b>.</p>
+  <p>O caminho exato (PR #59053, <code>VLLM_MIMO_EXACT_QKV=1</code>) evita a conta. Nas camadas globais, ele mantém o K e o V de cada chunk nas escalas do checkpoint, num layout com padding zero [Q… | K V pad | …]: 192 + 128 + 64 = 384 linhas, três blocos exatos, que reaproveitam os blocos 24, 25 e 26 originais. O forward separa K e V desse layout. Nas SWA o carregamento é uma permutação pura de blocos. Os pesos ficam idênticos bit a bit aos do checkpoint, e o preço é ~12K tokens a menos no pool de KV por causa do padding <b>[medido: diffbot]</b>. Nas SWA há ainda outro problema, de lógica e não de escala: cada chunk carrega 2 KV heads, e a suposição “1 chunk por KV head” quebrava o sharding (#57508).</p>
+  <p><b>Decisão:</b> <b>TP=2</b> (uma GPU por nó, <code>--nnodes 2</code>), com <b>EP como variável de A/B no Passo 9</b>. O tonyd2wild roda TP2 sem EP, a diffbot usa EP desligado como padrão e o Smilehyu (SGLang) roda TP2/EP2. PP fica fora porque dobra a latência de decode com batch pequeno, e o suporte a spec decode sob PP é novo (#50514 no v0.30).</p>
+  <p>Custo de comunicação <b>[estimativa]</b>: são 96 all-reduces por passo de decode (48 camadas × 2), cada um de ~15–30 µs em RoCE. Isso dá 1,5–3 ms num passo de ~25 ms (~10%). Se o <code>NCCL_DEBUG=INFO</code> mostrar <code>NET/Socket</code> em vez de <code>NET/IB</code>, o RoCE não está sendo usado e esse custo explode; corrija <code>NCCL_IB_HCA</code> e <code>NCCL_IB_GID_INDEX</code> como na receita Qwen.</p>
+  <div class="la-callout tip"><b class="t">Critério de saída (Passo 3)</b><p>Uma tabela de divisibilidade sem “✘”, uma topologia escolhida e as alternativas anotadas para o Passo 9.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Passo 4 — Suporte no motor: overlays e paridade numérica</h2>
+  <p><b>Objetivo.</b> Fazer o vLLM carregar o modelo <b>corretamente</b>, não só carregar; corrigir o que falta com overlays auditáveis; e provar a correção numericamente (<a data-ch="vllm-arquitetura">Arquitetura do vLLM</a>, <a data-ch="engenharia-de-receita">Engenharia de receita</a>).</p>
+  <h3>4.1 O modelo está registrado?</h3>
+  <pre data-lang="bash"><code>IMAGE=vllm/vllm-openai:mimo-v26-aarch64-cu130
+docker run --rm --entrypoint python3 $IMAGE -c "
+import vllm, vllm.model_executor.models.registry as r
+print(vllm.__version__)
+print({k: v for k, v in r._VLLM_MODELS.items() if 'MiMo' in k or 'DFlash' in k})"
+# Esperado: MiMoV2ForCausalLM -&gt; ('mimo_v2', ...), MiMoV2OmniForCausalLM, MiMoV2MTPModel, DFlashDraftModel</code></pre>
+  <p>A escolha da imagem já é uma decisão de suporte. O v0.30.0 estável (2026-09-22) <b>não contém</b> o suporte MXFP4 do MiMo-V2 (#57784) nem o fix de QKV (#57508). As imagens dedicadas <code>mimo-v26-aarch64-cu130</code> trazem o vLLM <code>0.29.1rc1.dev449</code>. No GB10, use a <code>-cu130</code>: a <code>cu129</code> compila parte dos kernels só como <code>sm_120a</code>, que o sm_121 não executa (“no kernel image is available”) <b>[medido: Plaaasma]</b>.</p>
+  <h3>4.2 A lista de lacunas</h3>
+  <p>Monte uma tabela sintoma → causa → correção → prova. Para o MiMo na imagem <code>mimo-v26-aarch64-cu130</code>:</p>
+  <table>
+    <thead><tr><th>#</th><th>Sintoma</th><th>Causa</th><th>Correção</th><th>Como provar</th></tr></thead>
+    <tbody>
+      <tr><td>G1</td><td><code>--kv-cache-dtype fp8</code> “funciona”, mas o pool não dobra</td><td>Decoder e MTP criam <code>Attention</code> sem <code>cache_config</code>; o <code>TRITON_ATTN_DIFFKV</code> rejeita KV quantizado</td><td>Overlay de <code>mimo_v2.py</code> (cópia do <code>cache_config</code> com <code>sliding_window=None</code>) + porte do #58128 no backend</td><td><code>GPU KV cache size</code> ~2×; needle de 128K passa</td></tr>
+      <tr><td>G2</td><td>Lixo na saída com fastsafetensors, InstantTensor ou estratégia <code>eager</code></td><td>O par peso+escala do QKV se perde entre chamadas de <code>load_weights</code></td><td>Porte do #58142, ou <code>safetensors</code> com estratégia <code>lazy</code></td><td>Soma e NaN de <code>qkv_proj.weight</code>; teste “capital da França”</td></tr>
+      <tr><td>G3</td><td>Erro pequeno e sistemático de K/V em TP2</td><td>Requantização no <code>_shard_fp8_qkv_proj</code></td><td>Porte do #59053 (<code>VLLM_MIMO_EXACT_QKV=1</code>)</td><td>Teste de CPU que compara os shards TP2 com o checkpoint</td></tr>
+      <tr><td>G4</td><td>DFlash não sobe com a classe omni</td><td><code>MiMoV2OmniForCausalLM</code> sem o marcador <code>SupportsEagle3</code></td><td>Adicionar o marcador</td><td>Boot com <code>method: dflash</code> e aceitação &gt; 0 no <code>/metrics</code></td></tr>
+      <tr><td>G5</td><td>GEMM FP8 com resultado errado</td><td>DeepGEMM no SM12x</td><td><code>VLLM_USE_DEEP_GEMM=0</code></td><td>Canário GSM8K</td></tr>
+      <tr><td>G6</td><td><code>cutlass_gemm_caller … Invalid status</code></td><td>GEMM FP8 CUTLASS c3x em certos shapes no sm_121</td><td><code>--linear-backend triton</code></td><td>Boot limpo</td></tr>
+      <tr><td>G7</td><td>Decode lento em contexto longo com DFlash</td><td>O verify (q_len &gt; 1) cai no kernel 2D (#59054)</td><td>Porte de split-KV no verify (#59085/#58141)</td><td>tok/s em 32K e 128K antes/depois</td></tr>
+      <tr><td>G8</td><td>Saída corrompida sob concorrência</td><td>Spec decode + async scheduling (#46669)</td><td><code>--no-async-scheduling</code></td><td>24 gerações longas concorrentes limpas <b>[medido: tonyd2wild]</b></td></tr>
+    </tbody>
+  </table>
+  <div class="la-callout deep"><b class="t">Três mecanismos por trás da tabela</b>
+    <p><b>Por que DiffKV significa Triton (G1, G7).</b> O vLLM tem dois backends para K e V de tamanhos diferentes. O <code>FLASH_ATTN_DIFFKV</code> precisa de FlashAttention 3/4, que não existe no sm_121, então toda a atenção do alvo cai no <code>TRITON_ATTN_DIFFKV</code>. É por isso que os dois patches de atenção são arquivos Triton.</p>
+    <p><b>Por que o verify fica lento (G7).</b> Em contexto longo, a atenção de decode é dividida ao longo do KV (<i>split-KV</i>): vários blocos de threads (CTAs) leem pedaços diferentes do contexto em paralelo e depois juntam os resultados. O kernel stock desliga o split-KV quando <code>max_seqlen_q &gt; 1</code>, e um verify de 8 tokens (1 + 7 rascunhos) rodava em só 18 CTAs, com quase toda a GPU ociosa. O patch da diffbot mantém o split-KV no verify e cobre o verify inteiro num programa (<code>BLOCK_M = q_len × 16</code>): decode de 87–94 para 156–175 tok/s a 46K <b>[medido: diffbot, SM120]</b>.</p>
+    <p><b>Por que o DFlash precisa de um marcador (G4).</b> O DFlash não rascunha só a partir de tokens: ele consome os hidden states de 5 camadas do alvo (<code>target_layer_ids [0, 11, 23, 35, 47]</code>), e o vLLM entrega esses estados auxiliares pela interface do EAGLE3. O marcador <code>SupportsEagle3</code> declara que a classe sabe expô-los. Na classe omni os ganchos já delegavam ao modelo de linguagem interno; faltava só o marcador <b>[medido: tonyd2wild, patch 02]</b>.</p>
+  </div>
+  <h3>4.3 Como escrever um overlay</h3>
+  <p>O padrão do laboratório é o <span class="la-term" data-term="overlay">overlay</span>: um bind-mount de um <code>.py</code> gerado a partir do arquivo da <b>própria imagem</b>, sem rebuild.</p>
+  <pre data-lang="bash"><code>VPY=/usr/local/lib/python3.12/dist-packages/vllm
+mkdir -p files/orig files/overlay
+docker run --rm --entrypoint cat $IMAGE $VPY/model_executor/models/mimo_v2.py &gt; files/orig/mimo_v2.py
+sha256sum files/orig/mimo_v2.py | tee files/orig/mimo_v2.py.sha256
+python3 files/patch_mimo_cache_config.py files/orig/mimo_v2.py files/overlay/mimo_v2.py
+# na execução: -v $PWD/files/overlay/mimo_v2.py:$VPY/model_executor/models/mimo_v2.py:ro  (nos DOIS nós)</code></pre>
+  <p>O gerador é <span class="la-term" data-term="fail-closed">fail-closed</span> (aborta se a âncora não bate), idempotente e capaz de detectar quando a correção já chegou ao upstream:</p>
+  <pre data-lang="python"><code>#!/usr/bin/env python3
+import re, sys
+src, dst = sys.argv[1], sys.argv[2]
+s = open(src).read()
+MARK = "# [mimo-recipe] cache_config per layer"
+if MARK in s:                                                   # idempotente
+    open(dst, "w").write(s); print("[overlay] já aplicado"); sys.exit(0)
+if re.search(r"cache_config\s*=\s*layer_cache_config", s):     # a imagem nova já corrigiu
+    open(dst, "w").write(s); print("[overlay] already upstream"); sys.exit(0)
+# Âncora 1: início do __init__ do MiMoV2FlashDecoderLayer
+a1 = "        quant_config = vllm_config.quant_config\n        layer_id = extract_layer_index(prefix)\n"
+if s.count(a1) != 1:
+    sys.exit("[overlay] âncora 1 não encontrada exatamente 1x — a imagem mudou; revise o patch")
+s = s.replace(a1, a1 + f"        {MARK}\n        import copy\n"
+    "        layer_cache_config = copy.copy(vllm_config.cache_config)\n"
+    "        if layer_cache_config is not None:\n"
+    "            layer_cache_config.sliding_window = None  # globais continuam globais\n")
+# Âncora 2: as duas construções de MiMoV2Attention recebem cache_config
+n = s.count("                quant_config=quant_config,\n                partial_rotary_factor=")
+if n != 2:
+    sys.exit(f"[overlay] esperava 2 construções de MiMoV2Attention, achei {n}")
+s = s.replace("                quant_config=quant_config,\n                partial_rotary_factor=",
+              "                quant_config=quant_config,\n                cache_config=layer_cache_config,\n"
+              "                partial_rotary_factor=")
+open(dst, "w").write(s); print("[overlay] cache_config encaminhado (2 camadas-tipo)")</code></pre>
+  <p>Leia as defesas uma a uma. O <code>MARK</code> torna o script idempotente: rodar duas vezes não aplica duas vezes. A regex de “already upstream” faz o patch se aposentar sozinho quando a imagem nova trouxer a correção. As âncoras são <b>strings exatas com contagem exigida</b> (1 e 2): se a imagem mudou, o script morre com uma mensagem clara em vez de gerar um arquivo meio patchado. E a correção em si é sutil: encaminhar o <code>cache_config</code> <i>compartilhado</i> ativaria o FP8, mas levaria junto o <code>sliding_window: 128</code> do nível do modelo para as camadas globais. Por isso o patch usa uma <b>cópia</b> com <code>sliding_window=None</code>. A figura mostra os quatro estados possíveis.</p>
+  <figure class="la-fig wide" id="fig-overlay" data-title="O overlay fail-closed e o bug que ele evita">
+    <div class="la-fig-stage" style="height:450px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>À esquerda, o gerador do overlay, estágio por estágio (use o stepper; ligue “imagem mudou” para ver o aborto). À direita, a máscara de atenção de uma <b>camada global</b> num prompt curto (20 tokens; a janela de 128 é desenhada como 5, para caber) e o que o servidor reporta. O ✦ dourado é a “agulha” no início do texto; a última linha é o token que precisa encontrá-la. Os números de pool são os do PR #58128 num pool de 17 GiB <b>[medido]</b>.</figcaption>
+  </figure>
+  <p>Os quatro estados contam uma história. No <b>upstream</b>, o FP8 é ignorado em silêncio: você acha que tem o dobro de KV e não tem. Na <b>correção ingênua</b>, o FP8 funciona e as camadas globais passam a enxergar só 128 tokens: o needle falha, e nada no log avisa. Com o <b>overlay 1</b> sozinho, o boot <i>falha</i>, porque o backend DiffKV Triton ainda rejeita FP8. Esse é o comportamento certo: falhar alto. Só com o <b>overlay 2</b> (o porte do #58128 para <code>triton_attn_diffkv.py</code> e <code>triton_unified_attention_diffkv.py</code>) você chega ao estado bom. Para portá-lo, baixe o diff (<code>curl -L https://github.com/vllm-project/vllm/pull/58128.diff</code>), rode <code>patch --dry-run</code> contra os arquivos extraídos da imagem e, se não aplicar limpo (o PR é contra o <code>main</code>, a imagem é o <code>dev449</code>), refaça à mão com âncoras. <b>Nunca</b> copie arquivos do <code>main</code> para dentro da imagem: versões misturadas quebram imports de forma sutil.</p>
+  <div class="la-callout recipe" data-recipe="all"><b class="t"><span class="la-rb all"></span> Regras que as três receitas seguem</b><p>O overlay <b>loga um marcador</b> no boot (<code>[glm53-kpool-tail-seed-stride]</code>, <code>[overlay] …</code>) para você conferir com <code>docker logs | grep</code>; sai com <i>already upstream</i> quando a imagem nova já tem a correção; é montado <b>nos dois ranks</b>, com os mesmos bytes; e tem um teste de CPU (<code>tests/test_&lt;patch&gt;.py</code>) que roda sem GPU, como o <code>scripts/ci-validate.sh</code> da <span class="la-rb ds"></span>. As receitas vão além do exemplo acima: fixam o SHA-256 do arquivo de origem, validam a saída com <code>ast.parse</code>, publicam com <code>os.replace</code> (atômico) e mantêm uma ordem fixa quando vários patches tocam o mesmo arquivo (<code>GLM53_OVERLAY_ORDER</code> na <span class="la-rb glm"></span>).</p></div>
+  <h3>4.4 Paridade truncada contra o HF</h3>
+  <p>Rodar o modelo inteiro no HF é impossível num Spark. A técnica é a <span class="la-term" data-term="paridade-truncada">paridade truncada</span>: comparar um modelo com as mesmas \(N\) primeiras camadas nos dois lados.</p>
+  <ol class="la-steps">
+    <li><b>Escolha N = 2.</b> A camada 0 é global com MLP densa e a camada 1 é SWA com MoE: as duas cobrem todos os tipos de bloco. Em BF16 isso ocupa ~13 GB no HF (são 256 experts desquantizados de uma camada).</li>
+    <li><b>vLLM:</b> <code>--hf-overrides '{"num_hidden_layers": 2}' --enforce-eager</code>, sem speculator; TP=1 num nó e depois TP=2 entre os nós, porque é no TP=2 que vivem G2 e G3. Precisa do guard do #58184 (ou de um overlay equivalente) para ignorar o QKV das camadas 2–47. O texto gerado é lixo, e isso é esperado: o que se compara são as <b>logprobs</b>.</li>
+    <li><b>HF:</b> <code>AutoModelForCausalLM.from_config(cfg_truncado, trust_remote_code=True, torch_dtype=bfloat16)</code> com <code>attn_implementation="eager"</code> (o HF cai para eager quando há sinks) e um state dict <b>desquantizado</b> das camadas 0–1, com as fórmulas abaixo.</li>
+    <li><b>Métrica:</b> 32 prompts de 512 tokens, KLD top-20 por posição e concordância top-1. Referência <b>[heurística]</b>: KLD média &lt; 1e-3 e top-1 &gt; 99% em TP1; em TP2, <b>o mesmo valor que em TP1</b>. Se o TP2 diverge do TP1, o problema está no sharding (G2/G3), não no kernel.</li>
+    <li><b>Testes de kernel</b> da imagem, com o overlay montado: <code>pytest tests/kernels/attention/test_triton_unified_attention_diffkv.py</code> (os casos que exigem FA3/FA4 aparecem como <i>skipped</i> no GB10).</li>
+  </ol>
+  <div class="la-eq">
+    \[ W_{\text{FP8}}[i,j] = q[i,j]\cdot s_{\lfloor i/128\rfloor,\,\lfloor j/128\rfloor} \qquad\qquad W_{\text{MXFP4}}[i,j] = \mathrm{E2M1}\big(n[i,j]\big)\cdot 2^{\,e_{i,\lfloor j/32\rfloor}-127} \]
+    <ul class="la-eq-legend">
+      <li>\(q\): valor E4M3 armazenado; \(s\): <code>weight_scale_inv</code> F32 do bloco 128×128 (respeitando os 4 chunks do QKV, 27 blocos de linha na GA e 29 na SWA)</li>
+      <li>\(n\): nibble de 4 bits; E2M1 mapeia 0…15 em [0, .5, 1, 1.5, 2, 3, 4, 6, −0, −.5, …, −6]</li>
+      <li>\(e\): byte E8M0 da escala, um a cada 32 valores</li>
+      <li>A convenção “nibble baixo = elemento par” (OCP/gpt-oss) <b>precisa ser confirmada</b> contra o GEMM do kernel</li>
+    </ul>
+  </div>
+  <div class="la-callout tip"><b class="t">Critério de saída</b><p>Os overlays passam nos testes de CPU; paridade truncada TP1 = TP2 ≈ HF dentro do limiar; o boot completo loga todos os marcadores; o G1 é provado pelo pool 2× e o G2 pela soma não nula do QKV.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Passos 5 e 6 — Lançar com motivo, especular com medida</h2>
+  <h3>Passo 5 — Argumentos de lançamento</h3>
+  <p><b>Objetivo.</b> Um comando de head e um de worker em que <b>cada flag tem motivo</b> e cada valor vem do <code>.env</code>. O worker (rank 1) sobe primeiro, depois o head (rank 0), que hospeda o rendezvous e a API; é o mesmo padrão das três receitas (<a data-ch="nccl-rdma">NCCL &amp; RDMA</a>).</p>
+  <pre data-lang="bash"><code># comum aos dois nós (valores do .env)
+COMMON_DOCKER=(--gpus all --network host --ipc host --shm-size 16g
+  --cap-add SYS_NICE --ulimit memlock=-1 --ulimit stack=67108864 --device /dev/infiniband
+  -e NCCL_IB_DISABLE=0 -e NCCL_IB_HCA=$IB_HCA -e NCCL_IB_GID_INDEX=3 -e NCCL_IB_AUTO_DETECT=0
+  -e NCCL_SOCKET_IFNAME=$IFACE -e GLOO_SOCKET_IFNAME=$IFACE -e TP_SOCKET_IFNAME=$IFACE -e NCCL_DEBUG=WARN
+  -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1
+  -e VLLM_USE_DEEP_GEMM=0 -e VLLM_MARLIN_INPUT_DTYPE=${MARLIN_INPUT_DTYPE:-fp8}
+  -e VLLM_ENGINE_READY_TIMEOUT_S=3600 -e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+  -v $MODEL_DIR:$MODEL_DIR:ro -v $HOME/.cache/vllm:/root/.cache/vllm
+  -v $PWD/files/overlay/mimo_v2.py:$VPY/model_executor/models/mimo_v2.py:ro
+  -v $PWD/files/overlay/triton_attn_diffkv.py:$VPY/v1/attention/backends/triton_attn_diffkv.py:ro
+  -v $PWD/files/overlay/triton_unified_attention_diffkv.py:$VPY/v1/attention/ops/triton_unified_attention_diffkv.py:ro)
+
+VLLM_ARGS=(serve $MODEL_DIR --served-model-name mimo-v2.6-flash-mopd --trust-remote-code
+  --tensor-parallel-size 2 --distributed-executor-backend mp
+  --nnodes 2 --master-addr $HEAD_IP --master-port 50000
+  --max-model-len ${MAX_MODEL_LEN:-262144} --max-num-seqs ${MAX_NUM_SEQS:-8}
+  --max-num-batched-tokens ${MAX_NUM_BATCHED_TOKENS:-4096}
+  --gpu-memory-utilization ${GMU:-0.85}            # ou --kv-cache-memory &lt;bytes&gt; quando conhecer a folga
+  --kv-cache-dtype ${KV_CACHE_DTYPE:-fp8}          # só com os overlays G1; sem eles fica BF16 em silêncio
+  --moe-backend marlin ${LINEAR_BACKEND:+--linear-backend $LINEAR_BACKEND}
+  --load-format safetensors --safetensors-load-strategy lazy
+  --enable-chunked-prefill --enable-prefix-caching --no-async-scheduling
+  --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}'
+  --cudagraph-capture-sizes 8 16 24 32 40 48 56 64
+  --speculative-config "{\"method\":\"dflash\",\"model\":\"$MODEL_DIR/dflash\",\"num_speculative_tokens\":${SPEC_K:-7},\"draft_tensor_parallel_size\":2}"
+  --reasoning-parser mimo --tool-call-parser mimo --enable-auto-tool-choice
+  --generation-config auto --default-chat-template-kwargs '{"enable_thinking": false}'
+  --mm-encoder-tp-mode data --limit-mm-per-prompt '{"image":4,"video":1,"audio":1}'
+  --mm-processor-kwargs '{"max_pixels":2073600}' --mm-processor-cache-gb 1
+  --enable-prompt-tokens-details)
+
+# worker
+docker run -d --name vllm-mimo "${COMMON_DOCKER[@]}" -e VLLM_HOST_IP=$WORKER_IP \
+  --entrypoint vllm $IMAGE "${VLLM_ARGS[@]}" --node-rank 1 --headless
+# head
+docker run -d --name vllm-mimo "${COMMON_DOCKER[@]}" -e VLLM_HOST_IP=$HEAD_IP \
+  --entrypoint vllm $IMAGE "${VLLM_ARGS[@]}" --node-rank 0 --host 0.0.0.0 --port 8888</code></pre>
+  <p>Um único array <code>VLLM_ARGS</code> alimenta os dois ranks: argumentos divergentes entre ranks são uma classe inteira de bugs que desaparece. Antes de confiar em qualquer nome de flag, <b>rode <code>vllm serve --help=all</code> na imagem fixada</b> e faça o <code>start.sh</code> falhar se alguma não existir. Um exemplo real: o log sugere <code>--kv-cache-memory=&lt;bytes&gt;</code>, enquanto a receita GLM usa <code>--kv-cache-memory-bytes</code>. O mesmo vale para variáveis: <code>VLLM_*</code> que a imagem não registra são ignoradas, no máximo com um warning (a <span class="la-rb ds"></span> descobriu isso com as variáveis do Stage-C na imagem Anemll).</p>
+  <p>Antes da tabela, a coreografia. Dois processos em máquinas diferentes precisam se encontrar, formar um grupo de comunicação, carregar cada um a sua metade e só então servir. Cada fase do boot é governada por um punhado de flags; a figura mostra quais.</p>
+  <figure class="la-fig wide" id="fig-boot" data-title="O boot em dois nós: rendezvous, grupos e flags">
+    <div class="la-fig-stage" style="height:390px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Os dois nós, com os processos de cada um: no head, API server, EngineCore (scheduler e gerente de KV) e o worker da GPU 0; no worker, só o processo da GPU 1 (<code>--headless</code>). A linha fina é o controle por TCP na interface CX7 (rendezvous, Gloo, fila de mensagens); a grossa é o RDMA do NCCL, por onde passam os all-reduces. Avance as fases no stepper: os chips embaixo são as flags e variáveis que aquela fase usa. Ligue “HCA ou GID errados” para ver o que acontece quando o NCCL cai para <code>NET/Socket</code>. Esquema; tempos e endereços são os do exemplo.</figcaption>
+  </figure>
+  <p>Agora cada flag, com o motivo. A primeira tabela cobre o que muda o <b>modelo servido</b>; a segunda, a <b>infraestrutura</b> que faz os dois nós virarem um só.</p>
+  <table class="la-params">
+    <thead><tr><th>Flag / env</th><th>Valor</th><th>Por quê</th><th>Nas outras receitas</th></tr></thead>
+    <tbody>
+      <tr><td><code>--trust-remote-code</code></td><td>—</td><td>Config e processor são remote code (<code>auto_map</code>). Sem a flag, o vLLM não carrega o processor multimodal nem a configuração do checkpoint</td><td>DS também (arquitetura V4)</td></tr>
+      <tr><td><code>--max-model-len</code></td><td>262144 no começo</td><td>Suba para 1M só depois do needle de 128K e do teste de OOM; nos híbridos, os “tokens” do log dependem dele</td><td>GLM 850.000; Qwen 262.144; DS 1.048.576</td></tr>
+      <tr><td><code>--max-num-seqs</code></td><td>8</td><td>Admissão de requisições; precisa combinar com as capture sizes</td><td>GLM 4; Qwen 8; DS 6</td></tr>
+      <tr><td><code>--max-num-batched-tokens</code></td><td>4096</td><td>Chunk de prefill e teto de tokens por passo: mais prefill por passo contra mais ativação e <span class="la-term" data-term="itl">ITL</span> pior para quem está em decode (<a data-ch="scheduler-batching">Scheduler</a>)</td><td>GLM 7168; Qwen 8192; DS 8192</td></tr>
+      <tr><td><code>--gpu-memory-utilization</code> / <code>--kv-cache-memory</code></td><td>0,85 / bytes</td><td>O orçamento do Passo 1. Fixar o pool em bytes, depois do primeiro boot, tira a dependência do profiling, que no UMA varia com o que mais estiver na memória</td><td>GLM 0,85 + <code>--kv-cache-memory-bytes</code>; Qwen 0,80; DS 0,835</td></tr>
+      <tr><td><code>--enable-chunked-prefill</code></td><td>—</td><td>Um prefill longo é cortado em pedaços do tamanho do MNBT e intercalado com os decodes: quem está gerando não congela enquanto um prompt de 128K entra</td><td>Qwen e DS sempre (“necessário a 262K–1M”)</td></tr>
+      <tr><td><code>--enable-prefix-caching</code></td><td>—</td><td>Reusa o KV de prefixos idênticos (hash de blocos cheios). Agentes reenviam o histórico inteiro a cada turno, e o reuso corta o TTFT; nos híbridos, o acerto depende do alinhamento de blocos com a janela (Passo 9, <a data-ch="prefix-caching">Prefix caching</a>)</td><td>GLM e DS sempre</td></tr>
+      <tr><td><code>--enable-prompt-tokens-details</code></td><td>—</td><td>A resposta passa a trazer <code>usage.prompt_tokens_details.cached_tokens</code>. É assim que você confere <code>cached_tokens = 0</code> no prefill frio do Passo 8 e vê se o prefix cache acertou</td><td>Qwen e DS sempre; GLM em perfis</td></tr>
+      <tr><td><code>--kv-cache-dtype</code></td><td>fp8</td><td>KV global de 11,5 para 5,76 KB/token; escala unitária é exata para este checkpoint, que não traz escalas calibradas <b>[medido: tonyd2wild]</b> (<a data-ch="kv-cache-quantizado">KV quantizado</a>)</td><td>GLM <code>fp8</code> → <code>fp8_ds_mla</code>; Qwen <code>fp8</code>; DS <code>nvfp4_ds_mla</code></td></tr>
+      <tr><td><code>--moe-backend marlin</code> + <code>VLLM_MARLIN_INPUT_DTYPE=fp8</code></td><td>W4A8</td><td>Kernel MXFP4 que funciona no SM12x; ativações FP8 deram +15% de prefill no SM120 <b>[medido: diffbot]</b>, <b>[a medir]</b> no sm_121</td><td>DS <code>flashinfer_b12x</code> (W4A16); GLM kernel EXL3 próprio</td></tr>
+      <tr><td><code>--load-format safetensors --safetensors-load-strategy lazy</code></td><td>—</td><td>Evita o G2. Carregadores mais rápidos (InstantTensor: 161 GB em ~40 s <b>[medido: Plaaasma]</b>) exigem o porte do #58142</td><td>GLM <code>instanttensor</code> (com overlays); Qwen igual ao MiMo</td></tr>
+      <tr><td><code>--no-async-scheduling</code></td><td>—</td><td>G8: spec decode + async scheduling corrompe a saída sob concorrência</td><td>DS mantém async ligado (desliga só para A/B)</td></tr>
+      <tr><td><code>--compilation-config</code></td><td><code>FULL_DECODE_ONLY</code></td><td>Graphs só no decode; o builder DiffKV com patch exige esse modo <b>[medido: Plaaasma]</b> (<a data-ch="cuda-graphs-warmup">CUDA graphs</a>)</td><td>Qwen <code>{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"}</code></td></tr>
+      <tr><td><code>--cudagraph-capture-sizes</code></td><td>8 16 … 64</td><td>Com k=7, cada sequência em decode tem 8 tokens (1 + 7 do verify); 8 sequências = 64</td><td>GLM <code>1 2 4 8 16 24 32</code>; DS arredonda o teto a múltiplo de 8</td></tr>
+      <tr><td><code>--speculative-config</code></td><td><code>dflash</code>, k = <code>$SPEC_K</code> (7), <code>draft_tensor_parallel_size</code> 2</td><td>Liga o drafter embutido (<code>$MODEL_DIR/dflash</code>). O drafter também é fatiado em TP2 (64 Q e 8 KV heads dividem por 2). O JSON é montado pelo script a partir do <code>.env</code>, nunca lido cru (Passo 10). A escolha de k é o Passo 6</td><td>GLM: <code>dflash</code> k=7, draft TP2, <code>"kv_cache_dtype":"auto"</code> (KV do drafter sem quantizar) e <code>draft_sample_method</code> probabilístico; Qwen: <code>mtp</code> k=3; DS: <code>dspark</code> k=6</td></tr>
+      <tr><td><code>--reasoning-parser</code> / <code>--tool-call-parser</code></td><td><code>mimo</code> / <code>mimo</code></td><td>Separa <code>&lt;think&gt;</code> e converte o XML compacto em <code>tool_calls</code></td><td>GLM <code>glm45</code>/<code>glm47</code>; Qwen <code>qwen3</code>/<code>qwen3_coder</code>; DS <code>deepseek_v4</code></td></tr>
+      <tr><td><code>--generation-config</code></td><td><code>auto</code></td><td>Usa temperatura 1,0 e top_p 0,95 do checkpoint quando o cliente não manda nada; evita as <span class="la-term" data-term="tool-call-storm">tool-call storms</span> dos defaults quase gulosos <b>[medido: tonyd2wild, diffbot]</b></td><td>DS usa <code>vllm</code>: o cliente controla a amostragem</td></tr>
+      <tr><td><code>--default-chat-template-kwargs</code></td><td><code>enable_thinking: false</code></td><td>Política: o thinking vem ligado no template; desligar no servidor evita reasoning vazando em clientes ingênuos. Documente a escolha</td><td>DS <code>DEFAULT_THINKING=low</code></td></tr>
+      <tr><td><code>--mm-encoder-tp-mode data</code> e limites multimodais</td><td>replicado; 4 imagens, 1 vídeo, 1 áudio</td><td>Encoders replicados (1,7 GiB) em vez de fatiados; os limites fixam o pior caso (na receita GLM um vídeo decomposto em 33 imagens matou o engine por falta de memória)</td><td>Qwen <code>data</code>; GLM <code>{"image":48,"video":1}</code></td></tr>
+      <tr><td><code>--mm-processor-kwargs</code></td><td><code>{"max_pixels":2073600}</code> (1920 × 1080)</td><td>Resolve a esquisitice da triagem: o <code>config.json</code> declara <code>image_max_pixels</code> 8.388.608 e o <code>preprocessor_config.json</code>, 12.845.056. Em vez de apostar em qual dos dois o processor lê, a flag fixa o teto, e com ele o pior caso de tokens e de memória por imagem</td><td>GLM limita por tokens (<code>max_image_tokens</code> 2048)</td></tr>
+      <tr><td><code>--mm-processor-cache-gb</code></td><td>1</td><td>O cache do processor multimodal mora na RAM do host, que no UMA é a mesma memória da GPU; o padrão é 4 GiB</td><td>GLM igual</td></tr>
+      <tr><td><code>--language-model-only</code></td><td>só na lane de texto</td><td>Não carrega as torres de visão e áudio: ~1,6 GiB/rank a mais de KV e nenhum profiling multimodal (parte do motivo de o pool medido no Passo 1 ficar abaixo do previsto)</td><td>GLM <code>LANGUAGE_MODEL_ONLY=1</code> (opcional)</td></tr>
+      <tr><td><code>--linear-backend triton</code></td><td>só se aparecer G6</td><td>Troca o GEMM FP8 do CUTLASS pelo do Triton nos shapes que falham no sm_121</td><td>obrigatório no TP4 do tonyd2wild</td></tr>
+      <tr><td><code>--hf-overrides '{"moe_router_dtype":"bfloat16"}'</code></td><td><b>não precisa</b></td><td>Já vem no config do V2.6; os comandos do V2.5 precisavam</td><td>—</td></tr>
+      <tr><td><code>--kv-offloading-size</code></td><td><b>não use</b></td><td>Um “tier de KV em CPU” no UMA é a mesma memória física</td><td>—</td></tr>
+    </tbody>
+  </table>
+  <table class="la-params">
+    <thead><tr><th>Infra, rendezvous e ambiente</th><th>Valor</th><th>Por quê</th><th>Nas outras receitas</th></tr></thead>
+    <tbody>
+      <tr><td><code>--tensor-parallel-size 2</code> + <code>--distributed-executor-backend mp</code></td><td>—</td><td>TP=2, uma GPU por nó (Passo 3). O executor <code>mp</code> (multiprocessing) sobe um processo por GPU e fala com eles por uma fila de mensagens (shared memory no mesmo nó, ZMQ entre nós). Dispensa montar um cluster Ray, e as flags de rendezvous abaixo só valem com ele</td><td>As três usam <code>mp</code></td></tr>
+      <tr><td><code>--nnodes 2 --node-rank N --master-addr $HEAD_IP --master-port 50000</code></td><td>1 = worker, 0 = head</td><td>O <span class="la-term" data-term="rendezvous">rendezvous</span>: os processos dos dois nós se encontram no <code>master-addr:port</code> do head para formar o grupo de comunicação. A porta precisa estar livre e acessível pela interface CX7</td><td>Portas: GLM 29521; Qwen 50000; DS 25000</td></tr>
+      <tr><td><code>--headless</code> (worker) · <code>--host 0.0.0.0 --port 8888</code> (head)</td><td>—</td><td>O worker não abre API nem EngineCore: só executa o forward da sua metade. A API e o scheduler vivem no head</td><td>Igual nas três</td></tr>
+      <tr><td><code>VLLM_HOST_IP</code></td><td>IP de cada nó</td><td>O endereço que o vLLM anuncia neste nó; precisa ser diferente em cada um</td><td>Igual nas três</td></tr>
+      <tr><td><code>NCCL_SOCKET_IFNAME</code>, <code>GLOO_SOCKET_IFNAME</code>, <code>TP_SOCKET_IFNAME</code></td><td>interface CX7</td><td>O controle (bootstrap do NCCL, grupo Gloo de CPU) vai por TCP nesta interface. Se cair na NIC errada, o boot trava ou o tráfego fica lento</td><td>GLM por rank (cabos cruzados); Qwen <code>IFACE</code></td></tr>
+      <tr><td><code>NCCL_IB_DISABLE=0</code>, <code>NCCL_IB_HCA</code>, <code>NCCL_IB_GID_INDEX=3</code></td><td><code>=rocep1s0f0</code>; 3</td><td>Os dados (os 96 all-reduces por passo) vão por RDMA no HCA escolhido (<code>=</code> é match exato), com a GID RoCEv2 de índice 3. É isso que faz o log mostrar <code>NET/IB</code>, e não <code>NET/Socket</code> (Passo 3)</td><td>GLM: GID por rank (“uma entrada zerada mata o rank ~60 s depois”); Qwen: “se 3 não sobe, tente 5”</td></tr>
+      <tr><td><code>NCCL_IB_AUTO_DETECT=0</code>, <code>NCCL_DEBUG=WARN</code></td><td>—</td><td>A primeira vem da receita Qwen, para forçar o HCA exato; a referência do vLLM não a encontra na doc do NCCL (provável no-op). <code>WARN</code> mantém o log limpo; troque por <code>INFO</code> para conferir o transporte</td><td>Qwen igual</td></tr>
+      <tr><td><code>HF_HUB_OFFLINE=1</code>, <code>TRANSFORMERS_OFFLINE=1</code></td><td>—</td><td>O container nunca baixa nada: se falta um arquivo, falha na hora, em vez de buscar outra revisão em silêncio. Também permite montar o modelo read-only</td><td>As três</td></tr>
+      <tr><td><code>VLLM_USE_DEEP_GEMM=0</code></td><td>—</td><td>G5: o DeepGEMM da imagem corrompe GEMMs FP8 no SM12x sem avisar, e por padrão o vLLM também mandaria os experts MXFP4 para ele <b>[medido: tonyd2wild]</b></td><td>—</td></tr>
+      <tr><td><code>VLLM_ENGINE_READY_TIMEOUT_S</code></td><td>3600</td><td>O padrão (600 s) é menor que o boot frio (~11 min): o head desistiria de esperar o EngineCore no meio da carga</td><td>GLM 3600</td></tr>
+      <tr><td><code>VLLM_ALLOW_LONG_MAX_MODEL_LEN=1</code></td><td>—</td><td>Libera <code>--max-model-len</code> acima de 262.144 nos builds que pedem, para o caminho até 1M</td><td>—</td></tr>
+      <tr><td><code>--gpus all --network host</code></td><td>—</td><td>GPU visível no container; a rede do host, sem NAT, para NCCL, NFS e API</td><td>As três</td></tr>
+      <tr><td><code>--ipc host --shm-size 16g</code></td><td>—</td><td>Os processos do vLLM trocam o <code>SchedulerOutput</code> e outros buffers por shared memory (<code>/dev/shm</code>); o padrão do Docker (64 MB) é pequeno demais</td><td>GLM 32g; DS 64gb</td></tr>
+      <tr><td><code>--ulimit memlock=-1</code>, <code>--device /dev/infiniband</code></td><td>—</td><td>O RDMA precisa travar (<i>pin</i>) a memória que registra na placa e acessar os devices verbs; sem isso o NCCL cai para socket</td><td>As três</td></tr>
+      <tr><td><code>--cap-add SYS_NICE</code>, <code>--ulimit stack=67108864</code></td><td>—</td><td>A capability deixa o processo ajustar prioridade e afinidade de CPU e memória; a pilha de 64 MiB repete o valor da receita Qwen</td><td>Qwen igual; GLM usa <code>IPC_LOCK</code></td></tr>
+      <tr><td><code>-v …:ro</code> (modelo e overlays)</td><td>read-only</td><td>Os mesmos bytes nos dois ranks, sem chance de o container alterar o checkpoint ou o patch</td><td>As três</td></tr>
+    </tbody>
+  </table>
+  <div class="la-callout tip"><b class="t">Critério de saída (Passo 5)</b><p>O boot sobe nos dois nós; o log mostra <code>Using TRITON_ATTN_DIFFKV for attention.</code>, os marcadores dos overlays, o <code>GPU KV cache size</code> esperado e as capture sizes; e o comando renderizado (<code>.last_head_launch.sh</code>) fica salvo para auditoria, como na receita Qwen.</p></div>
+
+  <h3>Passo 6 — Decodificação especulativa</h3>
+  <p><b>Objetivo.</b> Escolher o speculator e o k que maximizam os tok/s <b>na sua carga</b>, medindo a aceitação (<a data-ch="especulacao-fundamentos">Especulação: fundamentos</a>, <a data-ch="dflash-dspark">DFlash &amp; DSpark</a>).</p>
+  <p><b>Conceito.</b> O drafter propõe k tokens e o alvo verifica todos numa passada. Cada passo emite os rascunhos aceitos mais um token do próprio alvo (a correção, ou o bônus quando tudo passa), e o ganho é</p>
+  <div class="la-eq">
+    \[ \text{tok/s} \;=\; \frac{1 + \bar a(k)}{t_{\text{passo}}(k)}, \qquad \bar a(k) = \sum_{i=1}^{k} \alpha^{i} \;\;\text{(aceitação geométrica, modelo simplificado)} \]
+    <ul class="la-eq-legend">
+      <li>\(\bar a(k)\): <span class="la-term" data-term="aceitacao-especulativa">rascunhos aceitos por passo</span>, em média</li>
+      <li>\(\alpha\): probabilidade de aceitar cada posição, se as posições fossem independentes</li>
+      <li>\(t_{\text{passo}}(k)\): custo do passo. Tem uma parte que sobe com k (verify maior, capture sizes maiores) e, com DFlash, uma parte quase fixa: o drafter rascunha o bloco inteiro de 8 numa passada, qualquer que seja o k usado</li>
+    </ul>
+  </div>
+  <p>A aceitação depende do <b>tipo de texto</b>: altíssima em JSON, contagem e código, baixa em prosa; temperatura 1,0 a reduz em relação a 0. No MiMo há duas opções embutidas: DFlash (k de 1 a 7; o bloco de 8 é o do treino) e MTP (k de 1 a 3). O ngram é experimental. Meça com os contadores Prometheus do vLLM V1, lidos por diferença antes e depois de cada braço:</p>
+  <pre data-lang="bash"><code>m() { curl -s http://$HEAD_IP:8888/metrics | grep -E "^vllm:spec_decode_num_(drafts|draft_tokens|accepted_tokens)_total" ; }
+m &gt; before.txt; python3 bench/run_category.py --category code --n 20; m &gt; after.txt
+# tokens aceitos por passo = Δaccepted / Δdrafts ; taxa por token = Δaccepted / Δdraft_tokens
+curl -s http://$HEAD_IP:8888/metrics | grep accepted_tokens_per_pos    # curva por posição (decai com a posição)</code></pre>
+  <p>O gabarito publicado <b>[medido: tonyd2wild, vLLM TP2, DFlash k=7, FP8 KV, temperatura 0, C=1]</b> dá, em tokens aceitos por passo (de 7): estruturado 6,85, código 5,23, matemática 5,00, JSON 4,00, raciocínio 2,62, prosa 1,23; e, em <span class="la-term" data-term="tok-s-por-stream">tok/s por stream</span>, código 70,5, prosa 25,9, média 53,3. O simulador abaixo usa esses pontos para calibrar um modelo simples e perguntar: e se k fosse outro?</p>
+  <figure class="la-fig wide" id="fig-spec" data-title="Simulador de especulação: rascunhar, verificar, escolher k">
+    <div class="la-fig-stage" style="height:470px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Em cima, o rascunhador propõe k cartas e o alvo carimba cada uma: verde aceita, vermelha rejeita (e tudo depois dela cai), rosa é o token do próprio alvo (correção ou bônus). No meio, os tok/s previstos para cada k. Embaixo, as capture sizes: com k fixo, um batch de n sequências tem n(k+1) tokens, e cada tamanho precisa casar com um graph capturado. <b>Modelo ilustrativo, e o gráfico é hipótese:</b> \(\alpha\) é ajustado para reproduzir a aceitação medida em k=7; o custo do passo é \(t(k) = t_0 + c_d\,[k&gt;0] + \beta k\), calibrado em dois pontos (sem spec: teto de banda × eficiência <b>[estimativa]</b>; k=7: ~87 ms, derivado de (1 + aceitos)/tok/s medidos <b>[interpretação]</b>). O controle \(c_d\) é o custo fixo do drafter, que ninguém mediu isoladamente <b>[a medir]</b>: com \(c_d = 0\) o custo é linear em k.</figcaption>
+  </figure>
+  <p>Mude a categoria e observe o k ótimo andar. Em código e texto estruturado o modelo prefere k = 7: quase tudo é aceito, e cada passo caro rende 6 a 8 tokens. A medição concorda na maior parte: no TP4 do tonyd2wild, k = 4 foi pior que k = 7 em matemática (82 contra 95 tok/s), texto estruturado (78 contra 115) e contagem (84 contra 136), e empatou em código dentro do ruído (86 contra 83) <b>[medido: tonyd2wild]</b>. Em prosa, com \(c_d = 0\), o modelo diz outra coisa: prevê ganho com k pequeno (ótimo em k ≈ 2). A medição não viu esse ganho: no mesmo TP4, k = 4 não melhorou a prosa (28 contra 35 tok/s em k = 7). É sinal de que o custo do passo tem uma parte fixa que o modelo linear ignora, porque o DFlash rascunha o bloco de 8 de uma vez. Suba o \(c_d\) e veja o ganho de k pequeno em prosa encolher até sumir. Trate “k ≈ 2 em prosa” como hipótese <b>[a medir]</b>, não como recomendação. A comparação MTP × DFlash do SGLang (o MTP ganhou em prosa, 35,0 contra 25,8 tok/s, e perdeu em código, 46,0 contra 69,8 <b>[medido: MiaAI-Lab]</b>) usa outro drafter e não valida o efeito de k; ela só mostra que, em prosa, o drafter importa mais que o k. A interpretação provável da parte que cresce com k: num MoE, verificar k + 1 tokens acorda mais experts distintos por camada do que verificar 1.</p>
+  <p>Repare também na faixa de capture sizes. A lista <code>8 16 … 64</code> é perfeita para k = 7 e ruim para qualquer outro k: com k = 3, um batch de 3 sequências tem 12 tokens e é “padded” para 16. A <span class="la-rb ds"></span> caiu na versão pior desse erro: com 6 sequências × 7 tokens = 42, o teto padrão truncou a grade em 40 e o passo de 42 tokens rodava <b>eager</b> (−12% no agregado de c=6), até arredondar o teto para 48.</p>
+  <p><b>Protocolo:</b> linha de base <b>sem spec</b> por categoria (código, JSON, prosa, raciocínio, resumo) com C=1; DFlash k ∈ {3, 5, 7} e MTP k ∈ {1, 2, 3} com o mesmo prompt set, em temperatura 0 <b>e</b> 1,0; repetir em 32K e 128K (o custo do verify em contexto longo depende do G7); escolher pela média ponderada da sua carga. Um laboratório que atende agentes de código pesa código e JSON.</p>
+  <div class="la-callout tip"><b class="t">Critério de saída (Passo 6)</b><p>Uma tabela aceitação × k × categoria × contexto; o speculator e o k escolhidos com justificativa; <code>SPEC_METHOD</code>/<code>SPEC_K</code> no <code>.env</code>, com <code>mtp</code> e <code>none</code> como rollback.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Passos 7 e 8 — Provar que está certo, depois medir</h2>
+  <h3>Passo 7 — Validação</h3>
+  <p><b>Objetivo.</b> Provar que o servidor responde <b>certo</b>, não só rápido (<a data-ch="api-tools-estruturado">API, tools &amp; JSON</a>, <a data-ch="medindo-qualidade">Medindo qualidade</a>). Todo teste vira script em <code>tests/</code> e roda depois de cada mudança. Cada teste existe para pegar um bug específico:</p>
+  <table>
+    <thead><tr><th>Teste</th><th>Como</th><th>Passa se</th></tr></thead>
+    <tbody>
+      <tr><td>Vida</td><td><code>curl -fsS $API/health</code>; <code>/v1/models</code></td><td>200; <code>max_model_len</code> = <code>.env</code></td></tr>
+      <tr><td>Sanidade (G2)</td><td>“What is the capital of France? One word.”, temperatura 0</td><td>“Paris”; nada de lixo ou repetição</td></tr>
+      <tr><td>Reasoning on/off</td><td>Com e sem <code>chat_template_kwargs: {enable_thinking: true}</code></td><td>Reasoning separado; <code>content</code> sem <code>&lt;think&gt;</code></td></tr>
+      <tr><td>Tool calling</td><td>Uma tool <code>get_weather</code>, <code>tool_choice: auto</code>, com e sem streaming; depois <code>required</code> e nomeado</td><td><code>finish_reason: tool_calls</code>, argumentos em JSON válido; o estrito pode falhar até o #58019</td></tr>
+      <tr><td>Repetição de tool calls</td><td>Replay de uma sessão de agente capturada</td><td>≤ N chamadas por resposta; compare MOPD × RL</td></tr>
+      <tr><td>Chat template</td><td><code>POST /tokenize</code> com <code>messages</code> contra <code>apply_chat_template</code> do HF</td><td>Tokens idênticos</td></tr>
+      <tr><td>Needle</td><td>16K, 32K e 128K; profundidades 0,1 / 0,5 / 0,9</td><td>100%. <b>Se falhar só acima de ~128 tokens, é vazamento de <code>sliding_window</code></b></td></tr>
+      <tr><td>Canário de qualidade</td><td>GSM8K, 200 questões, 5-shot, guloso</td><td>Igual à <b>sua</b> linha de base ± 3 questões</td></tr>
+      <tr><td>KV FP8 efetivo / sob carga / OOM</td><td>Pool com e sem fp8; 8 requisições longas com spec; <code>max_num_seqs</code> × <code>max_model_len</code></td><td>~2×; nenhum caractere espúrio; sem crash e <code>MemAvailable</code> ≥ 4 GiB</td></tr>
+    </tbody>
+  </table>
+  <pre data-lang="bash"><code>curl -s $API/v1/chat/completions -H 'Content-Type: application/json' -d '{
+ "model":"mimo-v2.6-flash-mopd","temperature":0,
+ "messages":[{"role":"user","content":"Qual o tempo em Lisboa agora?"}],
+ "tools":[{"type":"function","function":{"name":"get_weather","description":"Clima atual",
+   "parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}]}' \
+ | jq '.choices[0] | {finish_reason, tool_calls: .message.tool_calls}'</code></pre>
+  <p>Sobre o canário: as referências publicadas de GSM8K variam com o protocolo (diffbot 196/200; #58128 279–281/300 com limite de 256 tokens de saída; #58142 ~0,97 em 25-shot). O número absoluto importa menos que a estabilidade <b>contra a sua própria linha de base</b>. O <span class="la-term" data-term="needle-test">needle</span> merece atenção especial: é o único teste da lista que pega o vazamento de janela, porque em prompts curtos as camadas globais e as SWA enxergam o mesmo contexto.</p>
+  <div class="la-callout tip"><b class="t">Critério de saída (Passo 7)</b><p><code>tests/smoke.sh</code> verde e os resultados anotados no README (“Verified end to end: …”), com data e commit.</p></div>
+
+  <h3>Passo 8 — Benchmark</h3>
+  <p><b>Objetivo.</b> Números reproduzíveis de <span class="la-term" data-term="ttft">TTFT</span> e <span class="la-term" data-term="tpot">TPOT</span>, e tok/s na escada de concorrência e no prefill, com o método publicado (<a data-ch="benchmarking">Benchmarking</a>). Antes de medir, calcule onde você <i>deveria</i> chegar: o prefill é limitado por compute, e o decode sem spec é limitado por banda (<a data-ch="gpu-por-dentro">GPU por dentro</a>). Cada passo de decode lê, por rank, os experts ativos e tudo o que é denso:</p>
+  <div class="la-eq">
+    \[ \text{bytes/passo/rank} \approx \underbrace{2{,}51}_{\text{8 experts}\times 47,\ \div 2} + \underbrace{1{,}44}_{\text{qkv FP8}} + \underbrace{1{,}61}_{o\_proj\ \text{BF16}} + \underbrace{0{,}63}_{lm\_head} + \underbrace{0{,}2}_{\text{router, MLP densa}} \approx 6{,}4\ \text{GB} \;\Rightarrow\; \text{tok/s} \le \frac{273\ \text{GB/s}}{6{,}4\ \text{GB}} \approx 43 \]
+    <ul class="la-eq-legend">
+      <li>Tudo <b>[estimativa]</b> a partir dos shapes; o TP divide quase tudo por 2</li>
+      <li>Com <code>o_proj</code> em FP8 (#59083) o total cai para ~5,6 GB e o <span class="la-term" data-term="teto-de-banda">teto</span> sobe para ~49 tok/s</li>
+      <li>Na prática espere 50–65% do teto, e depois multiplique pelo efeito do spec</li>
+    </ul>
+  </div>
+  <p>A figura transforma essa conta numa esteira: os bytes de um passo passam do LPDDR5X para a GPU na velocidade da banda, e o tempo que a esteira leva é o tempo mínimo do passo.</p>
+  <figure class="la-fig" id="fig-teto" data-title="O teto de decode: uma esteira de bytes por passo">
+    <div class="la-fig-stage" style="height:400px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Cada caixa na esteira é um componente lido em todo passo de decode, com largura proporcional aos GB por rank. A banda define a velocidade da esteira; a eficiência reduz a banda útil (kernels, latência de all-reduce, lançamento de kernels). A régua de baixo compara o teto e a faixa realista <b>[estimativa]</b> com as medições <b>com</b> DFlash k=7 <b>[medido: tonyd2wild]</b>: é a distância entre as duas que o spec precisa pagar.</figcaption>
+  </figure>
+  <p>Repare no que a régua revela: o decode sem spec deveria ficar em ~21–28 tok/s <b>[estimativa]</b>. Os 70,5 tok/s medidos em código só são possíveis porque cada passo emite ~6 tokens. E os 25,9 de prosa ficam dentro da faixa sem spec: é a mesma conclusão do simulador, agora por outro caminho.</p>
+  <p><b>Regras de método</b> (detalhadas em <a data-ch="benchmarking">Benchmarking</a>): prompts <b>reais por categoria</b> para decode com spec (o dataset <code>random</code> derruba a aceitação e subestima o DFlash; prompts sintéticos repetitivos a inflam); prefill <b>frio</b>, com um prefixo único por requisição e <code>cached_tokens = 0</code> conferido; aquecimento descartado; mediana de ≥ 3–5 execuções; temperatura e thinking registrados; escada C ∈ {1, 2, 4, 8} e prefill de 2K a 256K; e o <code>.env</code>, o digest da imagem, a revisão do modelo e o log de boot salvos junto do JSON.</p>
+  <pre data-lang="bash"><code># Escada de concorrência (dataset customizado por categoria → JSONL de prompts)
+for C in 1 2 4 8; do
+  vllm bench serve --backend openai-chat --base-url http://$HEAD_IP:8888 --endpoint /v1/chat/completions \
+    --model mimo-v2.6-flash-mopd --dataset-name custom --dataset-path bench/prompts_code.jsonl \
+    --num-prompts $((C*8)) --max-concurrency $C --temperature 0 \
+    --percentile-metrics ttft,tpot,itl,e2el --metric-percentiles 50,90,99 \
+    --save-result --result-dir results/$(date +%F)-c$C
+done
+# Prefill frio: 1 requisição por tamanho, prefixo único, max_tokens=1 → prefill tok/s = prompt_tokens / TTFT
+python3 bench/cold_prefill.py --sizes 2048 8192 32768 65536 131072 262144 --max-tokens 1</code></pre>
+  <table>
+    <thead><tr><th>Gabarito (2× Spark)</th><th>vLLM TP2, DFlash k=7, FP8 KV <b>[medido: tonyd2wild]</b></th><th>SGLang TP2 <b>[medido: MiaAI-Lab / Smilehyu]</b></th></tr></thead>
+    <tbody>
+      <tr><td>C1 por stream (média)</td><td>53,3 tok/s; TTFT 0,37 s</td><td>EAGLE MTP: 31,8–46,8 (MOPD)</td></tr>
+      <tr><td>C1 código / prosa</td><td>70,5 / 25,9</td><td>DFlash 69,8 / 25,8; EAGLE 46,0 / 35,0</td></tr>
+      <tr><td><span class="la-term" data-term="tok-s-agregado">Agregado</span></td><td>C6: 155,8 tok/s</td><td>C8: 98–226 por categoria (MOPD, EAGLE)</td></tr>
+      <tr><td>Prefill frio 2K / 32K / 128K / 248K</td><td>1.947 / 1.425 / 937 / 656 tok/s</td><td>pico de 2.558 em 8K (RL); 2.311 em 16K (MOPD)</td></tr>
+      <tr><td>Pool de KV</td><td>1,84–1,87 M tokens @300K (GMU 0,90; dois pares de Sparks, 1.835.052 e 1.867.302)</td><td>2,55 M (MOPD, 0,93) / 2,88 M (RL, 0,963)</td></tr>
+    </tbody>
+  </table>
+  <div class="la-callout warn"><b class="t">Compare com cautela</b><p>Os números de vLLM publicados são do checkpoint RL (config e drafter idênticos, pesos diferentes); nenhuma medição do MOPD em vLLM no GB10 foi publicada até 2026-09-28. Seus números do MOPD são, literalmente, <b>[a medir]</b>.</p></div>
+  <div class="la-callout tip"><b class="t">Critério de saída (Passo 8)</b><p>Tabelas de decode por categoria e C, de prefill frio e de aceitação, com método, data, commit e digest. Nada de “≈” sem a marcação [estimativa].</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Passos 9 e 10 — Ajustar com regra, empacotar para outra pessoa</h2>
+  <h3>Passo 9 — Tuning iterativo</h3>
+  <p><b>Objetivo.</b> Melhorar um alvo declarado sem quebrar o resto, com uma regra de decisão escrita <b>antes</b> do experimento (<a data-ch="benchmarking">Benchmarking</a>). A regra, declarada em <code>docs/</code> antes de medir:</p>
+  <ol class="la-steps">
+    <li><b>Uma variável por vez</b>, no desenho <span class="la-term" data-term="ab-a">A/B/A</span> (baseline → mudança → baseline, no mesmo boot ou em boots pareados), com ≥ 3 execuções por braço e a mediana.</li>
+    <li><b>Aceite</b> se o alvo melhora ≥ 3% <b>nos dois lados</b> do A/B/A, nenhuma métrica secundária piora mais de 2%, o canário de qualidade fica dentro do ruído (GSM8K-200 ± 3 questões; needle 100%; suíte de tools 100%) e não há OOM no pior caso.</li>
+    <li><b>Rejeite e registre</b> o resultado negativo no CHANGELOG, como o tonyd2wild fez com k=4 e com MNBT 8192.</li>
+    <li>Mudanças que afetam memória (dtype do KV, GMU, MNBT) <b>refazem</b> o teste de OOM.</li>
+  </ol>
+  <p>Por que “nos dois lados”? Porque o sistema deriva: o page cache esquenta, o autotune termina, a temperatura do chip sobe. Na figura, ligue a deriva e zere o efeito real: o A/B ingênuo “descobre” uma melhoria que não existe.</p>
+  <figure class="la-fig" id="fig-aba" data-title="A/B/A: separando o efeito da deriva">
+    <div class="la-fig-stage" style="height:380px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Nove execuções em sequência: três do baseline A₁, três da mudança B, três do baseline A₂. Cada ponto é uma execução (tok/s), a linha grossa é a mediana do braço e a tracejada é a deriva. À direita, o veredito de duas regras: A/B ingênuo (B contra A₁) e A/B/A (B contra A₁ <b>e</b> contra A₂, ≥ 3% nos dois). Valores ilustrativos em torno de 53 tok/s; “novo sorteio” refaz o ruído.</figcaption>
+  </figure>
+  <p>Com deriva de ~0,6% por execução e efeito zero, B fica ~2% acima de A₁ só por vir depois, e com um pouco de ruído passa dos 3%. O A₂, medido ainda mais tarde, fica acima de B e desmascara a ilusão. Os botões do MiMo, com as hipóteses e o que já se sabe:</p>
+  <table class="la-params">
+    <thead><tr><th>Botão</th><th>Hipótese</th><th>Troca esperada</th><th>Evidência</th></tr></thead>
+    <tbody>
+      <tr><td><code>KV_CACHE_DTYPE</code> fp8 × auto</td><td>2× de pool</td><td>TTFT +4–15% em 16–128K; decode ≈ igual</td><td>#58128; tonyd2wild: decode igual dentro do ruído</td></tr>
+      <tr><td><code>MAX_NUM_BATCHED_TOKENS</code> 2048 / 4096 / 8192</td><td>Chunk maior = prefill mais rápido</td><td>Mais ativação (menos KV), <span class="la-term" data-term="itl">ITL</span> pior com prefill concorrente</td><td>TP4: 8192 rejeitado (prefill pior em 8K/32K, pool −13%)</td></tr>
+      <tr><td><code>MAX_NUM_SEQS</code> 4 / 8 / 16</td><td>Mais agregado</td><td>Menos tok/s por stream; capture sizes maiores</td><td>C1→C6: 45,6→155,8 agregado, 53→31 por stream</td></tr>
+      <tr><td>W4A8 × W4A16</td><td>+prefill</td><td>Precisão das ativações</td><td>+15% de prefill, GSM8K 98,5% no SM120 [diffbot]</td></tr>
+      <tr><td><code>o_proj</code> FP8 (#59083)</td><td>−0,8 GiB/rank, +14% no teto</td><td>Erro por tensor</td><td><b>[a medir]</b></td></tr>
+      <tr><td>EP on/off</td><td>Menos bytes por rank sob carga?</td><td>Desbalanceamento, all-to-all</td><td><b>[a medir]</b></td></tr>
+      <tr><td>Agrupamento do KV híbrido (#58207)</td><td>+10% de pool</td><td>Mais grupos (metadados)</td><td>+10,57% [#58175]</td></tr>
+      <tr><td>Split-KV no verify (G7)</td><td>Decode em contexto longo</td><td>Nenhuma esperada</td><td>87–94 → 156–175 tok/s no SM120 [diffbot]</td></tr>
+      <tr><td>Prefix cache</td><td>TTFT em multi-turn</td><td>Alinhamento de blocos com SWA</td><td>Revisita de 8K: TTFT 0,34 s (10,8×) no SGLang [Smilehyu]</td></tr>
+    </tbody>
+  </table>
+  <div class="la-callout tip"><b class="t">Critério de saída (Passo 9)</b><p>Um <code>docs/tuning-AAAA-MM-DD.md</code> por rodada com a tabela de experimentos (aceitos <i>e</i> rejeitados), o <code>.env.sample</code> atualizado e o CHANGELOG com o motivo de cada default.</p></div>
+
+  <h3>Passo 10 — Empacotamento</h3>
+  <p><b>Objetivo.</b> Outra pessoa, com outro par de Sparks, reproduz tudo com <code>cp .env.sample .env &amp;&amp; ./start.sh</code> (<a data-ch="engenharia-de-receita">Engenharia de receita</a>). A estrutura é a mesma das três receitas do laboratório:</p>
+  <pre data-lang="text"><code>MiMo-V2.6-Flash-MOPD-vLLM-2x-DGX-Sparks/
+├── README.md              # Status honesto, Quick start, .env reference, KV budget medido, Patches e por quê, Gotchas, Credits
+├── CHANGELOG.md           # cada default com data, medição e motivo; resultados negativos também
+├── LICENSE  NOTICE        # da receita; licenças do código vendorizado
+├── .env.sample            # comentado; os valores do README vêm daqui
+├── Dockerfile             # opcional: só deps de áudio/vídeo
+├── download.sh  verify-weights.py
+├── start.sh               # doctor | download | sync | overlays | launch
+├── stop.sh  status.sh  logs.sh  smoke.sh
+├── files/
+│   ├── orig/*.py + .sha256        # arquivos extraídos da imagem fixada
+│   ├── patch_*.py                 # geradores fail-closed e idempotentes
+│   ├── overlay/*.py               # saída (bind-mount nos 2 ranks)
+│   └── evict_page_cache.py        # posix_fadvise(DONTNEED) do checkpoint antes do boot
+├── tests/                 # test_&lt;patch&gt;.py (CPU), smoke, needle, tools, multimodal, paridade truncada
+├── bench/                 # prompts por categoria, cold_prefill.py, run_ladder.sh
+├── results/AAAA-MM-DD-*/  # JSON + .env + boot log + digest
+└── docs/                  # triagem, memória, tuning, decisões</code></pre>
+  <p>O <code>Dockerfile</code> só existe porque os kits relatam que a imagem não tem <code>soundfile</code> e PyAV. Ele parte da imagem <b>fixada por digest</b> e congela as versões que já vêm nela, para que o <code>pip</code> não troque o torch por baixo:</p>
+  <pre data-lang="dockerfile"><code>FROM vllm/vllm-openai:mimo-v26-aarch64-cu130@sha256:&lt;digest-fixado&gt;
+RUN pip freeze | grep -iE "^(torch|torchaudio|torchvision|numpy|triton|transformers)==" &gt; /tmp/pins.txt &amp;&amp; \
+    pip install --no-cache-dir -c /tmp/pins.txt librosa soundfile av &amp;&amp; \
+    python3 -c "import librosa, soundfile, av; print('ok')"</code></pre>
+  <p>Os overlays ficam <b>fora</b> da imagem, em bind-mount: você atualiza um patch sem rebuild e a imagem continua igual ao upstream. Leve a imagem ao worker pelo próprio link CX7: <code>docker save $IMAGE | ssh $WORKER docker load</code>. O <code>.env.sample</code> concentra todas as decisões:</p>
+  <pre data-lang="bash"><code># --- cluster ---
+HEAD_IP=10.0.0.1
+WORKER_IP=10.0.0.2
+IFACE=enp1s0f0np0          # interface CX7 do head
+IB_HCA==rocep1s0f0         # "=" no início = match exato de um HCA
+IB_GID_INDEX=3
+# --- modelo ---
+MODEL_ID=XiaomiMiMo/MiMo-V2.6-Flash-MOPD
+MODEL_REV=2479e2d0029eca9a34cc7e7f55a121925f81908e
+IMAGE=vllm/vllm-openai:mimo-v26-aarch64-cu130
+NFS_SHARE=false            # true = o worker monta o diretório do head em read-only
+# --- serving ---
+MAX_MODEL_LEN=262144
+MAX_NUM_SEQS=8
+MAX_NUM_BATCHED_TOKENS=4096
+GMU=0.85
+KV_CACHE_MEMORY=           # bytes; se definido, fixa o pool (recomendado depois do 1º boot)
+KV_CACHE_DTYPE=fp8         # exige overlays G1; o start.sh recusa fp8 sem eles
+SPEC_METHOD=dflash         # dflash | mtp | none
+SPEC_K=7
+MARLIN_INPUT_DTYPE=fp8     # vazio = W4A16
+EXACT_QKV=1                # overlay G3
+OPROJ_FP8=0                # lane experimental (#59083)
+EVICT_PAGE_CACHE=true</code></pre>
+  <div class="la-callout warn"><b class="t">Armadilhas do <code>.env</code></b><p>Um <code>.env</code> é <i>sourced</i> pelo shell: aspas somem, e um JSON como <code>{"image":8}</code> chega quebrado. Por isso a <span class="la-rb ds"></span> aceita <code>image=N</code> e monta o JSON dentro do container, e o <code>start.sh</code> acima monta o <code>--speculative-config</code> a partir de <code>SPEC_K</code>. A <span class="la-rb ds"></span> também normaliza BOM e CRLF numa cópia <code>0600</code> antes de ler. Documente a precedência, porque cada receita decide de um jeito. Na <span class="la-rb qwen"></span> o <code>.env</code> vence o ambiente (<code>KV_CACHE_DTYPE=fp8 ./start.sh</code> é ignorado se o <code>.env</code> define a chave), com exceção de <code>ABLIT</code> e <code>HF_TOKEN</code>, e as lanes <code>start-fp8.sh</code> e <code>start-v030.sh</code> usam variáveis <code>OVERRIDE_*</code> lidas depois do <code>.env</code>. Na <span class="la-rb glm"></span> é o contrário: o que o chamador exporta, inclusive vazio, vence o <code>.env</code>, exceto <code>ABLIT</code>, que é forçado a 0 depois do <code>.env</code>. Escolha uma regra, escreva-a no README e faça o resumo do launch imprimir o valor efetivo de cada chave.</p></div>
+  <p>O <code>start.sh</code> faz, nesta ordem: (1) <b>doctor</b>: ssh ao worker, a imagem nos dois nós com o <b>digest igual</b>, RoCE ativo, GPU ociosa, <code>MemAvailable</code>, disco, <code>earlyoom</code> desligado; (2) download + verify no head e sync (rsync ou NFS read-only); (3) extrai os arquivos da imagem, confere o sha256 e gera os overlays, <b>abortando</b> se uma âncora falhar; (4) recusa combinações proibidas antes de subir (<code>KV_CACHE_DTYPE=fp8</code> sem overlay, <code>SPEC_K</code> &gt; 7 com DFlash ou &gt; 3 com MTP, capture sizes que não são múltiplos de k+1, flags inexistentes); (5) libera o page cache, sobe o worker, sobe o head e espera o <code>/health</code> com timeout de ~20 min (o boot frio leva ~11 min com mmap <b>[medido: tonyd2wild]</b>); (6) imprime as linhas de KV do log e roda o <code>smoke.sh</code>.</p>
+  <p>Por fim, a documentação: uma seção “Status” em tabela, só com medições e com “Not measured” explícito; uma seção “Why the overlay exists” para cada patch (sintoma, causa, PR upstream, como remover quando o upstream absorver); e créditos a cada kit de onde veio uma ideia e aos autores dos PRs. Respeite as licenças: o MiMo é MIT e o vLLM é Apache-2.0, mas código vendorizado de terceiros tem licença própria (a receita Qwen, por exemplo, vendoriza código AGPL-3.0 e declara isso).</p>
+  <div class="la-callout tip"><b class="t">Critério de saída (Passo 10): “pronto”</b><p>Um segundo par de Sparks reproduz os números do README com diferença ≤ 5–10%, seguindo só o README.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Além do MiMo: o desafio, o Mac e o checklist final</h2>
+  <h3>Desafio: Naive-N0.5-Flash, um modelo que o vLLM ainda não conhece</h3>
+  <p>O <b>Naive-N0.5-Flash</b> (2026-09-27, MIT) tem 309B parâmetros e 15,5B ativos e deriva da base do MiMo-V2.5: mesma espinha dorsal (48 camadas, hidden 4096, 256 experts top-8, 4 KV heads, vocabulário 152.576). Mas <b>troca as camadas globais por DeepSeek Sparse Attention</b> (DSA) num layout ~5:1 SWA:DSA, sem nenhuma atenção densa global. Os pesos são BF16 (617,8 GB) e FP8 (~310 GB), com um <code>Naive-N0.5-Flash-FP8-Draft</code>. É o exercício “nível 2”: o Passo 4 deixa de ser overlay e vira implementação completa.</p>
+  <ul>
+    <li><b>Passo 0:</b> <code>NaiveN05FlashForCausalLM</code>, <code>model_type: naive_n05_flash</code>, remote code em <code>modeling_naive_n05_flash.py</code>, e <b>nenhuma entrada no registry do vLLM</b>.</li>
+    <li><b>Passo 1:</b> não há mais camada global densa. O DSA ainda <i>guarda</i> KV e uma chave pequena do indexador para todo token (o armazenamento cresce com o contexto), mas cada query <i>lê</i> só o top-k (<a data-ch="atencao-esparsa">Atenção esparsa</a>). Refaça a fórmula por camada DSA a partir do config: KV heads × dims × bytes + a chave do indexador.</li>
+    <li><b>Passo 2:</b> nem o FP8 cabe em 2 Sparks. Quantize os experts (NVFP4 com <code>llm-compressor</code> ou ModelOpt, calibrado) e meça a KLD contra o FP8 oficial rodando em ≥ 3 nós, ou contra a referência HF truncada.</li>
+    <li><b>Passo 4:</b> escreva o modelo como <span class="la-term" data-term="plugin-out-of-tree">plugin out-of-tree</span>, que registra a arquitetura sem fork. Reaproveite <code>mimo_v2.py</code> (MoE, SWA com sinks, loader do QKV) e troque as globais por um bloco DSA. O DSA do vLLM existe para MLA (DeepSeek-V3.2 e V4); <b>DSA com GQA é trabalho novo</b>, e no sm_121 os backends de sparse-MLA também não servem direto. Valide com paridade truncada N = 6, para incluir ao menos uma camada DSA.</li>
+    <li><b>Passo 6:</b> confira se o <code>FP8-Draft</code> segue um formato que o vLLM já conhece (EAGLE3/DFlash) ou se também precisa de registro.</li>
+  </ul>
+  <p>A troca central é de mecanismo, não de formato, e vale ver de perto. Numa camada global do MiMo, cada query lê o K e o V de <b>todos</b> os tokens anteriores. Numa camada DSA, um <span class="la-term" data-term="lightning-indexer">indexador</span> barato dá uma nota a cada token passado, usando chaves pequenas guardadas à parte, e a atenção de verdade lê só os top-k.</p>
+  <figure class="la-fig wide" id="fig-naive" data-title="Naive-N0.5: trocar a camada global por DSA">
+    <div class="la-fig-stage" style="height:430px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Em cima, as 48 camadas: no MiMo, 9 globais entre 39 SWA; no Naive, camadas DSA entre SWA num layout ~5:1 (as posições desenhadas são <b>ilustrativas</b>: leia o padrão real no config durante a triagem). Clique numa camada para escolhê-la. Embaixo, uma query no fim de um contexto de L tokens, com os 4 KV heads (GQA) em linhas. Na camada global, a query lê tudo. Na DSA, o indexador varre as chaves pequenas (barras), escolhe os top-k e só essas colunas de KV são lidas. Aqui o top-k é compartilhado pelos 4 KV heads, uma das decisões de projeto em aberto no “DSA com GQA” (poderia ser um top-k por grupo). Tamanhos e notas são ilustrativos; no DeepSeek-V3.2 o indexador escolhe 2.048 tokens.</figcaption>
+  </figure>
+  <p>Repare no que não muda: o armazenamento. A DSA ainda guarda o KV de todo token, porque qualquer um deles pode ser escolhido amanhã, e ainda soma a chave do indexador. O que ela corta é a <b>leitura</b> por query, de L para k (mais a varredura das chaves pequenas). É por isso que a conta do Passo 1 precisa ser refeita, e não apagada.</p>
+  <pre data-lang="python"><code># naive_plugin/__init__.py — instalado com pip install -e . ; entry point "vllm.general_plugins"
+def register():
+    from vllm import ModelRegistry
+    ModelRegistry.register_model("NaiveN05FlashForCausalLM",
+                                 "naive_plugin.model:NaiveN05FlashForCausalLM")</code></pre>
+  <p>O registro é preguiçoso (módulo:classe como string) para não inicializar CUDA no import, e todo processo do vLLM (API, EngineCore, workers) carrega os plugins do grupo <code>vllm.general_plugins</code>. Instale o pacote nos <b>dois</b> nós, com a mesma versão.</p>
+
+  <h3>O mesmo modelo no Mac, com MLX e contrato OpenAI</h3>
+  <p>Se você quer o MiMo <b>local no Mac</b>, atrás do mesmo <code>/v1/chat/completions</code>, para que o cliente só troque a <code>base_url</code>:</p>
+  <ul>
+    <li><b>Memória:</b> as conversões MLX pesam 150–172 GB e carregam ~164–170 GB; é preciso um Mac com <b>≥ 192 GB</b> unificados (na prática, Mac Studio M3 Ultra de 256 GB ou M5 Ultra). Num M3 Ultra de 256 GB: decode de <b>59,4 tok/s</b>, prompt processing de 563 tok/s em 2K e pico de 164,3 GB <b>[medido: Vontra]</b>. É a mesma conta do teto do Passo 8, mas sem TP: um único dispositivo lê todos os bytes ativos do passo, ~12,8 GB (o dobro dos 6,4 GB por rank), e ~800 GB/s ÷ ~12,8 GB ≈ 60 tok/s <b>[estimativa]</b>, contra ~43 no par de Sparks. A banda é ~3× maior, mas os bytes por dispositivo dobram, e o ganho de teto fica em ~1,5×.</li>
+    <li><b>Motor:</b> o suporte está no PR #1219 do mlx-lm (branch <code>kernelpool/mlx-lm@add-mimo-v2</code>), sem merge em 2026-09-28.</li>
+    <li><b>Diferenças de contrato:</b> a conversão <code>mlx-community</code> é só texto e não executa MTP nem DFlash; o thinking vem ligado (passe <code>enable_thinking=False</code> via <code>chat_template_kwargs</code>, e dê <code>max_tokens</code> folgado: o default do <code>mlx_lm.server</code> é 512); os tool calls usam o formato Qwen3-Coder (parser <code>qwen3_coder</code>); o campo de raciocínio no stream se chama <code>reasoning</code>, não <code>reasoning_content</code>. Teste com a mesma suíte do Passo 7.</li>
+    <li><b>MOPD:</b> ainda não há conversão da <code>mlx-community</code> (só do RL); converter com <code>mlx_lm.convert</code> do mesmo branch é o caminho, <b>[a medir]</b>. Macs de 128 GB só com poda de experts (REAP50 MLX, ~95 GB), com perda de qualidade <b>[a medir]</b>; para eles, um modelo menor costuma ser a escolha mais honesta.</li>
+  </ul>
+  <pre data-lang="bash"><code>python3 -m venv ~/.venvs/mlx &amp;&amp; source ~/.venvs/mlx/bin/activate
+pip install "git+https://github.com/kernelpool/mlx-lm.git@add-mimo-v2"
+mlx_lm.server --model mlx-community/MiMo-V2.6-Flash-RL-mxfp4-q8 --host 127.0.0.1 --port 8080
+# contrato OpenAI: POST http://127.0.0.1:8080/v1/chat/completions  (mesmo payload do vLLM)</code></pre>
+
+  <h3>O checklist final</h3>
+  <p>Cada critério de saída do capítulo cabe numa linha. Use o checklist abaixo na sua próxima receita; troque o modo para ver como a lista muda no desafio Naive e no Mac. As marcações ficam salvas só neste navegador.</p>
+  <figure class="la-fig" id="fig-check" data-title="Checklist da receita: MiMo, Naive ou Mac">
+    <div class="la-fig-stage" style="height:240px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>A trilha em cima é o metrô do começo do capítulo em miniatura: cada estação é um critério de saída, com as cores das três fases, e o trem avança a cada critério cumprido. Quando todos estão marcados, a receita está pronta para outra pessoa reproduzir. No modo Naive, os itens que mudam em relação ao MiMo aparecem com “≠”. No modo Mac, a lista encolhe: não há topologia, overlays nem especulação a escolher.</figcaption>
+  </figure>
+  <div class="la-callout why"><b class="t">Por que isso importa</b><p>Nenhum passo deste capítulo depende do MiMo em si. Troque o nome do modelo e as perguntas continuam as mesmas: o que o checkpoint realmente contém, quanto sobra para KV, qual arquivo e qual topologia, o que falta no motor e como provar que está certo, por que cada flag, qual k, como medir, como decidir e como entregar. É isso que as receitas do laboratório fizeram, uma por uma, e é isso que você acabou de aprender a fazer.</p></div>
+  <p>No próximo capítulo, o <a data-ch="laboratorio">Laboratório</a> transforma as contas deste tutorial numa ferramenta: você digita a arquitetura, o formato e a topologia, e ele devolve a memória por nó, a capacidade de KV, o teto de decode e um esqueleto de <code>.env</code> comentado, com alertas para tudo o que não divide ou não cabe.</p>
+</section>

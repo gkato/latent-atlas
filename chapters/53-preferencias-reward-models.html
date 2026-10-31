@@ -1,0 +1,408 @@
+<p class="la-lead">Depois do <a data-ch="sft">SFT</a>, o modelo sabe imitar demonstrações. Só que, para muita coisa, é mais fácil <i>reconhecer</i> uma resposta melhor do que <i>escrevê-la</i>. Quase ninguém redige o resumo perfeito de um artigo, mas qualquer pessoa atenta aponta qual de dois resumos ficou mais fiel. O pós-treino por preferências aproveita essa assimetria em duas etapas. Primeiro, pessoas (ou outros modelos) comparam respostas. Depois, um <span class="la-term" data-term="modelo-de-recompensa">modelo de recompensa</span> (<i>reward model</i>, RM) aprende a transformar essas comparações num número \(r(x,y)\) que um otimizador consegue subir. Este capítulo constrói esse número do zero: por que comparar em vez de dar nota, como coletar e medir a concordância dos anotadores, de onde vem o modelo de Bradley–Terry, qual é a perda do RM e como o gradiente dela se comporta, como é a arquitetura por dentro, como calibrar, e o que acontece quando a recompensa começa a mentir (viés de comprimento, <i>reward hacking</i> e superotimização). No fim entram as recompensas de processo, os juízes de IA e o RLAIF. É a matéria-prima de tudo o que vem depois: PPO, GRPO e DPO.</p>
+
+<section class="la-sec">
+  <h2>Por que comparar em vez de dar nota</h2>
+  <p>Treinar com preferências exige uma função \(r(x,y)\): recebe um prompt \(x\) e uma resposta \(y\) e devolve um escalar que diz quão boa a resposta é. Ninguém escreve essa função à mão. Ela é aprendida a partir de julgamentos humanos, e a primeira decisão de projeto é <b>que tipo de julgamento pedir</b>. A resposta da literatura, desde o primeiro RLHF, é a mesma: peça <b>comparações</b>.</p>
+  <ul>
+    <li><b>Christiano et al. 2017</b>, o trabalho que inaugurou o RL a partir de preferências humanas, mostrava ao anotador dois clipes de 1–2 s de um agente e perguntava qual era melhor. A justificativa é explícita: os autores acharam muito mais fácil obter <i>comparações</i> consistentes do que <i>notas absolutas</i> consistentes. Em controle contínuo, prever comparações funcionou muito melhor do que prever notas. Cada consulta levava 3–5 s, e os humanos deram feedback em menos de 1% das interações do agente.</li>
+    <li><b>Ziegler et al. 2019</b>, o primeiro RLHF num modelo de linguagem (GPT-2), relata que os anotadores tinham dificuldade para dar distinções quantitativas finas e consistentes quando pedidos um número absoluto. <b>Stiennon et al. 2020</b> (sumarização) mantém a escolha pelas comparações.</li>
+    <li><b>O contraponto:</b> o <span class="la-term" data-term="helpsteer">HelpSteer</span> (Wang et al. 2023) avaliou cada resposta de forma <i>independente</i>, em <span class="la-term" data-term="escala-likert">Likert</span> 0–4, porque o número de comparações cresce de forma quadrática com o número de respostas por prompt. Notas absolutas escalam melhor.</li>
+  </ul>
+  <p>A intuição (interpretação nossa, apoiada nesses relatos): cada anotador carrega uma <b>régua pessoal</b>. Um é generoso e dá 6 para quase tudo, outro é rigoroso e raramente passa de 4, e um terceiro usa só o meio da escala. A nota absoluta mistura a qualidade da resposta com a régua de quem avaliou. A comparação cancela a régua: se o generoso dá 6 e 5 e o rigoroso dá 4 e 3, os dois concordam que A é melhor. A figura simula exatamente isso.</p>
+  <figure class="la-fig" id="fig-regua" data-title="Régua pessoal contra comparação">
+    <div class="la-fig-stage" style="height:430px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Cinco anotadores avaliam pares de respostas \(A\) (menta) e \(B\) (rosa). Cada um tem uma régua pessoal, com deslocamento e escala próprios, e um pouco de ruído. No modo “nota”, eles marcam uma nota Likert 1–7 na própria régua; no modo “comparação”, a balança de cada um pende para a resposta preferida. As barras de baixo acumulam a concordância entre os 10 pares de anotadores: “mesma nota” e “mesma direção”. Simulação <b>ilustrativa</b>: aumente a diferença entre as réguas e veja qual das duas concordâncias desaba.</figcaption>
+  </figure>
+  <p>Repare nos números, lembrando que as duas barras não partem da mesma base. Com as réguas iguais, a concordância de nota já é menor (~65%: acertar o mesmo número entre 7 é mais difícil do que acertar a direção) e a de direção fica perto de 85%. Ao afastar as réguas, a de nota despenca (~16% em 1,0) e a de direção quase não se mexe (~82%). A comparação não é “mais precisa”. Ela joga fora o nível absoluto, que é justamente a parte que os anotadores não compartilham, e guarda a diferença, que é a parte que compartilham. O preço é perder a <b>magnitude</b>: um par em que A é “um pouco melhor” vira o mesmo bit de um par em que A é “muito melhor”. Por isso os datasets modernos combinam os dois. O HelpSteer2 tem notas Likert por atributo e o HelpSteer2-Preference acrescenta preferências com intensidade; o UltraFeedback dá notas 1–5 que depois são convertidas em pares.</p>
+  <h3>Formatos de anotação</h3>
+  <p>Cada formato carrega uma quantidade diferente de informação e pede um modelo estatístico diferente. A tabela resume os que aparecem na prática; os modelos da última coluna são o assunto das próximas seções.</p>
+  <table>
+    <thead><tr><th>Formato</th><th>Exemplo real</th><th>Informação por anotação</th><th>Modelo / perda natural</th></tr></thead>
+    <tbody>
+      <tr><td>Par binário \((x, y_w, y_l)\)</td><td>Stiennon 2020 (TL;DR); HH-RLHF</td><td>1 bit de direção</td><td>Bradley–Terry, \(-\log\sigma(\Delta)\)</td></tr>
+      <tr><td>Par com empate ou “incomparável”</td><td>Christiano 2017: empate vira rótulo ½–½; incomparável é descartado</td><td>direção ou “igual”</td><td>BT com <span class="la-term" data-term="rotulo-suave">rótulo suave</span></td></tr>
+      <tr><td>Par com intensidade</td><td>Llama 2: 4 níveis (de <i>significantly better</i> a <i>negligibly better/unsure</i>); HelpSteer2-Preference e HelpSteer3: −3…+3</td><td>direção + magnitude</td><td>BT com margem ou BT escalado</td></tr>
+      <tr><td>Ranking de \(K\) respostas</td><td>InstructGPT: \(K=4\) a \(9\) por prompt</td><td>ordem total</td><td>\(\binom{K}{2}\) pares, ou Plackett–Luce</td></tr>
+      <tr><td>Melhor de \(K\)</td><td>Ziegler 2019: escolher a melhor de 4</td><td>índice do vencedor</td><td>softmax top-1</td></tr>
+      <tr><td>Likert multi-atributo</td><td>HelpSteer: <i>helpfulness, correctness, coherence, complexity, verbosity</i> em 0–4</td><td>uma nota por atributo</td><td>regressão (MSE)</td></tr>
+      <tr><td>Notas por aspecto dadas por IA</td><td>UltraFeedback: GPT-4 dá 1–5 em 4 aspectos, com justificativa e crítica</td><td>4 notas + texto</td><td>binarizar em pares → BT</td></tr>
+      <tr><td>Bom/ruim, sem par</td><td>(capítulo de KTO)</td><td>1 bit absoluto</td><td>KTO e afins</td></tr>
+      <tr><td>Rótulo por passo</td><td>PRM800K: cada passo de uma solução de matemática</td><td>1 rótulo por passo</td><td>PRM (seção 8)</td></tr>
+    </tbody>
+  </table>
+  <div class="la-callout analogy"><b class="t">Analogia: a degustação às cegas</b><p>Peça a dez pessoas uma nota de 0 a 10 para um vinho e você terá dez números espalhados, porque cada uma tem o seu “7”. Sirva dois vinhos lado a lado e pergunte qual é melhor: cada pessoa compara dentro da própria régua, e as respostas tendem a convergir muito mais. É a mesma aposta do RLHF.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Coletar preferências: prompts, políticas e anotadores</h2>
+  <p>Um par de preferência tem três ingredientes: um prompt, duas (ou mais) respostas e um julgamento. Cada um esconde decisões que mudam o RM final.</p>
+  <ul>
+    <li><b>Prompts.</b> O InstructGPT usou prompts reais da API (filtrados de dados pessoais, deduplicados, no máximo 200 por usuário, com as divisões de treino e validação feitas por usuário) e prompts escritos pelos próprios rotuladores para dar a partida. Na API, 45,6% eram de geração, 12,4% de perguntas abertas e 11,2% de brainstorming. O HH-RLHF da Anthropic usou diálogos abertos com o modelo; no conjunto de <i>harmlessness</i>, o anotador escolhia a resposta <b>mais nociva</b> (red teaming), escolha que os próprios autores consideram provavelmente não ideal para ensinar bom comportamento.</li>
+    <li><b>Respostas.</b> Para cobrir bem o espaço, as respostas vêm de fontes variadas. O Llama 2 amostrou as duas de variantes diferentes do modelo, com temperaturas diferentes. O UltraFeedback sorteou 4 de um conjunto de 17 modelos e ainda injetou “princípios” diferentes no prompt. O HelpSteer2 gerou só 2 por prompt, para reduzir a carga cognitiva do anotador.</li>
+    <li><b>De qual política vêm as amostras.</b> No InstructGPT, a maior parte dos pares veio das políticas supervisionadas, com uma parte vinda das políticas PPO. A Anthropic coletou em três levas, a última delas <span class="la-term" data-term="coleta-on-policy">online</span>: RMs e políticas RLHF eram atualizados numa cadência aproximadamente semanal. O Llama 2 diz que acumular dados novos de RM em paralelo com as melhorias do modelo é crucial para manter o RM <i>dentro da distribuição</i>. O motivo é simples: depois do RL, a política produz textos que o RM nunca viu, e o RM só é confiável onde foi treinado (seção 7).</li>
+    <li><b>Quais pares perguntar.</b> Christiano 2017 amostrava muitos pares e mandava aos humanos aqueles em que os membros de um ensemble de RMs mais discordavam. Em algumas tarefas isso piorou o resultado. Lightman 2023 buscou ativamente soluções “convincentes, porém erradas” e ganhou 2,6× de eficiência de dados no seu RM de processo.</li>
+  </ul>
+  <h3>Diretrizes e gestão de anotadores</h3>
+  <p>Os números de concordância dependem tanto das pessoas quanto do texto da diretriz. O InstructGPT contratou ~40 rotuladores, selecionados por um teste de triagem com corte “suave” de 75% de concordância com os pesquisadores. Os critérios eram <i>helpful, truthful, harmless</i>, mas com uma assimetria importante: no treino, priorizava-se a utilidade; na avaliação final, veracidade e inocuidade. O Llama 2 escreveu diretrizes <b>separadas</b> para utilidade e segurança, porque os dois critérios se contradizem. No HH-RLHF, uns ~20 trabalhadores produziram ~80% dos dados. No HelpSteer2, cada resposta teve pelo menos 3 anotadores (média de 3,41; mais dois eram chamados quando as notas de utilidade divergiam por mais de 2), e cerca de 50% das anotações foram descartadas no controle de qualidade.</p>
+  <h3>Concordância entre anotadores: o teto do RM</h3>
+  <p>Se dois humanos discordam em 1 de cada 4 pares, nenhum RM treinado nesses rótulos vai acertar 100% de um conjunto de validação humano. A <span class="la-term" data-term="concordancia-entre-anotadores">concordância entre anotadores</span> é, na prática, o teto da acurácia do RM:</p>
+  <table>
+    <thead><tr><th>Fonte</th><th>Medida</th><th>Valor</th></tr></thead>
+    <tbody>
+      <tr><td>InstructGPT</td><td>entre rotuladores de treino / entre rotuladores held-out</td><td>72,6 ± 1,5% / 77,3 ± 1,3%</td></tr>
+      <tr><td>Stiennon 2020</td><td>rotulador–pesquisador / pesquisador–pesquisador</td><td>77 ± 2% / 73 ± 4%</td></tr>
+      <tr><td>Stiennon 2020</td><td>entre rotuladores no CNN/DM (o RM de 6,7B chega a 66,5%)</td><td>66,9%</td></tr>
+      <tr><td>HH-RLHF</td><td>pesquisadores da Anthropic vs crowdworkers</td><td>≈63%</td></tr>
+      <tr><td>HelpSteer2</td><td>κ de Cohen ponderado quadrático (utilidade)</td><td>0,465 → 0,791 após o pós-processamento</td></tr>
+      <tr><td>MT-bench (Zheng 2023)</td><td>humano–humano vs GPT-4–humano, sem empates</td><td>81% vs 85%</td></tr>
+      <tr><td>RewardBench</td><td>teto de acurácia na validação de HH e Summarize</td><td>“entre 60 e 70%”</td></tr>
+    </tbody>
+  </table>
+  <p>Concordância percentual engana, porque parte dela acontece por acaso. Se os dois anotadores escolhem “A melhor” 90% das vezes, eles vão concordar em ~82% dos itens mesmo sorteando. O <span class="la-term" data-term="kappa-de-cohen">κ de Cohen</span> desconta esse acaso:</p>
+  <div class="la-eq">
+    \[ \kappa = \frac{p_o - p_e}{1 - p_e}, \qquad p_e = \sum_k p^{(A)}_k\, p^{(B)}_k \]
+    <ul class="la-eq-legend">
+      <li>\(p_o\): concordância observada (fração de itens com o mesmo rótulo)</li>
+      <li>\(p_e\): concordância esperada por acaso, dadas as marginais de cada anotador</li>
+      <li>\(p^{(A)}_k\): fração dos itens que o anotador A rotulou como classe \(k\)</li>
+      <li>\(\kappa = 1\): concordância perfeita; \(\kappa = 0\): nada além do acaso</li>
+    </ul>
+  </div>
+  <p>Para escalas ordinais (Likert, −3…+3), discordar entre 0 e 4 é muito pior do que discordar entre 0 e 1. O <span class="la-term" data-term="kappa-ponderado">κ ponderado quadrático</span> leva isso em conta:</p>
+  <div class="la-eq">
+    \[ \kappa_w = 1 - \frac{\sum_{i,j} w_{ij}\, O_{ij}}{\sum_{i,j} w_{ij}\, E_{ij}}, \qquad w_{ij} = \frac{(i-j)^2}{(k-1)^2} \]
+    <ul class="la-eq-legend">
+      <li>\(O_{ij}\): proporção de itens com rótulo \(i\) pelo anotador A e \(j\) pelo B</li>
+      <li>\(E_{ij}\): o que se esperaria por acaso (produto das marginais)</li>
+      <li>\(w_{ij}\): peso da discordância; 0 na diagonal, 1 no canto oposto</li>
+      <li>\(k\): número de níveis da escala</li>
+    </ul>
+  </div>
+  <p>Foi por esse motivo que o HelpSteer2 escolheu o κ quadrático. Com ~1000 anotadores, raramente os mesmos dois compartilham amostras, o que inviabiliza o κ de Fleiss e o α de Krippendorff. Brinque com as contas na figura: o exemplo binário tem 75% de concordância bruta, mas κ de só 0,50.</p>
+  <figure class="la-fig" id="fig-kappa" data-title="Kappa de Cohen: quanto da concordância é acaso">
+    <div class="la-fig-stage" style="height:420px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>À esquerda (em cima no celular), a matriz de contagem observada (linhas: anotador A; colunas: anotador B), com os 100 itens caindo nas células. À direita (embaixo no celular), o que o acaso produziria com as mesmas marginais (\(E_{ij}\)). Embaixo, \(p_o\), \(p_e\) e κ. No modo “explorar”, desequilibre as marginais e veja κ cair mesmo com \(p_o\) alto. No modo ordinal, ligue a ponderação quadrática: as discordâncias “vizinhas” pesam pouco (κ = 0,6949 → 0,8064). Contagens <b>ilustrativas</b>.</figcaption>
+  </figure>
+  <p>O ruído humano também pode entrar no modelo. Christiano 2017 supôs que, em 10% das vezes, o humano responde ao acaso. A probabilidade prevista vira \(\hat P = 0{,}9\,\sigma(\Delta) + 0{,}05\), que fica entre 5% e 95%: um rótulo errado custa no máximo \(-\ln 0{,}05 \approx 3{,}0\), e o gradiente dele some quando o RM está confiante no contrário (o modelo atribui o erro ao acaso).</p>
+  <div class="la-callout why"><b class="t">Por que isso importa</b><p>Um RM com 65–70% de acurácia em HH ou TL;DR <b>não é</b> necessariamente ruim: os próprios humanos concordam ~63–77% entre si. O RM de 6,7B de Stiennon chega a 66,5% no CNN/DM, quase igual aos 66,9% entre rotuladores. O teste de qualidade de um RM não é “acertou 95%?”, e sim “chegou perto da concordância humana e generaliza para onde a política vai?”.</p></div>
+  <h3>Datasets de preferência</h3>
+  <p>Os números abaixo vêm dos papers e dos cards dos datasets. A mesma coleção às vezes aparece com contagens diferentes em fontes diferentes, por causa de filtragens e divisões; por isso cada número traz a fonte.</p>
+  <table>
+    <thead><tr><th>Dataset</th><th>Quem anotou</th><th>Tamanho</th><th>Formato</th></tr></thead>
+    <tbody>
+      <tr><td><span class="la-term" data-term="hh-rlhf">Anthropic HH-RLHF</span></td><td>crowdworkers (utilidade e red teaming)</td><td>169.352 linhas (≈161k treino, 8,55k teste) segundo o card</td><td><code>chosen</code>/<code>rejected</code>, diálogos completos; licença MIT</td></tr>
+      <tr><td>OpenAI <code>summarize_from_feedback</code></td><td>rotuladores contratados</td><td>Stiennon: 64.832 comparações no TL;DR; a reprodução “N+ details” treina em 92.858 pares</td><td>par + confiança 1–9</td></tr>
+      <tr><td><span class="la-term" data-term="ultrafeedback">UltraFeedback</span></td><td><b>IA</b> (GPT-4): notas 1–5 em 4 aspectos + crítica</td><td>63.967 instruções × 4 respostas; 340.025 pares; versão binarizada com 61.135 pares de treino e 2.000 de teste</td><td>notas → pares (<i>chosen</i> = maior nota, <i>rejected</i> = uma das outras 3 ao acaso)</td></tr>
+      <tr><td>HelpSteer / HelpSteer2</td><td>~200 anotadores / ≥3 por resposta</td><td>37.120 amostras / 21.362 (10.681 prompts × 2)</td><td>Likert 0–4 em 5 atributos; CC-BY-4.0</td></tr>
+      <tr><td>HelpSteer3</td><td>3–5 anotadores, liberam os 3 mais concordantes</td><td>40.476 preferências (General, STEM, Code, Multilingual)</td><td>−3…+3; CC-BY-4.0</td></tr>
+      <tr><td>Stanford SHP</td><td>votos do Reddit</td><td>≈386k linhas, 18 subreddits</td><td>par</td></tr>
+      <tr><td>PRM800K</td><td>humanos, passo a passo</td><td>800K rótulos de passo em 75K soluções de 12K problemas do MATH</td><td>positivo/negativo/neutro por passo</td></tr>
+      <tr><td>Chatbot Arena / MT-bench</td><td>usuários e especialistas</td><td>3K votos de especialistas + 30K conversas</td><td>A/B/empate</td></tr>
+      <tr><td>Skywork SynPref-40M</td><td>pipeline humano + IA</td><td>40M pares (26M curados), base dos Skywork-Reward-V2 de 0,6B a 8B</td><td>par</td></tr>
+    </tbody>
+  </table>
+  <p>Todos carregam vieses. O mais famoso é o de <b>comprimento</b>: os dados contêm a correlação “mais longo = melhor”, e o RM aprende isso (seção 7). Quando o rotulador é uma IA, entram ainda o <b>viés de posição</b> (preferir a primeira ou a segunda resposta) e o <b>autofavorecimento</b>. E há o viés de <i>quem</i> rotula: o “rotulador médio” contratado não é o usuário real, e o paper do InstructGPT discute explicitamente a quem o modelo está sendo alinhado.</p>
+</section>
+
+<section class="la-sec">
+  <h2>Bradley–Terry: de comparações a uma escala</h2>
+  <p>Temos pares “\(y_w\) venceu \(y_l\)”. Queremos um número \(r(x,y)\) por resposta. A ponte é um modelo probabilístico que diga quanto deveria valer \(P(y_w \succ y_l)\) dado \(r\). A construção clássica supõe que cada resposta tem uma <b>utilidade latente</b> com ruído, e o humano escolhe a de maior utilidade naquele momento:</p>
+  <div class="la-eq">
+    \[ u(x,y) = r(x,y) + \epsilon_y, \qquad y_1 \succ y_2 \iff u_1 > u_2 \iff \epsilon_2 - \epsilon_1 < r_1 - r_2 \]
+    <ul class="la-eq-legend">
+      <li>\(r(x,y)\): a “qualidade verdadeira” que o RM quer aprender</li>
+      <li>\(\epsilon_y\): ruído i.i.d. do julgamento (humor, atenção, interpretação)</li>
+      <li>\(y_1 \succ y_2\): “\(y_1\) é preferida a \(y_2\)”</li>
+    </ul>
+  </div>
+  <p>Tudo depende da distribuição do ruído. Se \(\epsilon\) segue uma <span class="la-term" data-term="distribuicao-gumbel">Gumbel</span>(0,1), a diferença de dois Gumbels independentes é uma <b>logística</b>, cuja função de distribuição acumulada é a <span class="la-term" data-term="sigmoide">sigmoide</span> (a conta, de três linhas, está na caixa logo abaixo). Resultado:</p>
+  <div class="la-eq">
+    \[ P(y_1 \succ y_2 \mid x) = \sigma\big(r(x,y_1) - r(x,y_2)\big) = \frac{e^{r_1}}{e^{r_1} + e^{r_2}} \]
+    <ul class="la-eq-legend">
+      <li>\(\sigma(z) = 1/(1+e^{-z})\): sigmoide logística</li>
+      <li>\(e^{r_i}\): a “força” \(p_i\) da resposta \(i\), como em Bradley & Terry (1952): \(P(i\succ j) = p_i/(p_i+p_j)\)</li>
+      <li>\(\Delta = r_1 - r_2\): o <b>log-odds</b> da preferência</li>
+    </ul>
+  </div>
+  <div class="la-callout math"><b class="t">Por que dois Gumbels dão uma sigmoide</b><p>Na Gumbel(0,1), a acumulada é \(F(\epsilon)=e^{-e^{-\epsilon}}\) e a densidade é \(f(\epsilon)=e^{-\epsilon}F(\epsilon)\). Com \(\Delta = r_1 - r_2\), a resposta \(y_1\) vence quando \(\epsilon_2 &lt; \epsilon_1 + \Delta\). Fixe \(\epsilon_1 = \epsilon\), use \(F\) para a chance de \(\epsilon_2\) ficar abaixo e integre em \(\epsilon\):
+  \[ P(y_1\succ y_2)=\int_{-\infty}^{\infty} f(\epsilon)\,F(\epsilon+\Delta)\,d\epsilon \]
+  \[ =\int_{-\infty}^{\infty} e^{-\epsilon}\,e^{-e^{-\epsilon}(1+e^{-\Delta})}\,d\epsilon \]
+  O segundo passo junta os dois expoentes, porque \(F(\epsilon+\Delta)=e^{-e^{-\epsilon}e^{-\Delta}}\). Troque \(u=e^{-\epsilon}\), com \(du=-e^{-\epsilon}d\epsilon\) (quando \(\epsilon\) vai de \(-\infty\) a \(\infty\), \(u\) vai de \(\infty\) a 0):
+  \[ =\int_0^\infty e^{-u(1+e^{-\Delta})}\,du=\frac{1}{1+e^{-\Delta}}=\sigma(\Delta) \]
+  É a sigmoide, exatamente (cálculo).</p></div>
+  <p>Esse é o <span class="la-term" data-term="bradley-terry">modelo de Bradley–Terry</span> (BT). Se o ruído for normal, sai o <span class="la-term" data-term="modelo-thurstone">modelo de Thurstone</span> (1927), com \(P = \Phi\Big(\dfrac{r_1-r_2}{\sqrt2\,s}\Big)\), em que \(\Phi\) é a acumulada da normal e \(s\) o desvio do ruído. As duas curvas são quase idênticas quando os ruídos têm a mesma variância. A logística vence na prática porque o gradiente é simples e ela casa com a <span class="la-term" data-term="softmax">softmax</span> que os LLMs já usam. Christiano 2017 nota que é a mesma regra de escolha de Luce–Shepard e que é “análoga ao Elo do xadrez”.</p>
+  <figure class="la-fig" id="fig-gumbel" data-title="Duelos com ruído de Gumbel viram uma sigmoide">
+    <div class="la-fig-stage" style="height:420px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Em cada duelo, as respostas \(A\) e \(B\) recebem um ruído sorteado, e vence a de maior utilidade \(r+\epsilon\). À direita (embaixo no celular), o histograma de \(\epsilon_B - \epsilon_A\): \(A\) vence sempre que ele cai à esquerda de \(\Delta = r_A - r_B\) (área sombreada). A fração de vitórias converge para \(\sigma(\Delta)\) com Gumbel, ou para \(\Phi\big(\Delta/(\sqrt2\,s)\big)\) com ruído normal de mesma variância. O readout “Elo” converte \(\Delta\) para a escala do xadrez.</figcaption>
+  </figure>
+  <p>O <span class="la-term" data-term="elo">Elo</span> é o mesmo BT escrito em outra base: \(P(A\succ B) = 1/\big(1+10^{-(R_A-R_B)/400}\big)\). Igualando a \(\sigma(\Delta r)\):</p>
+  <div class="la-eq">
+    \[ \Delta r = \frac{\ln 10}{400}\,\Delta R_{\text{Elo}} \approx 0{,}005756\,\Delta R_{\text{Elo}} \]
+    <ul class="la-eq-legend">
+      <li>\(\Delta R_{\text{Elo}}\): diferença de rating Elo; \(\Delta r\): diferença de recompensa BT</li>
+      <li>+100 Elo ⇔ \(\Delta r = 0{,}5756\) ⇔ 64,01% de vitória; +400 Elo ⇔ \(\Delta r = 2{,}3026\) ⇔ 90,91%</li>
+    </ul>
+  </div>
+  <p>Por isso o Chatbot Arena e a Anthropic reportam modelos em Elo. O leaderboard do LMArena, aliás, não usa o Elo online (que depende da ordem das batalhas): ajusta um Bradley–Terry por máxima verossimilhança sobre todas as batalhas e só depois reporta o resultado em escala tipo Elo.</p>
+  <h3>Rankings de K respostas: Plackett–Luce e os pares do InstructGPT</h3>
+  <p>O InstructGPT não pedia pares: pedia ao rotulador que <b>ordenasse</b> de \(K=4\) a \(9\) respostas. O modelo natural para um ranking \(\tau\) é o de <span class="la-term" data-term="plackett-luce">Plackett–Luce</span> (PL): escolhe-se o 1º colocado por uma softmax entre todos, o 2º por uma softmax entre os que sobraram, e assim por diante. A softmax também sai das utilidades com ruído: o mesmo cálculo da caixa acima, com \(K\) Gumbels, mostra que a chance de \(y_i\) ter a maior utilidade é \(e^{r_i}/\sum_j e^{r_j}\), uma softmax; ordenar todas por utilidade dá exatamente o Plackett–Luce.</p>
+  <div class="la-eq">
+    \[ P(\tau \mid x) = \prod_{i=1}^{K} \frac{\exp\big(r(x, y_{\tau(i)})\big)}{\sum_{j=i}^{K} \exp\big(r(x, y_{\tau(j)})\big)} \]
+    <ul class="la-eq-legend">
+      <li>\(\tau(i)\): índice da resposta colocada na posição \(i\)</li>
+      <li>o denominador soma só sobre as respostas ainda não escolhidas</li>
+      <li>com \(K=2\), PL vira Bradley–Terry; só o 1º fator é o modelo “melhor de \(K\)” de Ziegler 2019</li>
+    </ul>
+  </div>
+  <p>O InstructGPT, porém, <b>não</b> usou PL. Decompôs cada ranking em todos os \(\binom{K}{2}\) pares e aplicou BT em cada um:</p>
+  <div class="la-eq">
+    \[ \mathcal L(\theta) = -\frac{1}{\binom{K}{2}}\,\mathbb E_{(x,y_w,y_l)\sim D}\Big[\log\sigma\big(r_\theta(x,y_w) - r_\theta(x,y_l)\big)\Big] \]
+    <ul class="la-eq-legend">
+      <li>\(\binom{K}{2}\): número de pares de um ranking de \(K\); de 6 (\(K=4\)) a 36 (\(K=9\))</li>
+      <li>\(r_\theta\): o RM; \(y_w\) é a resposta mais bem colocada do par</li>
+    </ul>
+  </div>
+  <p>O detalhe de engenharia decisivo é que <b>todos os pares de um prompt entram no mesmo elemento do batch</b>. Os pares de um mesmo prompt são muito correlacionados. Embaralhados num dataset comum, cada resposta participaria de \(K-1\) atualizações separadas, e o RM sobreajustava numa única passada. Agrupados, bastam \(K\) forwards do RM por prompt (cada resposta passa uma vez) em vez de \(2\binom{K}{2}\), e a acurácia e a log-loss de validação ficaram “muito melhores”. Um batch de 64 prompts carrega até \(64\times36 = 2.304\) comparações. Empates eram descartados.</p>
+  <figure class="la-fig" id="fig-ranking" data-title="Um ranking de K respostas: pares contra Plackett–Luce">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Matriz \(K\times K\): a célula \((i,j)\) acima da diagonal mostra \(\sigma(r_i - r_j)\) para o par “\(i\) vence \(j\)”. No modo “pares”, a perda de cada par acende em sequência e a média é a perda do InstructGPT. No modo Plackett–Luce, a urna tira as respostas uma a uma por softmax entre as que restam. Escores <b>ilustrativos</b>; com \(K=4\) (\(r = 2{,}0;\ 1{,}0;\ 0{,}5;\ -0{,}5\)), a média dos 6 pares é 0,2637 e o PL dá \(P = 0{,}2388\) (NLL 1,4321).</figcaption>
+  </figure>
+  <p>Os dois números são diferentes porque medem coisas diferentes. A média dos pares é uma <i>verossimilhança composta</i> (interpretação): trata os pares como se fossem independentes, o que eles não são, mas é consistente sob BT e muito mais simples. O PL é a verossimilhança conjunta da ordem inteira. Ambos são minimizados empurrando os escores na ordem certa, e ambos usam só \(K\) forwards.</p>
+</section>
+
+<section class="la-sec">
+  <h2>A perda do RM e o seu gradiente</h2>
+  <p>Com BT nas mãos, treinar o RM é <b>máxima verossimilhança</b>: escolha os parâmetros \(\phi\) que tornam os julgamentos observados os mais prováveis. A log-verossimilhança negativa de um dataset de pares é a perda canônica de todo RM moderno:</p>
+  <div class="la-eq">
+    \[ \mathcal L_{\text{RM}}(\phi) = -\,\mathbb E_{(x, y_w, y_l)\sim\mathcal D}\Big[\log \sigma\big(r_\phi(x,y_w) - r_\phi(x,y_l)\big)\Big] \]
+    <ul class="la-eq-legend">
+      <li>\(r_\phi\): o RM com parâmetros \(\phi\)</li>
+      <li>\(y_w\), \(y_l\): resposta preferida (<i>chosen</i>) e rejeitada (<i>rejected</i>)</li>
+      <li>\(\mathcal D\): o dataset de pares; \(\sigma\): sigmoide</li>
+    </ul>
+  </div>
+  <p>Olhe de novo: é a <span class="la-term" data-term="entropia-cruzada">entropia cruzada</span> binária do <a data-ch="aprender-com-dados">capítulo 1</a>, com rótulo 1 (“\(y_w\) vence”) aplicado ao <span class="la-term" data-term="logits">logit</span> \(\Delta = r_w - r_l\). O RM é um classificador binário cujo logit é uma <i>diferença</i> de duas saídas da mesma rede. O gradiente explica quase todo o comportamento do treino:</p>
+  <div class="la-eq">
+    \[ \frac{\partial \mathcal L}{\partial \Delta} = -\big(1 - \sigma(\Delta)\big) = -\sigma(-\Delta), \qquad \nabla_\phi\mathcal L = -\sigma(-\Delta)\,\big(\nabla_\phi r_w - \nabla_\phi r_l\big) \]
+    <ul class="la-eq-legend">
+      <li>\(\sigma(-\Delta)\): a probabilidade que o próprio RM dá de <b>estar errado</b> nesse par</li>
+      <li>\(\nabla_\phi r_w\): direção que aumenta a recompensa da preferida (o gradiente a <i>sobe</i>)</li>
+      <li>\(-\nabla_\phi r_l\): direção que diminui a da rejeitada (o gradiente a <i>desce</i>)</li>
+    </ul>
+  </div>
+  <p>Cada par puxa \(r_w\) para cima e \(r_l\) para baixo com força \(\sigma(-\Delta)\). Um par já bem separado (\(\Delta = 3\), \(P = 0{,}9526\)) contribui com peso 0,0474. Um par invertido (\(\Delta = -0{,}8\)) contribui com 0,69. Um par empatado, com 0,5 e perda \(\ln 2 = 0{,}6931\). O treino concentra o esforço onde o RM ainda erra, e isso tem um lado ruim: um rótulo <b>errado</b> continua puxando com peso perto de 1 para sempre. É isso que o modelo de ruído de Christiano conserta: na variante “10% de ruído” da figura, o peso de um par muito invertido tende a 0. Ponha as mãos na figura.</p>
+  <figure class="la-fig" id="fig-perda" data-title="A perda do RM e o gradiente que ela empurra">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>À esquerda (em cima no celular), as recompensas da preferida \(r_w\) (menta) e da rejeitada \(r_l\) (rosa), com as setas do gradiente e as partículas que ele empurra (comprimento \(\propto \sigma(-\Delta)\)). À direita (embaixo no celular), a sigmoide \(P = \sigma(\Delta)\) (lavanda) e a perda (âmbar) em função de \(\Delta\). “Treinar” aplica passos de gradiente: a separação cresce depressa no começo e desacelera. “Deslocar as duas” soma ±2 às duas recompensas e não muda nada na perda. As variantes trocam a perda pela margem do Llama 2, pelo BT escalado do HelpSteer2-Preference ou pelo modelo com 10% de ruído de Christiano.</figcaption>
+  </figure>
+  <h3>Invariâncias: por que todo RM é normalizado</h3>
+  <p>A perda só enxerga diferenças. Somar uma constante a todas as recompensas não muda nada: o RM é <b>invariante a translação</b>, e o zero da escala é arbitrário. Por isso todo pipeline <span class="la-term" data-term="normalizacao-do-rm">normaliza</span> o RM antes do RL. Stiennon ajusta as saídas para que os resumos de referência tenham média 0. O InstructGPT põe um bias para que as demonstrações dos rotuladores tenham média 0. Ziegler normaliza para média 0 e variância 1 sob as amostras do modelo inicial. A reprodução “N+ details” calcula a média nas referências do SFT e a grava como bias da cabeça.</p>
+  <p>A perda <b>não</b> é invariante a escala. Multiplicar todas as recompensas por 2 deixa o RM mais “confiante”: a escala funciona como a <span class="la-term" data-term="temperatura">temperatura</span> da preferência. No RL, ela conversa diretamente com o coeficiente da penalidade de KL. O Llama 2, por exemplo, usa \(\text{whiten}(\text{logit}(\cdot))\) na recompensa para equilibrá-la com o termo de KL (<i>logit</i> é o inverso da sigmoide: a saída do RM do Llama 2 está em [0,1] e volta para a escala de log-odds; <i>whiten</i> subtrai a média e divide pelo desvio-padrão no lote); isso volta no capítulo de <a data-ch="ppo-rlhf">PPO e RLHF</a>.</p>
+  <h3>Rótulos suaves, empates e variantes da perda</h3>
+  <p>Quando o rótulo é uma distribuição \(\mu\) e não um 1 seco (empate → \(\mu = (\tfrac12, \tfrac12)\); um rotulador de IA que diz 60/40), usa-se a entropia cruzada completa:</p>
+  <div class="la-eq">
+    \[ \mathcal L = -\mu(1)\log\hat P(y_1\succ y_2) - \mu(2)\log\hat P(y_2 \succ y_1), \qquad \Delta^* = \log\frac{\mu(1)}{\mu(2)} \]
+    <ul class="la-eq-legend">
+      <li>\(\hat P\): a probabilidade prevista pelo RM, \(\sigma(\Delta)\)</li>
+      <li>\(\Delta^*\): o ótimo da perda com rótulo suave; um empate pede \(\Delta^* = 0\), um 60/40 pede \(\Delta^* \approx 0{,}405\)</li>
+    </ul>
+  </div>
+  <p>As variantes usadas na prática mudam a forma de usar a intensidade da preferência:</p>
+  <table>
+    <thead><tr><th>Variante</th><th>Fórmula</th><th>Quem usa</th><th>Para quê</th></tr></thead>
+    <tbody>
+      <tr><td>BT padrão</td><td>\(-\log\sigma(r_w - r_l)\)</td><td>Stiennon, InstructGPT, quase todos</td><td>direção</td></tr>
+      <tr><td><span class="la-term" data-term="margem-de-preferencia">Margem</span></td><td>\(-\log\sigma\big(r_c - r_r - m(r)\big)\)</td><td>Llama 2</td><td>exigir separação maior em pares “muito melhores”</td></tr>
+      <tr><td>BT escalado</td><td>\(-m\,\log\sigma(r_c - r_r)\)</td><td>HelpSteer2-Preference</td><td>pesar mais os pares de alta magnitude, sem impor distância</td></tr>
+      <tr><td>Regressão multi-atributo</td><td>\(\sum_a (\hat s_a - s_a)^2\)</td><td>HelpSteer, HelpSteer2</td><td>notas Likert absolutas, uma cabeça por atributo</td></tr>
+      <tr><td>BT + perda de LM</td><td>\(\mathcal L_{\text{BT}} + \beta_{\text{rm}}\mathcal L_{\text{LM}}\)</td><td>“Secrets of RLHF” (\(\beta_{\text{rm}}=1\))</td><td>regularizar o backbone</td></tr>
+    </tbody>
+  </table>
+  <p>As margens do Llama 2 por nível de preferência eram, na versão “pequena”, 1, 2/3, 1/3 e 0 (de <i>significantly better</i> a <i>negligibly better/unsure</i>), e na “grande”, 3, 2, 1 e 0. O ganho médio foi pequeno (acurácia de 62,5% sem margem, 63,0% com a pequena e 62,9% com a grande) e apareceu sobretudo nos pares “significantly better” (79,1 → 80,4 → 80,7). Os autores notam que a margem grande empurra os escores para uma distribuição bimodal. No HelpSteer2-Preference, o BT escalado foi a melhor variante no RewardBench: 92,7 contra 91,5 do BT comum e da margem, treinando do zero; 93,7 partindo do modelo de regressão; e 94,1 somando a extrapolação de pesos ExPO. Ou seja, regressão e BT carregam informação complementar.</p>
+</section>
+
+<section class="la-sec">
+  <h2>Arquitetura e treino: um LLM com uma cabeça escalar</h2>
+  <p>Um RM moderno é o mesmo <a data-ch="bloco-transformer">Transformer</a> do Módulo 1 com a última camada trocada. O InstructGPT parte do modelo SFT, remove a camada de <i>unembedding</i> (o <span class="la-term" data-term="lm-head">lm_head</span>, que projeta o estado oculto no vocabulário) e põe no lugar uma projeção para <b>um único número</b>. O Llama 2 inicializa os RMs a partir de checkpoints do próprio modelo de chat, para que o RM “saiba o que o modelo de chat sabe”. Stiennon acrescenta uma cabeça linear inicializada ao acaso. Em fórmula:</p>
+  <div class="la-eq">
+    \[ \begin{gathered} r_\phi(x,y) = w^\top h_L(x,y)_{\text{EOS}} + b \\[4pt] w_i \sim \mathcal N(0,\sigma^2),\quad \sigma = \frac{1}{\sqrt{d_{\text{model}}+1}}\ \ \text{(na inicialização)} \end{gathered} \]
+    <ul class="la-eq-legend">
+      <li>\(h_L(x,y)_{\text{EOS}} \in \mathbb R^{d_{\text{model}}}\): estado oculto da última camada na posição do <span class="la-term" data-term="token-eos">token EOS</span>, depois de ler prompt e resposta inteiros</li>
+      <li>\(w \in \mathbb R^{d_{\text{model}}}\), \(b\): a <span class="la-term" data-term="cabeca-escalar">cabeça escalar</span>; \(b\) é onde a normalização grava a média</li>
+      <li>a inicialização de \(w\) é a da reprodução “N+ details”, que corrige um typo do paper original; \(\sigma\) é o <b>desvio-padrão</b> de cada entrada \(w_i\)</li>
+      <li>por que esse \(\sigma\): com entradas de \(h\) de ordem 1 (depois da LayerNorm final), \(\mathrm{Var}(w^\top h)\approx d_{\text{model}}\,\sigma^2\approx 1\), e a recompensa inicial nasce com escala unitária (interpretação)</li>
+    </ul>
+  </div>
+  <p>Por que ler no EOS? Com atenção causal, a posição \(t\) só enxergou os tokens até \(t\). A única posição que leu a resposta inteira é a última, e é nela que se lê a nota. A reprodução N+ insiste: a recompensa é extraída <b>somente</b> no EOS (o índice do primeiro PAD menos 1); os “logits de recompensa” nas outras posições não valem nada e saem quase sempre negativos. Ler no lugar errado, num PAD de preenchimento por exemplo, é um bug silencioso: o treino roda, a perda cai, e o número não significa o que você pensa. Outro detalhe da mesma fonte: o RM treina com preenchimento à direita, mas no PPO as consultas são preenchidas à esquerda para a geração, e as máscaras precisam ser ajustadas.</p>
+  <figure class="la-fig" id="fig-rm" data-title="Dentro do RM: do texto ao escalar">
+    <div class="la-fig-stage" style="height:460px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Os tokens de prompt e resposta sobem pelo Transformer e viram a matriz de estados ocultos \(H\), desenhada transposta (uma coluna por token; \(d_{\text{model}} = 6\) aqui). A coluna do EOS é multiplicada, célula a célula, pelo vetor \(w\) da cabeça; a soma mais \(b\) dá \(r\). Alterne entre a resposta preferida e a rejeitada para ver \(r_w\), \(r_l\) e \(\sigma(\Delta)\). Desligue “ler no EOS” para ver o bug de ler num PAD, e troque para 5 cabeças para ver o RM multi-atributo do HelpSteer2 (aí os readouts \(r_w\), \(r_l\) e \(\sigma\) continuam sendo os da cabeça BT, para comparar). Valores <b>ilustrativos</b>.</figcaption>
+  </figure>
+  <p>O RM do HelpSteer2 projeta o estado do fim da resposta em <b>5 escalares</b>, um por atributo (utilidade, correção, coerência, complexidade, verbosidade), e treina por regressão. Um RM multi-atributo deixa você <i>escolher</i> a combinação na hora de otimizar, por exemplo descontando a verbosidade.</p>
+  <h3>Tamanho, dados e a receita de treino</h3>
+  <p>O InstructGPT usou <b>um único RM de 6B</b> para políticas de 1,3B, 6B e 175B. Um RM de 175B até alcançava menor perda de validação, mas (1) o treino era mais instável, o que o tornava pior como ponto de partida para a função valor do PPO, e (2) RM e crítico de 175B aumentariam muito o custo do PPO. Stiennon usou RM, política e crítico do mesmo tamanho. Quanto à escala, Stiennon treinou 7 RMs de 160M a 13B em 8k–64k comparações: <b>dobrar os dados rendeu ~+1,1%</b> de acurácia de validação, e <b>dobrar o modelo, ~+1,8%</b>. No setup de Gao 2022, com menos de ~2.000 comparações os RMs ficavam perto do acaso em todos os tamanhos. Askell et al. 2021 propuseram ainda um pré-treino de modelo de preferência (PMP) em preferências “baratas” (StackExchange, Reddit, Wikipedia) antes dos dados humanos, o que melhora a eficiência amostral em modelos grandes.</p>
+  <table class="la-params">
+    <thead><tr><th>Detalhe</th><th>Valor típico</th><th>Fonte</th><th>Por que importa</th></tr></thead>
+    <tbody>
+      <tr><td>Épocas</td><td><b>1</b></td><td>InstructGPT, Ziegler, Llama 2, Stiennon, N+</td><td>mais épocas sobreajustam rápido (InstructGPT: deterioração “óbvia” da perda de validação). Gao: 4 épocas contra 1 época com 4× mais dados não mudaram o escore ouro</td></tr>
+      <tr><td>LR e batch</td><td>InstructGPT 9×10⁻⁶, cosseno até 10%, 64 prompts; Llama 2 5×10⁻⁶ (70B) / 10⁻⁵, warmup 3%, 512 pares</td><td>papers</td><td>InstructGPT reporta insensibilidade a ±50% de LR; N+ usa 3×10⁻⁶ sem varredura</td></tr>
+      <tr><td>Sementes</td><td>3–10, escolha pelo dev set</td><td>Stiennon</td><td>a ordem dos dados e a inicialização da cabeça mudam o resultado</td></tr>
+      <tr><td>Dropout</td><td>desligado</td><td>N+, Ziegler</td><td>essencial no PPO; mantém o RM determinístico</td></tr>
+      <tr><td>Pares por prompt</td><td>todos no mesmo elemento do batch</td><td>InstructGPT</td><td>\(K\) forwards por prompt; evita sobreajuste por correlação</td></tr>
+      <tr><td>Memória</td><td>2 sequências por par (ou \(K\) por ranking)</td><td>cálculo</td><td>o forward/backward é pago por sequência: 2 por par, \(K\) por ranking agrupado; por sequência, o RM ainda economiza os logits de vocabulário \([T\times V]\) que o SFT materializa</td></tr>
+    </tbody>
+  </table>
+  <div class="la-callout deep"><b class="t">Ponte com o Módulo 1: pontuar é um prefill</b><p>Interpretação: para dar a nota, o RM faz <b>um</b> forward sobre prompt + resposta e lê uma posição. Não há amostragem nem decode, só um <a data-ch="prefill-decode-kv">prefill</a> do tamanho da sequência. No laço de RL, cada resposta gerada pela política custa ao RM um prefill, enquanto gerá-la custou centenas de passos de decode. Por isso, num pipeline de RLHF, quem domina o tempo é a geração (o assunto do capítulo de <a data-ch="ppo-rlhf">PPO</a>), e não a pontuação. Um juiz <i>generativo</i>, que escreve uma crítica antes da nota (seção 9), muda essa conta: ele também faz decode.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Avaliar um RM: acurácia, calibração e RewardBench</h2>
+  <p>A métrica principal de um RM é a <b>acurácia de pares</b> num conjunto separado: a fração de pares em que \(r(y_w) > r(y_l)\). Já vimos os tetos humanos. Mas há uma segunda pergunta, mais sutil: quando o RM diz “\(P = 0{,}9\)”, ele acerta 90% das vezes? Um RM BT é <span class="la-term" data-term="calibracao-do-rm">calibrado</span> se, entre os pares em que prevê \(\sigma(\Delta) = p\), a fração em que o humano concorda for \(p\). Isso importa porque, no RL, as <b>diferenças</b> de escore viram recompensa. Um RM sobreconfiante exagera diferenças pequenas; um subconfiante as achata.</p>
+  <p>Bai et al. 2022 (Anthropic) plotaram acurácia contra \(\Delta\) e acharam os modelos de preferência treinados só em utilidade “muito bem calibrados”, e os treinados na mistura utilidade + inocuidade, “ligeiramente subconfiantes”. A reprodução N+ refez o gráfico no TL;DR e encontrou RMs “ainda sub-calibrados”. A medida padrão de descalibração é o <span class="la-term" data-term="ece">ECE</span>:</p>
+  <div class="la-eq">
+    \[ \text{ECE} = \sum_b \frac{n_b}{N}\,\big|\text{acc}_b - \text{conf}_b\big|, \qquad \text{conf} = \max\big(\hat P,\ 1-\hat P\big) \]
+    <ul class="la-eq-legend">
+      <li>\(b\): faixas (bins) de confiança; \(n_b\): pares na faixa; \(N\): total</li>
+      <li>\(\text{acc}_b\): fração de acertos na faixa; \(\text{conf}_b\): confiança média prevista na faixa</li>
+    </ul>
+  </div>
+  <p>O remédio mais simples é o <span class="la-term" data-term="escalonamento-por-temperatura">escalonamento por temperatura</span>: trocar \(\sigma(\Delta)\) por \(\sigma(\Delta/T)\) e ajustar um único escalar \(T\) que minimize a entropia cruzada num conjunto de validação. Gao 2022 fez isso com os seus RMs proxy. Recalibrar não muda a <b>ordem</b> dos escores, então não altera nenhum best-of-\(n\); segundo os mesmos autores, também não deve afetar o RL <i>no setup deles</i>, que otimiza sem penalidade de KL (o Adam é invariante à escala da perda). Com a penalidade de KL do RLHF padrão, dividir \(r\) por \(T\) equivale a multiplicar o \(\beta\) da KL por \(T\), e aí a escala volta a importar (seção 4 e capítulo de <a data-ch="ppo-rlhf">PPO</a>).</p>
+  <figure class="la-fig" id="fig-calib" data-title="Diagrama de confiabilidade e a temperatura que conserta o RM">
+    <div class="la-fig-stage" style="height:420px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>À esquerda (em cima no celular), a sigmoide \(\sigma(\Delta/T)\) e, como pontos, a acurácia observada em três faixas de \(|\Delta|\) (0,25; 1,0; 2,5; com 400, 350 e 250 pares). À direita (embaixo no celular), o diagrama de confiabilidade: confiança prevista contra acurácia, com a diagonal da calibração perfeita; o tamanho das bolhas é o número de pares. Com \(T=1\) o RM é sobreconfiante (ECE = 0,0318). “Achar o T ótimo” desliza até \(T \approx 1{,}31\), que minimiza a NLL e leva as previsões a 0,5476 / 0,6821 / 0,8708 (ECE ≈ 0,010, cálculo nosso). Dados <b>ilustrativos</b>.</figcaption>
+  </figure>
+  <p>Acurácia e calibração no conjunto de treino ainda não respondem à pergunta que mais importa: o RM <b>generaliza para onde a política vai</b>? Stiennon testou isso. O RM treinado no TL;DR transferiu para o CNN/DM com 62,4% (1,3B) e 66,5% (6,7B) de concordância, contra 66,9% entre humanos. Preferiu edições mínimas que melhoravam um resumo em 79,4% e 82,8% dos casos (humanos: 84,1%) e detectou papéis trocados em 92,9% e 97,2%. Mas preferiu as edições que <i>encurtavam</i> o resumo só 62,6% das vezes, contra 76,4% dos humanos, o primeiro sinal do viés de comprimento da próxima seção.</p>
+  <h3>RewardBench: uma suíte padronizada</h3>
+  <p>O <span class="la-term" data-term="rewardbench">RewardBench</span> (Lambert et al. 2024) junta trios prompt–<i>chosen</i>–<i>rejected</i> verificados em quatro categorias. O núcleo tem 2.985 pares: Chat 358, Chat Hard 456, Safety 740 e Reasoning 1.431, além de “Prior Sets” com 17,2k pares de datasets antigos. A métrica é a acurácia de pares. Foi nele que o RM Nemotron-4 340B do HelpSteer2 chegou a 92,0% (1º lugar em 12/06/2024) e o Llama-3.1-70B com BT escalado do HelpSteer2-Preference, a 94,1 (1º em 01/10/2024). O <b>RewardBench 2</b> (2025) muda o formato para <i>best-of-4</i> (1 resposta correta contra 3 incorretas) em 6 domínios (Factuality, Precise IF, Math, Safety, Focus, Ties). Os modelos pontuam cerca de 20 pontos a menos que no primeiro, e os autores correlacionam o escore com o uso a jusante, em best-of-\(N\) e PPO.</p>
+  <div class="la-callout warn"><b class="t">Armadilha: o benchmark não é o uso</b><p>Um RM é avaliado em pares <i>fixos</i>, mas usado contra uma política que <i>procura</i> os pontos fracos dele. Acurácia alta no RewardBench é necessária, não suficiente. O teste que importa é o comportamento sob otimização, que é o assunto da próxima seção.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Quando a recompensa mente: comprimento, hacking e superotimização</h2>
+  <p>A <span class="la-term" data-term="lei-de-goodhart">lei de Goodhart</span> diz: quando uma medida vira alvo, ela deixa de ser uma boa medida. O RM é um <i>proxy</i> aprendido do julgamento humano. Otimizá-lo pouco melhora as respostas; otimizá-lo demais encontra e explora os erros dele. Esse fenômeno tem dois nomes: <span class="la-term" data-term="reward-hacking">reward hacking</span>, quando a política descobre um atalho que o RM premia e os humanos não, e <span class="la-term" data-term="superotimizacao">superotimização</span>, a curva em que a recompensa do proxy continua subindo enquanto a qualidade real cai.</p>
+  <h3>O viés de comprimento</h3>
+  <p>O atalho mais documentado é o tamanho da resposta. Gao 2022 relata que políticas otimizadas produzindo respostas muito longas, mesmo quando uma curta seria preferida, eram um problema real no cenário do InstructGPT. <b>Singhal et al. 2023</b> (“A Long Way to Go”) mediram isso. O PPO aumentou muito o comprimento em todos os cenários (WebGPT, Stack, RLCD), e decompondo o ganho de recompensa, <b>70–90% da melhoria</b> em WebGPT e RLCD vinha do comprimento. Um PPO cuja recompensa era <i>só o comprimento</i> reproduziu a maior parte do ganho: 56% contra 58% de win-rate do PPO padrão no WebGPT, e 64% contra 63% no RLCD. A fonte dominante do <span class="la-term" data-term="vies-de-comprimento">viés</span> são os RMs, “facilmente influenciados por vieses de comprimento nos dados de preferência”. As mitigações listadas na literatura incluem penalizar o comprimento na recompensa, RMs com cabeças separadas para comprimento e qualidade (ODIN), avaliação com controle de comprimento (AlpacaEval LC) e dados balanceados por comprimento.</p>
+  <p>Há outros exemplos clássicos. Os sumarizadores RL de Ziegler 2019 viraram “copiadores espertos”, que copiavam frases inteiras do texto, porque os rotuladores usavam “copiou?” como heurística de qualidade. Stiennon viu que, sob otimização leve, os modelos melhoravam segundo os rotuladores e, sob otimização forte, pioravam, com o RM ainda dando nota alta a resumos que os humanos rejeitavam. O “Secrets of RLHF” descreve um <i>colapso de padrão</i> no PPO: a política engana o RM com padrões específicos para obter escores anormalmente altos.</p>
+  <h3>As leis de escala de Gao</h3>
+  <p><b>Gao, Schulman & Hilton 2022</b> mediram a superotimização de forma limpa, sem humanos. O RM de 6B do InstructGPT faz o papel de humano (o <b>RM ouro</b>) e rotula 100.000 pares sintéticos, que treinam <b>RMs proxy</b> de 3M a 3B. Depois otimiza-se uma política contra o proxy (best-of-\(n\), ou PPO sem penalidade de KL) e mede-se o escore <i>ouro</i>. A distância percorrida é \(d = \sqrt{D_{KL}(\pi\,\|\,\pi_{\text{init}})}\), com a <span class="la-term" data-term="kld">divergência KL</span> em relação à política inicial. As curvas do escore ouro seguem formas simples:</p>
+  <div class="la-eq">
+    \[ R_{\text{bon}}(d) = d\,(\alpha_{\text{bon}} - \beta_{\text{bon}}\,d), \qquad R_{\text{RL}}(d) = d\,(\alpha_{\text{RL}} - \beta_{\text{RL}}\log d), \qquad \text{KL}_{\text{bon}} = \log n - \frac{n-1}{n} \]
+    <ul class="la-eq-legend">
+      <li>\(R(d)\): ganho no escore ouro; \(R(0) := 0\)</li>
+      <li>\(\alpha\): o “quanto melhora” no começo; \(\beta\): o “quanto se perde” por superotimização. Dependem do tamanho do RM proxy e dos dados</li>
+      <li>\(\text{KL}_{\text{bon}}\): fórmula analítica de Stiennon/Gao para o KL do <span class="la-term" data-term="best-of-n">best-of-\(n\)</span> (amostrar \(n\) respostas e ficar com a de maior proxy); é um limite superior (Beirami et al., 2024), quase exato quando as \(n\) respostas são distintas e sem empates de recompensa (<a data-ch="awr-contrastivo">capítulo 59</a>): \(n = 1.000\) → ≤ 5,91 nats, \(n = 60.000\) → ≤ 10,00 nats</li>
+      <li>picos: \(d^* = \alpha/2\beta\) no BoN e \(d^* = e^{\alpha/\beta - 1}\) no RL (cálculo a partir das formas)</li>
+    </ul>
+  </div>
+  <p>Com coeficientes ilustrativos (\(\alpha_{\text{bon}}=1\), \(\beta_{\text{bon}}=0{,}25\); \(\alpha_{\text{RL}}=1\), \(\beta_{\text{RL}}=0{,}5\)), o BoN atinge o pico em \(d = 2\) (KL = 4 nats, \(R = 1{,}0\)) e o RL em \(d = e\) (KL ≈ 7,39 nats, \(R ≈ 1{,}359\)). Os achados principais de Gao:</p>
+  <ol class="la-steps">
+    <li><b>RL gasta muito mais KL que BoN</b> para otimizar e para superotimizar o mesmo tanto. Logo, KL <i>não</i> serve para comparar a quantidade de otimização entre métodos. Em função do escore proxy, os dois se parecem.</li>
+    <li><b>Os coeficientes variam suavemente com o tamanho do RM proxy</b>: \(\alpha_{\text{bon}}\), \(\beta_{\text{bon}}\) e \(\beta_{\text{RL}}\) mudam de forma aproximadamente logarítmica com o número de parâmetros, e \(\alpha_{\text{RL}}\) fica quase constante.</li>
+    <li><b>O tamanho da política importa pouco</b>: políticas maiores ganham menos com a otimização, mas superotimizam quase igual.</li>
+    <li><b>A penalidade de KL ≈ parar cedo</b>: no setup deles, ela melhorava o proxy alcançado por unidade de KL, mas não a fronteira ouro × KL. Os autores ressalvam a sensibilidade a hiperparâmetros.</li>
+  </ol>
+  <p>A taxonomia de Goodhart ajuda a ler as curvas. No Goodhart <b>regressional</b>, o proxy é o ouro mais um ruído independente. Com ruído gaussiano, otimizar seleciona em parte o ruído e o ganho real fica menor que o aparente, mas o ouro continua subindo. O ouro pode <i>cair</i> em dois casos. O primeiro é o Goodhart <b>extremal</b>: fora da distribuição de treino do RM, a relação proxy–ouro se desfaz, como no comprimento exagerado. O segundo aparece quando o erro próprio do RM tem <b>caudas pesadas</b>, ou seja, quando o RM raramente erra muito e o best-of-\(n\) acaba “encontrando” esse erro (interpretação; é o que a figura simula). A figura monta um best-of-\(n\) de brinquedo com os dois mecanismos.</p>
+  <figure class="la-fig wide" id="fig-goodhart" data-title="Goodhart no best-of-n: o proxy sobe, o ouro cai">
+    <div class="la-fig-stage" style="height:460px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>À esquerda (em cima no celular), a cada rodada \(n\) respostas candidatas (pontos: comprimento × qualidade real) e a coroa na escolhida pelo proxy. O proxy enxerga a qualidade, mas soma um viés de comprimento e um erro próprio com caudas pesadas; o “ouro” pune respostas longas demais. À direita (embaixo no celular), as médias de Monte Carlo da resposta escolhida contra \(d=\sqrt{\text{KL}_{\text{bon}}}\): em cima o proxy, embaixo o ouro (cada um na sua escala), com a forma de Gao \(d(\alpha-\beta d)\) ajustada ao ouro (tracejado). Teste o ensemble: ele corrige o erro <i>próprio</i> de cada RM, mas não o viés <i>compartilhado</i>. Com o viés em 0 e 1 RM, o ouro ainda cai por causa da cauda pesada do erro próprio; troque para a média de 4 e a queda some. Com o viés alto (o padrão, 0,7), nem o ensemble evita a queda, porque o viés é compartilhado; a partir de 0,8, a média de 4 termina abaixo de 1 RM em \(n = 256\) (sem o ruído para diluir, a escolha vai direto no comprimento). Modelo <b>ilustrativo</b>; só a fórmula do KL do BoN é analítica (um limite superior, quase exato aqui porque as respostas não empatam).</figcaption>
+  </figure>
+  <p>Bai 2022 viu algo compatível nos seus treinos: no começo, o ganho de escore do modelo de preferência cresce de forma aproximadamente linear em \(\sqrt{D_{KL}}\), em todas as execuções. Dividindo os dados 50/50 entre um RM “de treino” e um “de teste”, o RL ficou robusto até ~150k amostras de treino; depois disso, os dois RMs passaram a discordar.</p>
+  <h3>Mitigações: KL, ensembles e médias de pesos</h3>
+  <p>A primeira linha de defesa é a <b>penalidade de KL</b> até o modelo de referência, que mantém a política na região onde o RM foi treinado. Ela será o centro do capítulo de <a data-ch="ppo-rlhf">PPO e RLHF</a>. As outras atacam o próprio RM:</p>
+  <ul>
+    <li><b>Ensembles.</b> Christiano 2017 já treinava vários preditores por bootstrap e usava a média dos membros, cada um normalizado separadamente. Coste et al. 2023 compararam três formas de combinar \(k\) RMs:</li>
+  </ul>
+  <div class="la-eq">
+    \[ R_\mu = \tfrac1k\sum_i R_i, \qquad R_{\text{WCO}} = \min_i R_i, \qquad R_{\text{UWO}} = \tfrac1k\sum_i R_i - \lambda\,\tfrac1k\sum_i\Big(R_i - \tfrac1k\sum_j R_j\Big)^2 \]
+    <ul class="la-eq-legend">
+      <li>\(R_\mu\): média; não é conservadora, porque basta um membro superestimar</li>
+      <li>\(R_{\text{WCO}}\): pior caso (mínimo); sem hiperparâmetro, mas pode custar desempenho</li>
+      <li>\(R_{\text{UWO}}\): média menos \(\lambda\) vezes a variância entre membros; penaliza a discordância</li>
+      <li>exemplo ilustrativo: \(R_i = (1{,}8;\ 2{,}0;\ 2{,}2;\ 0{,}6)\) → média 1,65; WCO 0,60; UWO (\(\lambda=0{,}5\)) 1,4562</li>
+    </ul>
+  </div>
+  <p>Com e sem 25% de ruído nos rótulos, a otimização conservadora praticamente eliminou a superotimização no BoN, com melhoras de até 70%, e sempre a reduziu no PPO; somada a uma KL pequena, preveniu a superotimização sem custo de desempenho. Há um limite, porém. <b>Eisenstein et al. 2023</b> mostraram que ensembles que variam a semente de <i>pré-treino</i> generalizam melhor do que os que variam só a do fine-tuning, mas que nem eles eliminam o reward hacking, porque todos os membros erram de forma parecida. É o viés compartilhado da figura. O <span class="la-term" data-term="warm">WARM</span> (Ramé et al. 2024) troca a média das <i>predições</i> pela média dos <i>pesos</i> de vários RMs ajustados a partir do mesmo pré-treino, explorando a conectividade linear entre eles: na inferência custa um RM só e fica mais robusto a mudanças de distribuição e a preferências inconsistentes. Completam a caixa de ferramentas a parada antecipada com avaliação separada ou humana, o RM retreinado com dados on-policy (Bai, Llama 2), a normalização e o clipping da recompensa e o controle de comprimento.</p>
+</section>
+
+<section class="la-sec">
+  <h2>Resultado ou processo: ORM, PRM e Math-Shepherd</h2>
+  <p>Até aqui o RM dava uma nota à resposta inteira. Em raciocínio de vários passos, dá para perguntar outra coisa: <i>cada passo</i> está certo? Uesato et al. 2022 definiram os dois tipos com um RM que prevê um token “correto/incorreto” depois de cada passo:</p>
+  <ul>
+    <li><b><span class="la-term" data-term="orm">ORM</span></b> (<i>outcome reward model</i>): o rótulo de todos os passos é se a <b>resposta final</b> bate com o gabarito. Maximizar o ORM passo a passo ≈ maximizar a chance estimada de <i>chegar</i> à resposta certa, ou seja, o ORM aprende algo parecido com uma função valor.</li>
+    <li><b><span class="la-term" data-term="prm">PRM</span></b> (<i>process reward model</i>): o rótulo depois de cada passo diz se os passos <b>até ali</b> estão corretos. Exige anotação passo a passo.</li>
+  </ul>
+  <p>No GSM8K, supervisionar só o resultado deu erro de resposta final parecido, com menos rótulos. Mas, para o <i>raciocínio</i> ficar correto, foi preciso supervisão de processo ou RMs que a imitassem. O melhor sistema reduziu o erro final de 16,8% para 12,7% e o <b>erro de traço</b> (soluções com resposta certa e raciocínio errado) de 14,0% para 3,4%. Lightman et al. 2023 (“Let's Verify Step by Step”) escalaram a ideia com o <span class="la-term" data-term="prm800k">PRM800K</span>. Os humanos rotulavam só até o primeiro passo errado, e o escore de uma solução é o <b>produto</b> das probabilidades de cada passo estar correto:</p>
+  <div class="la-eq">
+    \[ \text{escore}_{\text{PRM}}(y) = \prod_{k=1}^{S} p\big(\text{passo}_k\ \text{correto} \mid x, \text{passo}_{1..k}\big) \]
+    <ul class="la-eq-legend">
+      <li>\(S\): número de passos da solução; \(p\): probabilidade dada pelo PRM (neutros contam como positivos)</li>
+      <li>o mínimo no lugar do produto dá diferenças “pequenas”, segundo os autores</li>
+      <li>exemplo ilustrativo: \((0{,}98;\ 0{,}95;\ 0{,}60;\ 0{,}97)\) → produto 0,5418, mínimo 0,60</li>
+    </ul>
+  </div>
+  <p>Escolhendo a melhor de 1.860 soluções num subconjunto de 500 problemas do MATH, o PRM acertou <b>78,2%</b>, o ORM 72,4% e a votação por maioria 69,6%. Anotar passo a passo é caro, e o <span class="la-term" data-term="math-shepherd">Math-Shepherd</span> (Wang et al. 2023) gera os rótulos sem humanos: a partir do passo \(s_i\), um “completador” termina \(N\) soluções e confere as respostas finais \(\{a_j\}\) com o gabarito \(a^*\):</p>
+  <div class="la-eq">
+    \[ y^{\text{HE}}_{s_i} = \mathbb 1\big[\exists j: a_j = a^*\big], \qquad y^{\text{SE}}_{s_i} = \frac{1}{N}\sum_{j=1}^{N}\mathbb 1[a_j = a^*] \]
+    <ul class="la-eq-legend">
+      <li>HE (<i>hard estimation</i>): o passo é bom se <b>alguma</b> continuação acerta</li>
+      <li>SE (<i>soft estimation</i>): a fração das continuações que acertam</li>
+      <li>exemplo: \(N = 4\) continuações com respostas (42, 17, 42, 42) e gabarito 42 → HE = 1, SE = 0,75</li>
+    </ul>
+  </div>
+  <figure class="la-fig" id="fig-prm" data-title="ORM, PRM e os rótulos de Monte Carlo do Math-Shepherd">
+    <div class="la-fig-stage" style="height:450px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Uma solução de 4 passos para um problema de brinquedo. <b>ORM</b>: um único rótulo, o do resultado, carimbado em todos os passos (até no passo estranho). <b>PRM</b>: uma probabilidade por passo; mexa na do passo 3 e veja o produto e o mínimo. <b>Math-Shepherd</b>: escolha o passo e o completador lança \(N\) continuações; o rótulo HE/SE sai da fração que chega a 42. Valores <b>ilustrativos</b> (os do exemplo acima com \(N=4\)).</figcaption>
+  </figure>
+  <p>Com PPO passo a passo contra o Math-Shepherd, um Mistral-7B foi de 77,9% para 84,1% no GSM8K e de 28,6% para 33,0% no MATH; com verificação no fim, 89,1% e 43,5%. Repare no que o SE é (interpretação): uma estimativa de Monte Carlo do <b>valor</b> \(V(s_i)\), a recompensa final esperada a partir daquele prefixo. Um PRM treinado nesses rótulos é um crítico aprendido fora do laço. Essa ponte volta no <a data-ch="rl-fundamentos">próximo capítulo</a>, quando aparecerem a função valor e o crítico.</p>
+  <div class="la-callout warn"><b class="t">Por que o DeepSeek-R1 não usou PRM</b><p>O relatório do DeepSeek-R1 conta que não usou RMs neurais, nem de processo nem de resultado, no RL de raciocínio, porque eles sofrem reward hacking em larga escala. Para o PRM, os autores dão três motivos: definir o que é um “passo” é difícil, anotar passos é caro e ruidoso, e qualquer PRM baseado em modelo acaba levando a hacking. Eles reconhecem que o PRM funciona bem para reordenar as N melhores respostas. Onde existe um verificador exato (resposta numérica, testes de código), o “RM” vira uma função determinística: é o RL com recompensas verificáveis do capítulo de <a data-ch="grpo-rlvr">GRPO e RLVR</a>.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Juízes de IA: LLM-as-judge, RMs generativos e RLAIF</h2>
+  <p>Um RM escalar só devolve um número. Um LLM grande, instruído a comparar duas respostas, também julga, e ainda explica. Zheng et al. 2023 usaram o GPT-4 como <span class="la-term" data-term="llm-como-juiz">juiz</span> no MT-bench e no Chatbot Arena: a concordância com humanos foi de <b>85%</b> (sem empates), acima dos 81% entre humanos, e os humanos acharam “razoáveis” 75% dos julgamentos do GPT-4 de que discordavam. Os modos de uso são três: comparação pareada, nota única e nota com resposta de referência. Os vieses catalogados são quatro: <span class="la-term" data-term="vies-de-posicao">posição</span>, verbosidade, autofavorecimento (o juiz prefere as próprias respostas) e raciocínio limitado em matemática (o juiz erra o que não sabe resolver). As mitigações: julgar nas duas ordens e só aceitar vitórias consistentes, dar ao juiz uma referência, e pedir um raciocínio curto antes do veredito.</p>
+  <p>O passo seguinte é treinar o juiz como um modelo de recompensa. No <span class="la-term" data-term="rm-generativo">GenRM</span> (Zhang et al. 2024), o verificador é treinado por previsão de próximo token, e a recompensa é a probabilidade do token “Yes” depois da pergunta “a resposta está correta (Yes/No)?”. Na variante GenRM-CoT, ele escreve uma justificativa antes e vota por maioria entre várias justificativas, gastando mais computação na hora do teste. Em best-of-\(N\), o GenRM levou uma tarefa algorítmica de 5% para 45,3%, o GSM8K de 73% para 93,4%, a transferência para o MATH de 28% para 44,6% e MMLU de álgebra abstrata de 37,9% para 53,5%. O <b>DeepSeek-GRM</b> (Liu et al. 2025) vai além: um RM generativo <i>pointwise</i>, treinado com RL online (<i>Self-Principled Critique Tuning</i>) para escrever primeiro <b>princípios</b> adaptados à pergunta e depois a crítica, que escala na inferência por amostragem paralela e votação guiada por um meta-RM.</p>
+  <p>Pairwise ou pointwise (interpretação)? O julgamento pareado casa com BT e é mais robusto a deriva de escala. Mas o PPO e o GRPO precisam de <b>um escalar por resposta</b>, e por isso os RMs generativos modernos convertem a crítica numa nota.</p>
+  <h3>RLAIF: quando o rotulador também é uma IA</h3>
+  <p>Se um LLM julga bem, ele pode produzir os próprios pares de treino do RM. É o <span class="la-term" data-term="rlaif">RLAIF</span> (<i>RL from AI Feedback</i>). Na <a data-ch="constitutional-ai">Constitutional AI</a> (Bai et al. 2022b), um modelo rotula qual de duas respostas é menos nociva segundo uma lista de princípios, e o modelo de preferência é treinado na mistura de preferências de IA (inocuidade) e humanas (utilidade). <b>Lee et al. 2023</b> (“RLAIF vs RLHF”) destrincharam a receita:</p>
+  <ol class="la-steps">
+    <li><b>Rótulo suave.</b> O rotulador (PaLM 2 L, sem RL) lê um preâmbulo, exemplos opcionais, as duas respostas e “Preferred Response=”. A softmax dos log-probs dos tokens “1” e “2” vira um rótulo suave, e o RM é treinado com entropia cruzada contra ele, numa espécie de destilação.</li>
+    <li><b>Viés de posição.</b> Mitigado fazendo duas inferências com a ordem trocada e tirando a média.</li>
+    <li><b>Cadeia de pensamento.</b> Pedir ao rotulador que raciocine antes melhorou consistentemente o alinhamento com os humanos; preâmbulo detalhado e exemplos few-shot só ajudaram em algumas tarefas.</li>
+    <li><b>Resultado.</b> Humanos preferiram RLAIF e RLHF ao SFT em 71% e 73% dos casos (sumarização) e em 63% e 64% (diálogo útil), diferença não significativa. Na taxa de respostas inofensivas, RLAIF 88%, RLHF 76%, SFT 64%. Com um rotulador do <i>mesmo tamanho</i> da política, ainda 68% contra o SFT.</li>
+    <li><b>d-RLAIF.</b> Uma variante pula o RM: o LLM dá uma nota de 1 a 10 diretamente durante o RL, evitando um RM “velho” (<i>stale</i>), e iguala ou supera o RLAIF canônico.</li>
+  </ol>
+  <p>A figura mostra por que trocar a ordem ajuda, e também o que essa troca <i>não</i> conserta.</p>
+  <figure class="la-fig" id="fig-juiz" data-title="O juiz, a posição e o rótulo suave">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>O juiz lê as duas respostas e produz logits para os tokens “1” e “2”; a softmax vira o rótulo suave. Um viés de posição \(b\) soma-se ao logit de quem aparece primeiro. Na ordem (A, B) o viés ajuda \(A\); na ordem (B, A), ajuda \(B\). A média das duas ordens remove o viés direcional, mas puxa o rótulo para 0,5 (fica menos confiante). Se as duas ordens discordam do vencedor, o protocolo de avaliação conta empate. Modelo <b>ilustrativo</b>: \(P(A) = \sigma(\Delta \pm b)\).</figcaption>
+  </figure>
+  <p>Rótulos de IA são baratos e consistentes, mas carregam os vieses do juiz (posição, comprimento, autofavorecimento). Tudo da seção 7 se aplica, e um RM treinado em rótulos de IA herda esses vieses e às vezes os amplifica (interpretação). O UltraFeedback é RLAIF em escala de dataset (GPT-4 como rotulador), e o Skywork-Reward-V2 usou curadoria humano + IA em 40M pares.</p>
+  <h3>Nas três famílias do Módulo 1</h3>
+  <p>Os relatórios técnicos das famílias que o Módulo 1 serve mostram como essas peças se combinam em 2025–2026. Não há RM “puro”: todos misturam regras, RMs e juízes.</p>
+  <div class="la-cards">
+    <div class="la-card" data-recipe="glm"><span class="ic">⚖️</span><h4><span class="la-rb glm"></span> GLM-5: recompensa híbrida</h4><p>No estágio de <i>General RL</i>, a recompensa combina regras (precisas, mas de escopo limitado), ORMs (baixa variância, porém hackeáveis) e RMs generativos (robustos, mas de alta variância). Respostas humanas de especialistas entram como <b>âncoras de estilo</b>, para evitar o padrão prolixo e formulaico de “texto de modelo”.</p></div>
+    <div class="la-card" data-recipe="qwen"><span class="ic">📏</span><h4><span class="la-rb qwen"></span> Qwen3: regra, referência e RM</h4><p>O <i>General RL</i> cobre mais de 20 tarefas, com três fontes de recompensa: regras (formato, instrução), um modelo <b>com referência</b> (o Qwen2.5-72B-Instruct pontua a resposta contra uma resposta de referência) e um modelo <b>sem referência</b> (um RM treinado).</p></div>
+    <div class="la-card" data-recipe="ds"><span class="ic">🧑‍⚖️</span><h4><span class="la-rb ds"></span> DeepSeek: do RM com CoT ao ator-juiz</h4><p>O V3 usava regras (resposta em caixa, compilador e testes) e um RM treinado a partir do SFT do V3 com dados de preferência que incluem a <b>cadeia de pensamento que leva à recompensa</b>, para mitigar hacking. O V4 dispensa RMs escalares: o RL é guiado por rubricas e o <b>próprio ator funciona como RM generativo</b>.</p></div>
+  </div>
+  <p>Há ainda uma ponte direta com o Módulo 1: os três modelos servidos pelas receitas nos dois Sparks (<code>GLM-5.3-Flash-EXL3</code>, <code>qwen3.8-flash-next</code>, <code>deepseek-v4-flash-vision-exp</code>, todos com API OpenAI na porta 8888) formam um painel de juízes de três famílias distintas. O PoLL (Verga et al. 2024) mostrou que um painel de modelos menores de famílias diferentes tem menos viés intra-modelo e custa mais de 7× menos que um juiz grande. A regra prática, que o capítulo de <a data-ch="avaliacao-pos-treino">avaliação</a> detalha: exclua do painel a família do professor que gerou os dados e a família do aluno, para fugir do autofavorecimento.</p>
+  <h3>Roteiro: o seu primeiro RM (ou juiz)</h3>
+  <ol class="la-steps">
+    <li><b>Decida o formato antes de coletar.</b> Pares (ou rankings de \(K\) respostas, agrupados no batch) para direção; intensidade ou Likert por atributo se você quiser magnitude ou controlar a verbosidade depois.</li>
+    <li><b>Gere as respostas da política que você vai otimizar</b> (ou de uma bem próxima) e reserve coletas novas depois de cada rodada de RL. RM fora da distribuição é RM hackeável.</li>
+    <li><b>Meça a concordância</b> (κ, ou κ ponderado em escalas ordinais) numa amostra com 2–3 anotadores, ou entre juiz e humano. Ela é o teto do seu RM.</li>
+    <li><b>Treine 1 época</b>, com o backbone SFT, cabeça escalar lida no EOS, dropout desligado e algumas sementes; normalize o bias para média 0 nas referências.</li>
+    <li><b>Avalie acurácia, calibração e generalização</b> (RewardBench e um conjunto do seu domínio), e olhe a correlação do escore com o comprimento.</li>
+    <li><b>Sob otimização, vigie o ouro</b>: amostras avaliadas por humanos ou por um juiz de outra família, o comprimento médio e o KL. Proxy subindo com o ouro parado é Goodhart.</li>
+  </ol>
+  <p>Agora temos \(r(x,y)\): um número que resume as preferências, com os seus defeitos mapeados. Falta a pergunta central do pós-treino por reforço: <i>como fazer um LLM subir esse número</i>, se a recompensa só chega no fim da resposta e não dá para derivar através da amostragem? O <a data-ch="rl-fundamentos">próximo capítulo</a> responde com o teorema do gradiente de política, o REINFORCE e a família de ideias que leva ao PPO.</p>
+</section>

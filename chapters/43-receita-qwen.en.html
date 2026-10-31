@@ -1,0 +1,417 @@
+<p class="la-lead">Imagine receiving a box with <b>180 billion numbers</b> (123.5 GiB on disk) and two book-sized computers, each with 121.69 GiB of memory. The task: get this model — <b>Qwen3.8-Flash-Next</b>, the open preview of the Qwen4 architecture — to talk to tools, see images, remember 262K tokens and answer fast. Eleven minutes after a <code>./start.sh</code>, Mia's recipe delivers exactly that: <b>52 tok/s</b> in a single conversation and about <b>225 tok/s aggregate</b> with eight prose conversations. In this chapter you will rebuild that recipe from scratch, <i>decision by decision</i>, understanding why each parameter has the value it has — and which chapter holds the concept behind it.</p>
+
+<section class="la-sec">
+  <h2>Step 0 — The byte budget rules everything</h2>
+  <p>A recipe doesn't start in the terminal: it starts on a sheet of paper. Before choosing an image, flags or speculation, Mia answered the two questions from the <a data-ch="mapa-da-jornada">journey map</a> — <i>does it fit?</i> and <i>is it fast?</i> — with numbers. Everything else in the recipe follows from that arithmetic. Here is the full roadmap; the numbers match the section titles (Step 0 to Step 8), and each step points to the chapter where the concept is taught in depth.</p>
+  <ol class="la-steps" style="counter-reset: st -1">
+    <li><b>Byte budget</b> Add up weights, KV cache, activations and system per node, remembering that the memory is unified (<a data-ch="memoria-unificada">unified memory</a>, <a data-ch="prefill-decode-kv">prefill, decode and KV</a>).</li>
+    <li><b>Hardware and network</b> Two DGX Sparks linked by ConnectX-7; find the interface, HCA and GID on each side (<a data-ch="nccl-rdma">NCCL and RDMA</a>).</li>
+    <li><b>Image and lane</b> Choose between the <span class="la-term" data-term="imagem-day-0">day-0</span> image, the stable vLLM 0.30 or the single-node variant (<a data-ch="vllm-arquitetura">inside vLLM</a>).</li>
+    <li><b>Weights</b> Pick the checkpoint, check the hashes and distribute it to the other node (<a data-ch="checkpoints">checkpoints</a>, <a data-ch="fp8-fp4-microescala">FP8/FP4</a>).</li>
+    <li><b>Fix the loading</b> Patch the metadata and the loader so vLLM understands the checkpoint (<a data-ch="ngram-mtp">N-gram and MTP</a>, <a data-ch="kernels">kernels</a>).</li>
+    <li><b>Arguments</b> Assemble the <code>vllm serve</code> line: parallelism, memory, scheduler, KV, speculation, compilation and API (<a data-ch="paralelismos">parallelism</a>, <a data-ch="scheduler-batching">scheduler</a>).</li>
+    <li><b>Launch</b> Bring up the worker, then the head, and follow the boot until <code>/health</code> (<a data-ch="engenharia-de-receita">recipe engineering</a>).</li>
+    <li><b>Verify and operate</b> Read the right log lines, measure quality and acceptance; then stop, switch lanes and keep an eye on memory (<a data-ch="medindo-qualidade">measuring quality</a>, <a data-ch="benchmarking">benchmarking</a>).</li>
+    <li><b>Tune</b> Find out where the step's milliseconds go and pull one lever at a time (<a data-ch="mtp-eagle-vocab">MTP and reduced vocabulary</a>).</li>
+  </ol>
+
+  <h3>What has to fit</h3>
+  <p>The default checkpoint, <code>nvidia/Qwen3.8-Flash-Next-NVFP4</code>, is a numerical patchwork quilt: each piece of the model was stored in the format its role can tolerate. The table below (from the safetensors file headers) shows where the bytes live. If any name looks strange, the <a data-ch="tres-modelos">three-models chapter</a> dissects the architecture layer by layer.</p>
+  <table>
+    <thead><tr><th>Component</th><th>Size</th><th>Format</th><th>Role</th></tr></thead>
+    <tbody>
+      <tr><td>Routed experts (48 layers × 512)</td><td>63.28 GiB</td><td><span class="la-term" data-term="nvfp4">NVFP4</span> (56.25 + 7.03 in scales)</td><td>120.8 B parameters, 96% of the main model; only 10 per token</td></tr>
+      <tr><td>N-gram table (<span class="la-term" data-term="ple-ngram">PLE</span>)</td><td>47.68 GiB (+0.06 GiB of PLE projections, norms and conv)</td><td>per-tensor FP8</td><td>51.2 B parameters looked up by <i>gather</i>, almost no FLOPs</td></tr>
+      <tr><td><span class="la-term" data-term="mtp">MTP</span> layer</td><td>≈2.5 GiB (FP8 experts 2.34 GiB + the rest)</td><td>experts in FP8 in 128×128 blocks; the rest BF16</td><td>the extra layer that drafts tokens</td></tr>
+      <tr><td><span class="la-term" data-term="gdn">GDN</span> projections (36 layers)</td><td>3.89 GiB</td><td>BF16</td><td>linear attention with a fixed-size state</td></tr>
+      <tr><td>Gated Residual (97 modules)</td><td>1.19 GiB</td><td>BF16, replicated</td><td>the 4-branch residual stream</td></tr>
+      <tr><td><code>lm_head</code> and <code>embed_tokens</code></td><td>1.18 + 1.18 GiB</td><td>BF16</td><td>vocabulary of 248,320 × 2560</td></tr>
+      <tr><td><span class="la-term" data-term="qsa">QSA</span> attention (12) + indexer</td><td>1.11 + 0.04 GiB</td><td>BF16</td><td>the only layers with a KV cache</td></tr>
+      <tr><td>Shared experts, routers, vision</td><td>0.44 + 0.12 + 0.84 GiB</td><td>BF16</td><td>small pieces, several of them replicated</td></tr>
+    </tbody>
+  </table>
+  <p>Total: ≈123.5 GiB. A single Spark has 121.69 GiB <i>visible to CUDA</i> — and it still has to run Linux and hold the KV cache and activations. It doesn't fit. With two nodes and <b>tensor parallelism (TP=2) plus expert parallelism (EP)</b>, each GPU holds half the experts (256 of 512), half the N-gram table (split by vocabulary range) and half the dense matrices. Only a few pieces stay whole on both sides: the HyperConnections, the routers, the indexer and the vision tower. The log measured <b>64.46 GiB of weights per node</b>.</p>
+
+  <div class="la-eq">
+    \[ M_{\text{KV}} = \text{GMU}\cdot M_{\text{total}} - \big(W + N_{\text{non-torch}} + A_{\text{peak}}\big) \qquad T_{\text{KV}} = M_{\text{KV}}\cdot\tau \qquad C = \frac{T_{\text{KV}}}{L_{\max}} \]
+    <ul class="la-eq-legend">
+      <li>\(M_{\text{total}}\): CUDA-visible memory per node (121.69 GiB on the GB10)</li>
+      <li>\(\text{GMU}\): <code>--gpu-memory-utilization</code>, the fraction vLLM is allowed to budget</li>
+      <li>\(W + N_{\text{non-torch}}\): weights plus allocations outside PyTorch (68.52 GiB measured)</li>
+      <li>\(A_{\text{peak}}\): activation peak measured in the <i>profile run</i> (1.07 GiB)</li>
+      <li>\(\tau\): tokens per GiB of pool — 114,060 with FP8 KV, 67,229 with BF16, measured on day-0 at GMU 0.835 with the SSM state apparently in float32 (the README doesn't say; with a bf16 SSM the same GMU gave 4.24–4.38 M tokens in FP8)</li>
+      <li>\(L_{\max}\): <code>--max-model-len</code>; \(C\) is the “maximum concurrency” the log prints</li>
+    </ul>
+  </div>
+  <p>Check the math against the real log at GMU 0.835: \(0.835 \times 121.69 = 101.61\) GiB budgeted; subtract 68.52 and 1.07 and you are left with <b>32.02 GiB</b> of KV — exactly what vLLM printed, along with <code>GPU KV cache size: 3,652,200 tokens</code> and <code>Maximum concurrency for 262,144 tokens per request: 13.93x</code>. By the log's own arithmetic, the 0.54 GiB of CUDA graphs sit outside this sum. In the figure, play with the GMU and the KV type.</p>
+
+  <figure class="la-fig wide" id="fig-orcamento" data-title="Memory budget of one node">
+    <div class="la-fig-stage" style="height:480px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>One bar = the 121.69 GiB of one Spark. The vertical line marks the budgeted limit (GMU × 121.69). Weights, the non-torch part and activation come from the log at 0.835; the KV pool is whatever is left. Away from 0.835, the tokens are a <b>linear extrapolation</b> (▼) using the τ measured at 0.835 (float32 SSM); the diamonds (◆) are real measurements (at 0.80, lane 0.30: 2.64 M fp8 and 1.34–1.52 M BF16; at 0.835 with a bf16 SSM: 4.24–4.38 M). The capsules count how many full contexts fit together, according to the extrapolation.</figcaption>
+  </figure>
+  <p>Notice three things. First: the KV cache is <i>the remainder</i>; every extra GiB for the system is one GiB less of cache. Second: the math is a model, and models can be wrong. At 0.80 it promises 3.17 M FP8 tokens, but lane 0.30 (a different image) measured 2.64 M, ~10× 262K (≈5× in BF16); a bf16 SSM, on the other hand, pushes the other way (4.24–4.38 M at 0.835). The truth is the <code>GPU KV cache size</code> line in the log. Third: with FP8, more full contexts fit than the 8 allowed by <code>--max-num-seqs</code>, so the scheduler is the limit. In BF16, eight 262K-token conversations would no longer fit together (vLLM would preempt), but real conversations rarely fill the context. As the README puts it: <i>the weights, not the KV, are the binding constraint on this machine</i>.</p>
+
+  <div class="la-callout why"><b class="t">Why it matters</b><p>Why do only 13 layers hold KV? Of the 48, 36 are <a data-ch="atencao-linear">Gated DeltaNet</a>, with a fixed-size state per request. That leaves the 12 QSA layers plus the MTP: \(13 \times 2\,(K,V) \times 2\ \text{KV heads} \times 256 \times 2\,\text{B} = 26{,}624\) B per token in BF16, 13,312 B per GPU with TP=2, half that in FP8. The measured figure is higher (9,418 B/token/GPU in FP8) because the indexer, the compressor and the GDN state stay in BF16 and the allocator rounds pages up: that's why FP8 yields 1.70×, not 2× (<a data-ch="paged-attention-kv">PagedAttention and the KV budget</a>).</p></div>
+
+  <div class="la-inrecipe" data-recipe="qwen"><div class="la-inrecipe-h"><span class="la-rb qwen"></span><span class="k">Parameter</span><code>GPU_MEMORY_UTILIZATION=0.80</code></div><div class="la-inrecipe-b"><p>The value used to be 0.85 and then 0.835. At 0.835 the driver held 114.5 GiB per node, and a soak with six clients left <span class="la-term" data-term="memavailable">MemAvailable</span> between 0.3 and 0.9 GiB — the zone where the GB10 does a <i>hard reset</i> instead of raising an out-of-memory error. At 0.80, 4.5 GiB (head) and 7.8 GiB (worker) stayed free during an hour of load. Cost: the KV pool shrinks by about 4 GiB per node. Speed lost: none — decode does not depend on the GMU. It's the concept of <a data-ch="memoria-unificada">unified memory</a> turned into a parameter. A note on rigor: <code>.env.sample</code> gives the rule of thumb “+0.01 GMU ≈ +0.83 GiB ≈ +95K FP8 tokens”. It comes from the 0.835 → 0.85 delta quoted in the README (+1.24 GiB, measured in the BF16 era with an old container): 1.24 / 1.5 ≈ 0.83. By definition it would be 0.01 × 121.69 = 1.22 GiB, and the CHANGELOG measured “~4 GiB less” for −0.035, consistent with the definition. The figure above uses the definition.</p></div></div>
+</section>
+
+<section class="la-sec">
+  <h2>Step 1 — Hardware and network: two Sparks, one cable</h2>
+  <p>Each DGX Spark has a GB10 GPU (<code>sm_121</code>, 48 SMs), 20 ARM cores and 121.69 GiB of LPDDR5x shared between CPU and GPU, with ~273 GB/s in theory (235–245 GB/s in practice). The two nodes talk through a ConnectX-7 card running RoCE v2 at 200 GbE, cabled port to port. With TP=2 this cable literally becomes the model's internal bus: every layer ends with a sum across the two GPUs.</p>
+  <p>Before touching vLLM, write down three things on <b>each</b> node: the name of the cable's interface (<code>ip -o -4 addr</code>), the name of the RDMA <span class="la-term" data-term="hca-gid">HCA</span> (<code>ibstat</code>) and the link IPs. In the figure, switch between the four traffic “planes” to see which variable governs each one.</p>
+
+  <figure class="la-fig wide" id="fig-topologia" data-title="Topology: who talks over what">
+    <div class="la-fig-stage" style="height:420px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Two nodes, one cable, four kinds of traffic. “Data” is the NCCL collectives over RDMA; “control” is the rendezvous and the bootstrap TCP sockets; “weights &amp; ops” is SSH, rsync/NFS and copying the image; “API” is the client talking only to the head. Turn on cross-wiring to see why <code>WORKER_IFACE</code> and <code>WORKER_IB_HCA</code> exist.</figcaption>
+  </figure>
+  <p>Look at the data plane: there are about <b>106 collectives per decode step</b> — 36 all-reduces of the GDN outputs, 12 of the attention outputs, 48 of the MoE, 1 all-gather of logits and 9 of the drafts —, each 5 to 20 KB. At 20–30 µs per collective, that adds up to 2 to 3 ms per step (6–8% of the time), and that floor <i>does not shrink with the batch</i>: it's latency, not bandwidth. Prefill is the opposite: each 8192-token chunk does 96 all-reduces of 42 MB, about 150–180 ms of communication. The α-β model that explains the difference is in <a data-ch="nccl-rdma">NCCL and RDMA</a>.</p>
+
+  <table class="la-params">
+    <thead><tr><th>Parameter</th><th>Value</th><th>What it does</th><th>Why this value</th></tr></thead>
+    <tbody>
+      <tr><td><code>HEAD_IP</code> / <code>WORKER_IP</code></td><td><code>10.0.0.1</code> / <code>10.0.0.2</code></td><td>IP of each rank; they become <code>--master-addr</code> and <code>VLLM_HOST_IP</code></td><td>required; in the kit, <code>10.0.0.x</code> is an alias — NFS should not use it</td></tr>
+      <tr><td><code>WORKER_USER</code></td><td>empty (author: <code>zurih</code>)</td><td>SSH user from the head to the worker</td><td>the whole launcher assumes passwordless SSH head→worker: it copies overlays, sends the worker script and runs <code>docker</code> remotely</td></tr>
+      <tr><td><code>IFACE</code> / <code>WORKER_IFACE</code></td><td><code>enp1s0f0np0</code> (author: head <code>f1</code>, worker <code>f0</code>)</td><td>Ethernet interface of the cable on each side</td><td><i>cross-wired</i> nodes: the physical port has a different name on each side</td></tr>
+      <tr><td><code>IB_HCA</code> / <code>WORKER_IB_HCA</code></td><td><code>=rocep1s0f0</code></td><td>becomes <code>NCCL_IB_HCA</code>; the leading <code>=</code> asks for an exact <i>match</i> of a single device</td><td>pointing to an HCA cabled to another cluster hangs NCCL at init with no useful message</td></tr>
+      <tr><td><code>IB_GID_INDEX</code></td><td><code>3</code> (try <code>5</code>)</td><td>GID table entry used by RoCE</td><td>3 is usually RoCE v2/IPv4; some clusters route on 5</td></tr>
+      <tr><td><code>MASTER_PORT</code></td><td><code>50000</code></td><td>port for the distributed rendezvous</td><td>required on both ranks</td></tr>
+      <tr><td><code>NCCL_IB_DISABLE=0</code>, <code>NCCL_IB_AUTO_DETECT=0</code>, <code>NCCL_DEBUG=WARN</code></td><td>fixed</td><td>turns on the RDMA transport, turns off HCA autodetection, quiets the log</td><td>without RDMA, NCCL would fall back to TCP; without autodetection, the exact HCA is used</td></tr>
+      <tr><td><code>GLOO_/NCCL_/TP_SOCKET_IFNAME</code></td><td><code>$IFACE</code> / <code>$WORKER_IFACE</code></td><td>NIC for the control sockets (Gloo, bootstrap)</td><td>on the wrong NIC: hangs or slow traffic</td></tr>
+      <tr><td><code>VLLM_HOST_IP</code></td><td><code>$HEAD_IP</code> / <code>$WORKER_IP</code></td><td>IP each node announces to vLLM's control plane</td><td>the per-step scheduler→worker broadcast already crosses the CX7 (~0.15–0.4 ms round trip)</td></tr>
+      <tr><td><code>REQUIRE_IDLE_GPU</code></td><td><code>true</code></td><td>aborts if <code>nvidia-smi --query-compute-apps</code> shows a process on either node</td><td>without it, a forgotten tenant (in this case, a DeepSeek-V4 on the worker) only shows up as <code>CUDA out of memory</code> 10 minutes later</td></tr>
+    </tbody>
+  </table>
+  <div class="la-callout warn"><b class="t">Pitfall</b><p>Network failures in vLLM look like <i>hangs</i>, not errors: init sits still for a minute and nothing explains why. Validate RDMA in isolation first (<code>nccl-tests all_reduce_perf</code> with <code>NCCL_IB_HCA==&lt;hca&gt;</code>, <code>NCCL_IB_GID_INDEX=3</code> and <code>NCCL_DEBUG=INFO</code>). The repository also lists suggested fabric knobs that were <i>not adopted</i> — a second CX7 link with <code>NCCL_CROSS_NIC=1</code>, the LL/LL128 protocols, GPUDirect RDMA — with an estimated 3–8% decode gain. An estimate, not a measurement.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Step 2 — The image and the lanes: day-0, vLLM 0.30 and TP1</h2>
+  <p>The Python code that knows what a QSA layer, an N-gram table or an MTP is lives <i>inside the Docker image</i>. Choosing the image means choosing which implementation of the model you will run — and, therefore, which fixes you will need. The recipe knows two:</p>
+  <div class="la-compare">
+    <div data-recipe="qwen"><h4>day-0 image</h4><p><code>vllm/vllm-openai:qwen38-flash-next</code>: NVIDIA's development build from launch day (vLLM <code>0.1.dev20073+g8e685d198</code>, V1 engine, FlashInfer 0.6.17, torch 2.13+cu130, NCCL 2.30.7; ~20.6 GB). Code in <code>qwen3_8_flash_next/nvidia/</code>. It works, but it trips over several checkpoints — hence the patches.</p></div>
+    <div><h4>Stable vLLM 0.30.0</h4><p><code>vllm/vllm-openai:v0.30.0</code>: the release that absorbed the model as <code>qwen4_exp</code>. It loads the nvidia checkpoint natively and already ships the prefix cache fixes, but its QSA kernels only accept a BF16 KV.</p></div>
+  </div>
+  <p>A <span class="la-term" data-term="lane-de-receita">lane</span> is a combination of image, checkpoint, overlays and defaults <i>validated together</i>. Instead of copying <code>start.sh</code>, the recipe creates few-line <b>wrappers</b> that export <code>OVERRIDE_*</code> variables and run <code>exec start.sh</code>. That way the cluster configuration (IPs, HCAs, ports) lives in a single <code>.env</code> and each lane only declares what changes. The figure is a decision map: pick your goal and see which train to take.</p>
+
+  <figure class="la-fig wide" id="fig-lanes" data-title="Decision map: the lanes as subway lines">
+    <div class="la-fig-stage" style="height:330px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Each colored line is a lane; each station, a decision (wrapper, image, weights, KV, result). Pick a goal and the map points to the recommended lane; or pick the lane directly. Numbers measured by the repository between 2026-09-05 and 2026-09-27; see the text for the conditions of each measurement.</figcaption>
+  </figure>
+  <p>No lane is “the best”: day-0 holds more context (FP8 KV) and is the only one with determinism and a kernel profile; 0.30 has half the multi-turn TTFT and equal or higher decode, but a BF16 KV by default; the official FP8 uses Qwen's own weights and pays for it in cache; TP1 fits on a single Spark.</p>
+
+  <table class="la-params">
+    <thead><tr><th>Parameter</th><th>Value in the recipe</th><th>What it does</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td><code>start-v030.sh</code></td><td>exports <code>V030=true</code>, <code>OVERRIDE_IMAGE=vllm/vllm-openai:v0.30.0</code>, <code>OVERRIDE_KV_CACHE_DTYPE=auto</code>, <code>OVERRIDE_GPU_MEMORY_UTILIZATION=0.80</code>, <code>SKIP_PLE_PATCH=true</code></td><td>wrapper for the stock 0.30 lane; mounts only <code>patch_mtp_draft_vocab_v030.py</code> (the reduced vocabulary reapplied to <code>qwen4_exp</code>) and, if requested, the FP8 KV backport</td><td>gains listed in the figure; bug #62 fixed upstream (vllm#54713, vllm#53945)</td></tr>
+      <tr><td><code>V030</code></td><td><code>true</code> only in this lane</td><td>tells <code>start.sh</code> that the code is <code>qwen4_exp</code>: swaps the overlays and skips the MTP alias, block-drop, PLE and MXFP8</td><td><code>FP8_DENSE</code>, <code>QSA_PROFILE</code> and determinism were not ported: <b>explicit error</b> instead of mounting a nonexistent file</td></tr>
+      <tr><td><code>OVERRIDE_IMAGE</code></td><td><code>vllm/vllm-openai:v0.30.0</code></td><td>swaps the image after the <code>.env</code></td><td>it's what turns the same <code>start.sh</code> into the stock lane, with only 1–2 overlays</td></tr>
+      <tr><td><code>OVERRIDE_KV_CACHE_DTYPE</code></td><td><code>auto</code> (BF16) or <code>fp8</code> opt-in</td><td>swaps the KV dtype; with <code>fp8</code> on 0.30 it mounts the backport of vllm#55557 (<code>patch_qsa_fp8_kv_v030.py</code>)</td><td>BF16: 1.34–1.52 M tokens at GMU 0.80 (three measurements); FP8: 2.64 M, NLL 1.328/1.334, needles 3/3 at 200k, ~5% slower</td></tr>
+      <tr><td><code>OVERRIDE_GPU_MEMORY_UTILIZATION</code></td><td><code>0.80</code></td><td>swaps the GMU after the <code>.env</code></td><td>the lane was validated at 0.80 in a 1 h soak (1,349 requests, 0 server errors)</td></tr>
+      <tr><td><code>V030_BREAKABLE_CUDAGRAPH</code></td><td><code>0</code></td><td>value of <code>VLLM_USE_BREAKABLE_CUDAGRAPH</code> in the lane</td><td>0.30 turns it on by default for this model; on the GB10 that made decode vary 10–18% between identical runs and lose 13–19% at S≥2 (<a data-ch="cuda-graphs-warmup">CUDA graphs</a>)</td></tr>
+      <tr><td><code>docker save | ssh docker load</code></td><td><code>docker save vllm/vllm-openai:v0.30.0 | ssh &lt;worker&gt; docker load</code></td><td>copies the image over the CX7 cable</td><td>the image must exist on both nodes, and the author's worker has no internet access</td></tr>
+      <tr><td><code>start-fp8.sh</code></td><td><code>OVERRIDE_MODEL_ID=Qwen/Qwen3.8-Flash-Next-FP8</code>, <code>OVERRIDE_SERVED_MODEL_NAME</code>, <code>OVERRIDE_MAX_MODEL_LEN=262144</code>, <code>OVERRIDE_YARN_ENABLE=false</code>, <code>SKIP_PLE_PATCH=true</code></td><td>wrapper for the lane with the official FP8 checkpoint</td><td>FP8 experts take up twice as much as NVFP4: there is KV left for ~500K tokens, hence native context and YaRN off</td></tr>
+      <tr><td><code>SKIP_PLE_PATCH</code></td><td><code>false</code>; <code>true</code> in the FP8 and 0.30 lanes</td><td>skips stage 6 of <code>start.sh</code> (the <code>ple_layer.py</code> patch)</td><td>the official FP8 declares an <code>Fp8Config</code> <code>quantization_config</code> for the whole checkpoint, so the stock PLE dispatch already picks FP8; 0.30 loads the PLE natively</td></tr>
+      <tr><td><code>start-tp1.sh</code> / <code>tp1/start.sh</code></td><td>one Spark, TP=1</td><td>mounts the PLE offload patches, the packed mmap table and the <code>memwatch.sh</code> watchdog</td><td>requires <code>local-inference-lab</code> (98.6 GiB), <code>--distributed-executor-backend mp</code> and a GMU derived from the budget</td></tr>
+      <tr><td><code>tp1/start.sh</code> (precedence)</td><td>environment &gt; <code>tp1/.env</code> &gt; default</td><td>self-contained version of TP1; adds <code>--enable-prompt-tokens-details</code> and writes <code>.last_launch.sh</code></td><td>the root <code>start-tp1.sh</code> deliberately overrides the values of the 2-node <code>.env</code>; the <code>tp1/</code> folder keeps the configurations apart</td></tr>
+      <tr><td><code>TP1_CONTAINER_NAME</code></td><td><code>vllm-fn-tp1</code></td><td>name of the TP1 lane's container</td><td>doesn't collide with the two-node <code>vllm-fn</code></td></tr>
+    </tbody>
+  </table>
+
+  <h3>The control panel: who wins?</h3>
+  <p>Wrappers only work because <code>start.sh</code> has a strict <span class="la-term" data-term="precedencia-de-configuracao">precedence order</span> — and it's a surprising one. The script reads the environment, then runs <code>source .env</code>: <b>the <code>.env</code> beats the command line</b> for every key it defines. Two exceptions are captured before the <code>source</code> and reapplied afterward: <code>ABLIT</code> and <code>HF_TOKEN</code>. Finally, the <span class="la-term" data-term="variavel-override"><code>OVERRIDE_*</code> variables</span> are read <i>after</i> the <code>.env</code>, and final guards pick the checkpoint and turn YaRN off when it makes no sense. Pick a variable in the figure and switch the layers on to watch the ball roll down.</p>
+
+  <figure class="la-fig" id="fig-precedencia" data-title="The start.sh precedence ladder">
+    <div class="la-fig-stage" style="height:420px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Each rung is a stage of <code>start.sh</code>, in the order it runs. The value only changes when a layer <i>defines</i> the variable; the last one to define it wins. The simulation follows lines 43–170 of the script.</figcaption>
+  </figure>
+
+  <table class="la-params">
+    <thead><tr><th>Parameter</th><th>Value</th><th>What it does</th><th>Why it matters</th></tr></thead>
+    <tbody>
+      <tr><td><code>.env</code></td><td><code>source .env</code> after reading the environment</td><td>the file's keys overwrite whatever came from the command line</td><td><code>KV_CACHE_DTYPE=fp8 ./start.sh</code> is silently ignored if the <code>.env</code> defines the key — it cost a whole launch cycle; check the <code>KV dtype:</code> line in the summary</td></tr>
+      <tr><td><code>_CLI_ABLIT</code></td><td>captures <code>ABLIT</code> before the <code>source</code></td><td>stores the command-line value and reapplies it after the <code>.env</code></td><td>makes <code>ABLIT=1 ./start.sh</code> work even with <code>ABLIT=0</code> in the file</td></tr>
+      <tr><td><code>_CLI_HF_TOKEN</code></td><td>same for <code>HF_TOKEN</code> (in <code>start.sh</code>, <code>download.sh</code>, <code>check-weights.sh</code>)</td><td>preserves the token passed in the environment</td><td>an empty <code>HF_TOKEN=</code> in the <code>.env</code> doesn't wipe the token for a <i>gated</i> repository</td></tr>
+      <tr><td><code>OVERRIDE_MODEL_ID</code></td><td>empty; <code>start-fp8.sh</code> exports the official FP8</td><td>replaces <code>MODEL_ID</code> after the <code>.env</code></td><td>selection order: <code>FP8_DENSE=true</code> &gt; <code>OVERRIDE_MODEL_ID</code> &gt; <code>ABLIT=1</code> &gt; <code>MODEL_ID</code>; with an override, <code>ABLIT</code> is ignored and ablit is never served with an incompatible checkpoint</td></tr>
+      <tr><td><code>OVERRIDE_SERVED_MODEL_NAME</code></td><td><code>qwen3.8-flash-next-fp8</code> (FP8 lane)</td><td>changes the name in <code>/v1/models</code></td><td>clients tell the lanes apart by the <code>"model"</code> field without editing the <code>.env</code></td></tr>
+      <tr><td><code>OVERRIDE_MAX_MODEL_LEN</code></td><td><code>262144</code> (FP8 lane)</td><td>swaps <code>MAX_MODEL_LEN</code></td><td>with FP8 weights there isn't enough KV left for 1M</td></tr>
+      <tr><td><code>OVERRIDE_YARN_ENABLE</code></td><td><code>false</code> (FP8 lane)</td><td>swaps <code>YARN_ENABLE</code></td><td>if it doesn't extend past 262,144, YaRN only costs precision (<a data-ch="posicao-rope">RoPE and YaRN</a>)</td></tr>
+    </tbody>
+  </table>
+  <div class="la-callout analogy"><b class="t">Analogy</b><p>Think of a cake recipe covered in sticky notes. The notebook (<code>.env</code>) is the household's source of truth; anyone shouting in the kitchen (the command line) is ignored if the notebook has that line — except for two messages the head of the household always says to obey (<code>ABLIT</code>, <code>HF_TOKEN</code>). The lane wrappers are sticky notes stuck <i>on top of</i> the notebook: they outrank everything, but only for that day's party. The engineering lesson is in <a data-ch="engenharia-de-receita">recipe engineering</a>: document the precedence and print the effective value in the log.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Step 3 — Weights: choose, check, distribute</h2>
+  <p>The same architecture can arrive under different <i>contracts</i>. Each quantizer decides which format to give each piece and — what hurts most — <b>how to record that in the metadata</b>. That's why switching checkpoints almost always wakes up a different patch. The figure shows the same model in six outfits: each component's bar is proportional to its estimated bytes (parameters × bytes per parameter of the format), and the panel lists what each choice demands from the recipe.</p>
+
+  <figure class="la-fig wide" id="fig-checkpoints" data-title="Same architecture, six checkpoints">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Bytes per parameter used in the estimate: BF16 = 2; FP8 = 1; NVFP4 = 0.5625 (4 bits + an FP8 scale every 16); MXFP8 ≈ 1.03 (8 bits + a scale every 32). Vertical stripes = MXFP8; hatched = format not detailed in the sources (the estimate assumes the format shown in the panel). “Published” comes from the repository; the rest is arithmetic.</figcaption>
+  </figure>
+  <p>Notice how the estimate matches the published size when the formats are known (nvidia ≈123.5 GiB; RadixArk ≈125.9 GiB, because its MTP experts are BF16) and how the official FP8 jumps to ≈173 GiB: FP8 experts cost twice as much as NVFP4 (112.5 GiB versus 63.3), and the dense layers do <b>not</b> shrink. The performance report read this checkpoint's headers (correction of 2026-09-02): <code>modules_to_not_convert</code> lists <code>linear_attn.*</code>, <code>hyper_connection*</code> and <code>lm_head</code>, and the tensor scan confirms GDN, attention, HC and <code>lm_head</code> in BF16. Only the routed experts and the MTP's experts are FP8. The phrase in <code>start-fp8.sh</code> (“block-128 over the whole checkpoint”) describes the <code>quantization_config</code> (a global <code>Fp8Config</code>), not the dtype of each tensor. Split across two GPUs, that's about 25 GiB more weights per node — which is what leaves only ~500K tokens of KV in this lane. The math of the formats is in <a data-ch="fp8-fp4-microescala">FP8, FP4 and microscaling</a>.</p>
+
+  <h3>Download, check and distribute</h3>
+  <p>The download (<code>download.sh</code>) goes to the head only. Three checks prevent the most expensive failures:</p>
+  <ul>
+    <li><b>Completeness</b>: <code>resolve_snapshot.py</code> only accepts a snapshot if every shard in <code>model.safetensors.index.json</code> exists (exit 0 complete, 1 incomplete, 2 missing). An interrupted download used to look finished — and rsync would copy the hole.</li>
+    <li><b><code>refs/main</code> without a trailing newline</b>: <code>huggingface_hub</code> 1.28 reads the file without <code>strip()</code>; an <code>echo $SHA &gt; refs/main</code> leaves a <code>\n</code> and vLLM dies with “repo not found” in offline mode. Use <code>printf</code>. <code>start.sh</code> normalizes it on both nodes.</li>
+    <li><b>Hash</b>: a corrupted shard keeps a similar size and only blows up at ~33% of the load (<code>safe_open</code>: “incomplete metadata”). <code>./check-weights.sh --verify</code> compares the SHA-256 of the LFS blobs and the SHA-1 of the git blobs against the Hugging Face API manifest — ~1 min for 135 GB at 2.4 GiB/s.</li>
+  </ul>
+  <p>For the worker, there are two paths. <b>rsync</b> (the default) copies ~126 GiB to the worker's disk once: independent nodes and a faster boot. <b>NFS</b> exports the head's cache over the cable: zero disk on the worker, great for switching checkpoints, but the head must stay up and every cold boot streams ~126 GiB. The repo's performance report attributes part of the 458 s of measured loading precisely to that streaming. Before launching, <code>start.sh</code> also evicts the checkpoint's own pages from the <span class="la-term" data-term="page-cache">page cache</span> (<code>posix_fadvise(DONTNEED)</code>, no root needed): in unified memory, clean pages left by an rsync compete with the GPU — measured 4.15 → 0.00 GiB.</p>
+
+  <table class="la-params">
+    <thead><tr><th>Parameter</th><th>Value</th><th>What it does</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td><code>--nfs</code></td><td>flag of <code>start.sh</code> and <code>stop.sh</code></td><td>forces NFS mode; in <code>stop.sh</code>, tears down the share and removes the volume</td><td>switches the distribution without editing the <code>.env</code></td></tr>
+      <tr><td><code>--no-nfs</code></td><td>flag of <code>start.sh</code></td><td>forces rsync even with <code>NFS_SHARE=true</code></td><td>rsync cuts the cold boot (no 126 GiB streaming)</td></tr>
+      <tr><td><code>NFS_IMAGE</code> / <code>NFS_CONTAINER</code> / <code>NFS_VOLUME</code></td><td><code>vllm-fn-nfs:local</code>, <code>vllm-fn-nfs</code>, <code>vllm-fn-hf</code></td><td>names of the server image and container on the head and of the NFS Docker volume on the worker</td><td>identify the resources that <code>nfs-share.sh</code> creates and <code>stop.sh --nfs</code> removes</td></tr>
+      <tr><td><code>nfs-server/{Dockerfile,entrypoint.sh}</code></td><td>Alpine + <code>nfs-utils</code>, privileged, host network</td><td>runs the kernel nfsd exporting <code>/export</code> with <code>ro,sync,no_subtree_check,no_root_squash,insecure,fsid=0</code></td><td><code>fsid=0</code> makes the export the <span class="la-term" data-term="nfs-pseudoroot">NFSv4 pseudo-root</span>; the worker mounts it with <code>nfsvers=4.2,ro,nconnect=8,rsize=1048576,hard</code></td></tr>
+      <tr><td><code>fp8dense/build.sh</code></td><td>creates <code>models--MiaAI-Lab--Qwen3.8-Flash-Next-NVFP4-FP8dense</code></td><td>resolves the source snapshot, creates <code>refs/main</code> without a newline, runs the converter and the verifier and does a <code>chown</code></td><td>reproducible build of the hybrid checkpoint, with clear messages when the source is partial</td></tr>
+      <tr><td><code>IMAGE</code> / <code>HF_HOME</code> (in <code>build.sh</code>)</td><td><code>vllm/vllm-openai:qwen38-flash-next</code> / <code>~/.cache/huggingface</code></td><td>image in which the conversion runs, and the cache root</td><td>converts inside the serving image itself: same torch and safetensors versions</td></tr>
+      <tr><td><code>--memory=1200m --cpus=4 CUDA_VISIBLE_DEVICES=</code></td><td>build container limits</td><td>1.2 GB cgroup, 4 CPUs and no visible GPU</td><td>streaming conversion (16 MiB slices) in ~2 min, feasible next to a live server</td></tr>
+    </tbody>
+  </table>
+  <div class="la-callout deep"><b class="t">Deep dive — the FP8-dense checkpoint</b><p>Per decode step, the dense BF16 matrices account for ~6.9 of the ~9.2 GiB read. The recipe's converter turns 591 linears (GDN, attention, HyperConnections, shared experts, <code>lm_head</code>) into FP8 E4M3 with <b>one scale per output channel</b> and dynamic per-token activation: no calibration, and it accepts the rank-320 projections, which are not multiples of 128. Whatever is sensitive stays in BF16 (embeddings, routers, indexer, gates, norms, MTP, vision). Measured error: relative RMSE 0.0240/0.0262/0.0268 (min/median/max), cosine ≥ 0.9996. Expected gain: 9.2 → 5.7 GiB per step, ~1.5× at batch 1 — <b>analytical, never measured on a GPU</b>. And the generator <code>files/overlay/apply_patches.py</code> is not in the repository (see Step 4).</p></div>
+  <div class="la-callout recipe" data-recipe="qwen"><b class="t"><span class="la-rb qwen"></span> In the recipe — the abliterated checkpoint</b><p><code>ABLIT=1</code> swaps the checkpoint for a <i>gated</i> derivative with the same layout as nvidia's, in which only the 12 <code>self_attn.o_proj</code> tensors of the QSA layers (3, 7, 11, …, 47) received a projection that removes the refusal direction (<a data-ch="abliteracao">abliteration</a>). It needs <code>HF_TOKEN</code> and accepted terms; it applies to this recipe only. Since the server listens on <code>0.0.0.0</code> with no authentication, safeguards become the operator's responsibility.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Step 4 — Fixing how the checkpoint is read and loaded</h2>
+  <p>On the day-0 lane, the nvidia checkpoint doesn't load “out of the box”. And the way it fails is the worst possible: almost always <b>~7 minutes after</b> starting, with the weights already in memory. Fixes 1 to 3 below are <b>required for nvidia</b>; fix 4 serves checkpoints with MXFP8 layers and is always mounted, just in case. Each one was born from a real crash, and the golden rule they teach is to turn late failures into a <span class="la-term" data-term="preflight">preflight</span> that takes seconds.</p>
+  <ol class="la-steps">
+    <li><b>Fix 1 — N-gram table: tell vLLM the dtype</b> The nvidia checkpoint declares the PLE as FP8 only inside <code>quantization_config.config_groups</code>. <code>detect_ple_dtype.py</code> looks for the group whose target is <code>ple_embedding.ngram_embedding</code> (<code>num_bits</code> 8 → <code>float8_e4m3fn</code>, 4 → <code>nvfp4</code>) and the recipe injects <code>--hf-overrides '{"text_config":{"ple_embedding_dtype":"float8_e4m3fn"}}'</code>. <code>patch_ple_layer.py</code> ports the dispatch from vLLM PR #53899: methods that keep the table quantized (NVFP4 rows packed into <code>uint8</code> with FP8 scales every 16 and an FP32 global scale; or FP8 shards with a single global scale) and dequantize only the 16 rows fetched per token. Without it the table turns into BF16 (~102 GB) and the load dies. (The README's <code>PLE_QUANT_OVERRIDE</code> is obsolete; see <a data-ch="ngram-mtp">N-gram and MTP</a>.)</li>
+    <li><b>Fix 2 — MTP: matching the names</b> vLLM instantiates the MTP layer at the absolute index <code>num_hidden_layers + i</code> = <code>mtp.layers.48</code> and looks up its quantization by <i>exact string</i>; the checkpoint only annotates <code>mtp.layers.0</code>. <code>patch_checkpoint_config.py</code> adds <code>.0.</code> → <code>.48.</code> aliases to <code>config.json</code> and <code>hf_quant_config.json</code> (mounted over the snapshot, without touching the cache) and normalizes the <code>FP8_PB_WO</code> label (group 128) to <code>FP8_BLOCK_SCALES</code>. The <code>--mtp-moe-algo</code> mode runs as a preflight and exits with code 3 if the algorithm can't be built.</li>
+    <li><b>Fix 3 — MTP: building the block scales</b> Even once it finds the name, the ModelOpt dispatch only knew how to build FP8, NVFP4, W4A16_NVFP4 and MXFP8 experts. <code>patch_modelopt_fp8_block_moe.py</code> adds the <code>Fp8Config(weight_block_size=[g,g])</code> branch with <code>g</code> read from <code>group_size</code> — and <b>refuses to guess</b>: a wrong block size silently applies misaligned scales.</li>
+    <li><b>Fix 4 — MXFP8: respecting the kernel envelope</b> A fallback for MXFP8 layers whose shape the kernel doesn't accept, vision included. It matters for checkpoints with MXFP8 layers, such as the local-inference-lab one used by the TP1 lane; on nvidia, whose dense layers are BF16, it probably does nothing. See the second figure in this section.</li>
+  </ol>
+  <p>The figure below acts out fixes 2 and 3 with real matrices: the name that doesn't match, the crash, the fix and the <span class="la-term" data-term="fp8-block-scales">FP8 scales per 128×128 block</span> applied to the right place — or to the wrong one.</p>
+
+  <figure class="la-fig wide" id="fig-mtp-alias" data-title="From name to number: the MTP that couldn't find its scales">
+    <div class="la-fig-stage" style="height:360px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>In the matrix, each cell represents 32×32 weights and each colored block 128×128 — one scale per block. “Simulate wrong block” applies the same scales with the block size swapped (illustrative). The correct final acceptance bars are the measured ones (89/74.5/60%); the wrong-block ones are illustrative.</figcaption>
+  </figure>
+  <p>Pay attention to the last step: the per-position acceptance curve is the MTP's <b>blood test</b>. With the right scales it decreases smoothly (89% → 74.5% → 60%), because each drafted token depends on the previous one. A low, flat, “nearly random” curve gives away drafter weights that were read wrong — even if nothing crashed. The fundamentals are in <a data-ch="especulacao-fundamentos">speculative decoding</a>.</p>
+
+  <h3>The kernel envelope: when the matrix shape picks the path</h3>
+  <p>High-performance quantized kernels only accept matrices whose dimensions fit their <i>tiles</i>. FlashInfer's <code>mm_mxfp8</code>, measured on <code>sm_121</code>, requires \(N \ge 128\), \(K \ge 128\) and both multiples of 32 — regardless of \(M\), the number of tokens. The 72 <code>linear_attn.in_proj_a/b</code> have shape <code>[48, 2560]</code> (\(N = 48\)) and killed the boot with <code>AssertionError … N &gt;= 128, got N=48</code> after ~7 min; the 27 <code>visual…mlp.linear_fc1</code> <code>[4304, 1152]</code> gave <code>Problem size is not supported</code>, because \(4304 \bmod 32 = 16\). <code>patch_modelopt_mxfp8.py</code> checks the shape <b>already split by TP</b>, layer by layer, and swaps the kernel for an <span class="la-term" data-term="kernel-de-emulacao">emulation kernel</span> that dequantizes to BF16 once at load time (+≈17 MB); the whole <code>visual.*</code> tower goes to emulation by prefix.</p>
+  <p><i>Which</i> checkpoint do these shapes come from? The sources disagree: the README says “this checkpoint”, the patch docstring talks about RadixArk, the TP1 HANDOFF puts the MXFP8 attention in local-inference-lab, and NVIDIA's model card says nvidia is BF16 outside the experts. The most coherent reading (interpretation): the crash comes from checkpoints with MXFP8 layers, and on nvidia the patch is mounted but inert. Always mounting it is cheap, because it only acts on MXFP8 layers. Explore the envelope:</p>
+
+  <figure class="la-fig" id="fig-envelope" data-title="The kernel envelope: tiles, remainders and fallback">
+    <div class="la-fig-stage" style="height:400px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>The weight matrix <code>[N × K]</code> cut into the tiles the kernel requires. Red strips are remainders that don't complete a tile, or dimensions below the minimum. When the matrix is very flat (like <code>in_proj</code>, 48 × 2560), the figure also shows a zoom of the corner at the real aspect ratio. The presets are real shapes from the recipe; the sliders let you try others. Under the NVFP4 rule, the dimension checked is the input one (K).</figcaption>
+  </figure>
+  <p>The same reasoning explains <code>--mm-encoder-tp-mode data</code>. With <code>weights</code>, the vision MLP (intermediate size 4304) would be split across the two GPUs: \(4304 / 2 = 2152\), which is not a multiple of 16 — the divisibility that the recipe's <code>.env</code> says the NVFP4 kernels require — and the load crashes. With <code>data</code>, the 0.84 GiB encoder is replicated whole on each GPU. Divisibility is one of the “taxes” of parallelism; the extreme case shows up in <a data-ch="tp3-tp4">TP=3 and TP=4</a>.</p>
+
+  <div class="la-callout deep"><b class="t">Deep dive — the bug of the YaRN that never was</b><p>Until September 2026, turning on <code>YARN_ENABLE</code> emitted <code>--hf-overrides '{"rope_parameters":{…}}'</code> at the root level. <code>ModelConfig._apply_dict_overrides</code> only descends into nested configs, and in <code>qwen4_exp</code> the parent also exposes <code>rope_parameters</code> as a plain dict: the value stayed on the parent and <b>never reached <code>text_config</code></b>. Every old “1M” run used unscaled RoPE. The fix is a single nested payload: <code>{"text_config":{"ple_embedding_dtype":"float8_e4m3fn","rope_parameters":{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":262144}}}</code>. That's why the default became <code>MAX_MODEL_LEN=262144</code> and the 1M context is <b>not validated</b>. Moral: an override that doesn't raise an error doesn't prove it was applied (<a data-ch="checkpoints">checkpoints and <span class="la-term" data-term="hf-overrides">--hf-overrides</span></a>).</p></div>
+
+  <h3>How the fixes are applied</h3>
+  <p>None of these patches rebuilds the ~20.6 GB image. They all follow the same ritual — extract, edit by anchor, validate, mount read-only — that the <a data-ch="engenharia-de-receita">recipe engineering</a> chapter generalizes as <span class="la-term" data-term="patch-por-ancora">source-exact, fail-closed patches</span>.</p>
+  <table class="la-params">
+    <thead><tr><th>Parameter</th><th>Value</th><th>What it does</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td><code>extract_from_image</code></td><td><code>docker create</code> + <code>docker cp</code></td><td>pulls the original <code>.py</code> to be patched out of the image</td><td>the patch always starts from the exact file of that image, with no rebuild</td></tr>
+      <tr><td>exact-anchor patch (<code>tests/*</code>)</td><td>each anchor occurs exactly once; <code>ast.parse</code>; <code>:ro</code> bind-mount on both nodes</td><td>replaces text snippets; aborts without writing anything if an anchor doesn't match</td><td>after an image update, a changed anchor <b>fails loudly</b> instead of producing a broken file; tested on CPU</td></tr>
+      <tr><td><code>patch_*.py</code></td><td>pattern shared by all patches</td><td>original → <code>files/&lt;name&gt;.orig</code> → patch → output mounted <code>:ro</code> over the vLLM package</td><td>auditable (the diff is the script) and reproducible</td></tr>
+      <tr><td><code>add_overlay</code></td><td>registers (patched file → path in the container)</td><td><span class="la-term" data-term="overlay-bind-mount">bind-mount</span>; refuses two overlays on the same path and basename collisions</td><td>on the worker the copies go into the flat directory <code>/tmp/vllm-overlay/</code>: repeated names would silently overwrite each other. It doesn't see the mount from stage 6b of <code>start.sh</code> (conflict with <code>FP8_DENSE</code>)</td></tr>
+      <tr><td><code>files/*.orig</code> and outputs</td><td><code>*.orig</code> = originals extracted from the image (e.g. <code>modelopt_patched.py.orig</code>); <code>ple_layer_patched.py</code> = patched output</td><td>reused across launches</td><td>delete both when updating the image, to force a re-extraction; otherwise the patch is applied on top of the old original</td></tr>
+      <tr><td><code>parse_diff</code> / <code>find</code> / <code>apply</code></td><td>mini hunk applier + <code>os.replace</code></td><td>embeds the upstream diff (vllm#55557), detects “already applied”, writes to a <code>.tmp</code> and swaps it in atomically</td><td>idempotent and atomic; the test confirms it fails without writing if the context changed</td></tr>
+      <tr><td><code>test_draft_vocab.py</code></td><td>vocab 100, TP 2, 23 unbalanced ids</td><td>runs the real patched functions with a fake vocab-parallel <code>lm_head</code> and stubbed collectives</td><td>compares against the full-vocabulary argmax restricted to the set and tests the empty rank; run it inside the image after changing the patch</td></tr>
+      <tr><td><code>files/overlay/apply_patches.py</code></td><td><b>missing</b> (<code>.gitignore:50</code> ignores <code>files/overlay/*.py</code>)</td><td>should generate the FP8-dense overlay <code>.py</code> files from the <code>.diff</code> files</td><td>only the <code>.diff</code> files are versioned: <code>FP8_DENSE=true</code> probably fails on a clean clone (inferred from the code); apply them by hand with <code>docker cp</code> + <code>patch -p0</code></td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="la-sec">
+  <h2>Step 5 — The vllm serve arguments, phase by phase</h2>
+  <p>With the checkpoint readable, what's left is telling the engine <i>how</i> to serve. <code>start.sh</code> builds the line in a single <code>VLLM_ARGS</code> array, rendered once and pasted into both the head and the worker scripts — the two ranks <b>must</b> have identical flags. Play with the conveyor belt's knobs and watch the command line change.</p>
+
+  <figure class="la-fig wide" id="fig-esteira" data-title="The conveyor belt that builds the command line">
+    <div class="la-fig-stage" style="height:320px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>The boxes on the belt are the <code>.env</code> keys; the <code>start.sh</code> machine turns them into a single string that goes, identical, to the worker and to the head — each one only appends its own <code>--node-rank</code>. The rendered code below follows <code>start.sh:875–952</code>; snippets that changed with the last click are highlighted.</figcaption>
+  </figure>
+
+  <h3>Topology and distribution</h3>
+  <table class="la-params">
+    <thead><tr><th>Parameter</th><th>Value</th><th>What it does</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td><code>--tensor-parallel-size</code></td><td><code>2</code></td><td>each matrix is split between the two GPUs (by columns or rows)</td><td>1 GPU per node × 2 nodes; costs ~106 collectives per decode step (<a data-ch="paralelismos">parallelism</a>)</td></tr>
+      <tr><td><code>--enable-expert-parallel</code> + <code>--all2all-backend allgather_reducescatter</code></td><td>on (“required for NVFP4”)</td><td>each GPU holds 256 of the 512 experts</td><td>with DP=1 the all-to-all backend is <b>never invoked</b>: the tokens are already replicated by TP, each rank computes its own experts and the result comes back through the regular all-reduce. EP here changes <i>where the weights live</i>, not the collective</td></tr>
+      <tr><td><code>--nnodes 2</code>, <code>--node-rank</code>, <code>--master-addr</code>, <code>--master-port</code></td><td><code>2</code>, <code>0</code>/<code>1</code>, <code>$HEAD_IP</code>, <code>50000</code></td><td>vLLM's native multi-node mode, no Ray</td><td>one process per node; rendezvous on the head</td></tr>
+      <tr><td><code>--headless</code></td><td>worker only</td><td>rank 1 doesn't start an API server</td><td>only the head serves on <code>:8888</code> (<span class="la-term" data-term="worker-headless">headless worker</span>)</td></tr>
+      <tr><td><code>--distributed-executor-backend mp</code></td><td><code>mp</code></td><td>multiprocess executor</td><td>it's the only one that spawns the PLE offload process (TP1) and, with MTP, turns on asynchronous scheduling</td></tr>
+      <tr><td><code>--mm-encoder-tp-mode</code></td><td><code>data</code> (<code>MM_ENCODER_TP_MODE</code> in the <code>.env</code>)</td><td>replicates the vision encoder on each GPU</td><td><code>weights</code> would split the 4304 MLP into 2152, not a multiple of 16: crash at load (<a data-ch="multimodal">vision</a>)</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Memory, context and scheduler</h3>
+  <table class="la-params">
+    <thead><tr><th>Parameter</th><th>Value</th><th>What it does</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td><code>--gpu-memory-utilization</code></td><td><code>0.80</code></td><td>fraction budgeted for weights, activation and KV</td><td>see the Step 0 card</td></tr>
+      <tr><td><code>--max-model-len</code></td><td><code>262144</code> (native)</td><td>maximum context per request</td><td>sizes per-step structures even with short prompts (at 1M, a QSA scoring buffer of 250K columns per layer and 625-entry block tables); +2–5% expected</td></tr>
+      <tr><td><code>YARN_ENABLE</code> / <code>YARN_FACTOR</code></td><td><code>false</code> / <code>4.0</code></td><td>YaRN RoPE scaling inside <code>text_config.rope_parameters</code></td><td>262,144 × 4 ≈ 1M; forced to <code>false</code> if <code>MAX_MODEL_LEN ≤ 262144</code>; 1M not validated</td></tr>
+      <tr><td><code>VLLM_ALLOW_LONG_MAX_MODEL_LEN</code></td><td><code>1</code></td><td>allows a <code>max_model_len</code> above <code>max_position_embeddings</code></td><td>needed only with YaRN; harmless when it's off</td></tr>
+      <tr><td><code>--max-num-seqs</code></td><td><code>8</code> (TP1: 4)</td><td>simultaneous sequences in the batch</td><td>with an FP8 KV, 10–14 full 262k contexts fit, so the scheduler is the limit; it also sets the CUDA graph sizes (1…64 tokens = 8 × (1+3) × 2)</td></tr>
+      <tr><td><code>--max-num-batched-tokens</code></td><td><code>8192</code> (TP1: 2048)</td><td>tokens per engine step (prefill chunk)</td><td>“reasonable”: bigger chunks don't reduce all-reduce bytes (<a data-ch="scheduler-batching">scheduler and chunked prefill</a>)</td></tr>
+      <tr><td><code>--enable-chunked-prefill</code></td><td>always</td><td>chunks long prefills and interleaves them with decodes</td><td>without it, a 200k prompt freezes every conversation</td></tr>
+      <tr><td><code>--kv-cache-memory</code></td><td>not emitted (via <code>EXTRA_VLLM_ARGS</code>)</td><td>fixes the KV pool in bytes, ignoring the GMU</td><td>the log suggests values like <code>41360080896</code> (38.52 GiB) to use all the memory</td></tr>
+    </tbody>
+  </table>
+
+  <h3>KV, state and speculation</h3>
+  <table class="la-params">
+    <thead><tr><th>Parameter</th><th>Value</th><th>What it does</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td><code>--kv-cache-dtype</code></td><td><code>fp8</code> (day-0) / <code>auto</code> (0.30)</td><td>KV dtype of the 12 QSA layers + MTP</td><td>the stock QSA kernels refuse FP8 (<code>requires a BF16 main KV cache</code>); <code>start.sh</code> applies <code>patch_qsa_fp8_kv.py</code> when the value starts with <code>fp8</code>. The patch reads the cache as <code>float8_e4m3fn</code> and applies the per-tensor scale after the product (<code>k_scale</code> on the scores, via <code>softmax_scale</code> on 0.30; <code>v_scale</code> on the output), without materializing FP32 tiles. 1.70× tokens per GiB; −5.3% average throughput; a quantized K can change <i>which</i> blocks the indexer picks (<a data-ch="kv-cache-quantizado">quantized KV</a>)</td></tr>
+      <tr><td><code>--mamba-ssm-cache-dtype</code></td><td><code>bfloat16</code></td><td>dtype of the recurrent state of the 36 GDN layers</td><td>half the state bytes read per step and a smaller page; single-Spark measured +8.5% at 8 streams; <b>not measured in isolation</b> on the two-node kit. Empty = the checkpoint's float32</td></tr>
+      <tr><td><code>method</code> / <code>num_speculative_tokens</code></td><td><code>mtp</code> / <code>3</code> (← <code>MTP_NUM_SPECULATIVE_TOKENS</code>; 0 omits the flag)</td><td>the MTP layer drafts 3 tokens per step, verified by the target</td><td>24.5 → 52.1 tok/s (2.13×); if the 3rd position accepts less than ~35%, K=2 becomes faster</td></tr>
+      <tr><td><code>use_local_argmax_reduction</code></td><td><code>true</code> with the reduced vocab</td><td>local argmax per rank + all-gather of (value, index) pairs</td><td>the only path that reaches the reduced <code>lm_head</code>; cuts the gather from O(vocab) to O(2·tp) per token</td></tr>
+      <tr><td><code>VLLM_MTP_DRAFT_VOCAB</code></td><td><code>draft_vocab_en_code_47k.txt</code> (47,149 ids; ← <code>MTP_DRAFT_VOCAB</code>, mounted at <code>/etc/vllm-draft-vocab.txt</code>); opt-in per language: <code>draft_vocab_&lt;lang&gt;_en_code_65k.txt</code> (es, zh, ja, de, pt, fr, ru)</td><td>slices the drafter's <code>lm_head</code> down to frequent ids (<span class="la-term" data-term="vocabulario-reduzido-drafter">reduced vocabulary</span>)</td><td>the drafter's <code>lm_head</code> (0.59 GiB per GPU) was read 3× per step; it drops to 0.22 GiB on the critical rank. +9.6% and +8.4% in two measurements, <b>without changing the output</b></td></tr>
+      <tr><td><code>disable_eagle_block_drop</code></td><td><code>true</code> (← <code>MTP_DISABLE_BLOCK_DROP=1</code>)</td><td>doesn't discard the last matched prefix-cache block with an EAGLE-like drafter</td><td>backport of vllm#53388: 2nd-turn TTFT (“turn 1” in the CHANGELOG) of a 9.5k session 3.25 → 0.63 s (<a data-ch="prefix-caching">prefix caching</a>)</td></tr>
+      <tr><td><code>index_share_for_mtp_iteration</code></td><td><code>true</code> (← <code>MTP_INDEX_SHARE=true</code>)</td><td>reuses the QSA indexer's top-k from the 1st draft in the following ones</td><td>code +6.1/+4.6/+21.3/+26.6% (S=1/2/4/8); prose within the noise; only affects the drafter</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Compilation, loading and API</h3>
+  <table class="la-params">
+    <thead><tr><th>Parameter</th><th>Value</th><th>What it does</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td><code>--compilation-config</code></td><td><code>{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"}</code></td><td>no torch.compile; full CUDA graphs only for decode batches</td><td>kernel launch cost weighs on decode, not on prefill; capturing 1–64 takes ~7 s and 0.39–0.54 GiB. <code>mode 3</code> remained an experiment (+2–5 min of boot)</td></tr>
+      <tr><td><code>--load-format safetensors</code> + <code>--safetensors-load-strategy lazy</code></td><td>always</td><td>loads shards on demand</td><td>each rank reads only what it needs; 458 s of loading measured</td></tr>
+      <tr><td><code>--hf-overrides</code></td><td><code>{"text_config":{"ple_embedding_dtype":"float8_e4m3fn"}}</code></td><td>overrides <code>config.json</code> fields without touching the cache</td><td>everything the model reads lives in <code>text_config</code> — nest it (<span class="la-term" data-term="text-config">text_config</span>)</td></tr>
+      <tr><td><code>--served-model-name</code></td><td><code>qwen3.8-flash-next</code></td><td>name in <code>/v1/models</code></td><td>clients use this name in the <code>"model"</code> field</td></tr>
+      <tr><td><code>--reasoning-parser qwen3</code></td><td>always</td><td>splits <code>&lt;think&gt;…&lt;/think&gt;</code> into its own field</td><td>this build streams into <code>delta["reasoning"]</code>, not <code>reasoning_content</code> (<a data-ch="api-tools-estruturado">API</a>)</td></tr>
+      <tr><td><code>--enable-auto-tool-choice</code> + <code>--tool-call-parser qwen3_coder</code></td><td>always</td><td>converts the model's tool calls into the OpenAI format</td><td>the tool-calling regression passes with MTP on</td></tr>
+      <tr><td><code>--enable-prompt-tokens-details</code></td><td>always</td><td>exposes <code>usage.prompt_tokens_details.cached_tokens</code></td><td>prefix-cache observability only; when streaming, ask for <code>"stream_options":{"include_usage":true}</code></td></tr>
+      <tr><td><code>--host 0.0.0.0 --port 8888</code></td><td>head only</td><td>OpenAI API on the host network</td><td>no authentication: expose it with care</td></tr>
+    </tbody>
+  </table>
+
+  <h3>The container and the launcher</h3>
+  <table class="la-params">
+    <thead><tr><th>Parameter</th><th>Value</th><th>What it does</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td><code>--gpus all</code></td><td>fixed</td><td>exposes the GB10 GPU to the container</td><td>without it vLLM sees no CUDA device</td></tr>
+      <tr><td><code>--network host</code> / <code>--ipc host</code></td><td>fixed</td><td>host network and shared memory</td><td>NCCL, NFS and API without NAT; vLLM processes exchange data through shared memory</td></tr>
+      <tr><td><code>--cap-add SYS_NICE</code></td><td>fixed</td><td>allows adjusting thread priority, scheduling policy and affinity</td><td>part of the container's fixed set; the repository doesn't document which library uses it — interpretation: runtimes and NCCL may pin thread affinity/priority</td></tr>
+      <tr><td><code>--ulimit memlock=-1</code> + <code>--device /dev/infiniband</code></td><td>fixed</td><td>unlimited lockable memory and access to the RDMA devices</td><td>RDMA needs to register (pin) buffers with the NIC</td></tr>
+      <tr><td><code>--ulimit stack=67108864</code></td><td>64 MiB</td><td>per-thread stack</td><td>also fixed and undocumented; interpretation: headroom for compilers and native libraries with deep recursion</td></tr>
+      <tr><td><code>HF_HUB_OFFLINE=1</code>, <code>HF_HOME=/root/.cache/huggingface</code></td><td>fixed</td><td>offline mode; the container runs as root</td><td>mounts must target <code>/root/…</code> or the offline lookup fails</td></tr>
+      <tr><td><code>VLLM_ARGS</code> + <code>EXTRA_VLLM_ARGS</code></td><td>a single array; <code>EXTRA_VLLM_ARGS</code> (empty) appended last, verbatim</td><td>single source of the head and worker flags; the extra is the <span class="la-term" data-term="escape-hatch">escape hatch</span>, re-parsed by the shell (JSON in single quotes)</td><td>the flags used to be handwritten in the two heredocs: the extra vanished, <code>ENABLE_EXPERT_PARALLEL=false</code> was ignored and MTP=0 emitted <code>num_speculative_tokens:0</code> (rejected). The final command ends up in <code>.last_head_launch.sh</code>, which may contain <code>--api-key</code></td></tr>
+      <tr><td><code>EXTRA_DOCKER_ARGS</code></td><td>empty — <b>bug</b>: dropped by the 2-node launcher</td><td>should append flags to <code>docker run</code> via <code>DOCKER_ARGS</code></td><td>the head and worker heredocs have handwritten flags and don't read <code>DOCKER_ARGS</code>; NCCL env vars passed this way have no effect — edit the heredocs (it works in <code>start-tp1.sh</code>)</td></tr>
+      <tr><td><code>.last_head_launch.sh</code></td><td>permission <code>0600</code></td><td>copy of the rendered head script</td><td>audit exactly what was launched, without leaking secrets to other users</td></tr>
+      <tr><td><code>ssh "bash -s" &lt; script</code></td><td><code>mktemp</code> 0600, no <code>scp</code> to a fixed path</td><td>sends the worker script through standard input</td><td>nothing is left on the worker to leak; <code>ssh</code> returns the exit code and <code>set -e</code> fails fast</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="la-sec">
+  <h2>Steps 6 and 7 — Launch, verify and operate</h2>
+  <p><code>start.sh</code> has its own numbered stages (don't confuse them with this chapter's steps): (1) download on the head; (2) resolve the snapshot and detect the PLE dtype; (3) distribute the weights; (4) verify they are present; (4b) idle-GPU preflight and page cache eviction; (4c–4i) overlays; (5) make sure the image is on both nodes; (6) PLE patch; (6b) MXFP8 patch; (7) build <code>VLLM_ARGS</code>, bring up the <b>worker first</b>, wait 15 s and bring up the head, following the log until <code>/health</code> answers 200. The flags choose which stages run:</p>
+  <table class="la-params">
+    <thead><tr><th>Parameter</th><th>Value</th><th>What it does</th><th>When to use it</th></tr></thead>
+    <tbody>
+      <tr><td><code>start.sh</code></td><td>no flag: download → sync → patch → launch</td><td>resolves the cache, detects the PLE, distributes, runs the preflight, applies overlays, ensures the image, brings up worker and head and polls <code>/health</code></td><td>first boot; a cold one measured ≈10m55s</td></tr>
+      <tr><td><code>--no-download</code></td><td>flag</td><td>skips the download</td><td>weights already on the head: <code>./start.sh --no-download</code></td></tr>
+      <tr><td><code>--no-launch</code></td><td>flag</td><td>download and distribution only</td><td>prepare the nodes ahead of a serving window</td></tr>
+      <tr><td><code>--launch</code></td><td>flag</td><td>skips download <i>and</i> sync; patches and launch only</td><td>it's what a supervisor should run: <code>stop &amp;&amp; start --launch</code> when <code>/health</code> fails</td></tr>
+      <tr><td><code>DO_DOWNLOAD</code> / <code>DO_SYNC</code> / <code>DO_LAUNCH</code></td><td>derived from the flags; <code>DO_DOWNLOAD_DEFAULT=false</code> with <code>FP8_DENSE</code></td><td>turn each stage on or off</td><td>the FP8-dense checkpoint is local, it's never on the Hub</td></tr>
+    </tbody>
+  </table>
+  <p>The figure shows the measured boot from end to end — and what happens when a fix is missing. Change the scenario and watch <i>when</i> the failure shows up.</p>
+
+  <figure class="la-fig wide" id="fig-boot" data-title="Cold boot timeline">
+    <div class="la-fig-stage" style="height:340px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Durations measured by the repository: NCCL ~40 s, weight loading 458 s (target 392 + drafter 67), engine initialization 92.4 s (profile, KV allocation, warmup), graph capture ~7 s; the rest, up to 10m55s, is not broken down. The failure instants follow the reports (“~7 min of loading”, “~33% of the load”, “10 min later”) and are approximate. The MXFP8 scenario is that of a checkpoint with MXFP8 layers (local-inference-lab), not nvidia's; the README says “~7 min into the launch”, and here it lands at the start of the profile run on nvidia's timeline. The host phase (download, sync, overlays) has a variable duration and is shown compressed.</figcaption>
+  </figure>
+  <p>Turn on the preflights: three of the four failures are caught before the container even exists — <code>REQUIRE_IDLE_GPU</code> in seconds, <code>--mtp-moe-algo</code> in seconds, <code>check-weights.sh --verify</code> in about a minute. The fourth has no preflight; the fix is the fallback itself, always mounted. Trading ten minutes for ten seconds is perhaps the biggest operational lesson of this recipe.</p>
+
+  <h3>What to read in the log and what to test</h3>
+  <ul>
+    <li><code>docker logs vllm-fn 2&gt;&amp;1 | grep -E "Available KV cache memory|GPU KV cache size"</code> — the real pool and the maximum concurrency.</li>
+    <li>The reduced vocabulary line: <code>47149 of 248320 tokens (19.0%), 45734 on this rank of 2; draft lm_head shard 0.59 -&gt; 0.22 GiB</code>.</li>
+    <li>On checkpoints with MXFP8 layers, one WARNING per shape that fell back to emulation (on nvidia, expect none); <code>EAGLE trailing prefix-cache block dropping is disabled</code>; the <code>--kv-cache-memory=&lt;bytes&gt;</code> suggestions.</li>
+    <li>Smoke test: a chat; <code>chat_template_kwargs.reasoning_effort</code> at <code>low|medium|xhigh</code> (<code>high</code> and <code>max</code> return HTTP 400); a tool call; an image by URL; a <code>max_tokens</code> of 2–4k, because thinking eats the budget first.</li>
+    <li>Quality: <code>bench/reasoning_check.py</code> (10 deterministic tasks + needles) with <code>auto</code> and then <code>--compare</code> with <code>fp8</code> — the failure mode of an FP8 KV is a <i>wrong answer</i>, not slowness.</li>
+    <li>Acceptance: <code>bench/mtp_accept.py --save</code> before and <code>--since</code> after; the <code>/metrics</code> counters are cumulative, so always measure the delta (<a data-ch="benchmarking">benchmarking</a>).</li>
+  </ul>
+
+  <table class="la-params">
+    <thead><tr><th>Parameter</th><th>Value</th><th>What it does</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td><code>vllm-fn</code></td><td>fixed container name (TP1: <code>vllm-fn-tp1</code>)</td><td>identifies the serving container on both nodes</td><td>every lane uses the same name and port: <code>docker logs -f vllm-fn</code>, and stop it before switching</td></tr>
+      <tr><td><code>stop.sh</code></td><td><code>[--nfs | --all]</code></td><td><code>docker rm -f vllm-fn</code> on the worker and then on the head; <code>--nfs</code> tears down the share (15 s timeout) and removes the volume</td><td>mandatory before switching checkpoint or lane; an <code>rpcbind</code> in D state may ignore SIGKILL</td></tr>
+      <tr><td><code>--restart</code></td><td><b>not</b> set</td><td>the container dies on a crash and stays dead</td><td>in two-node TP, a rank restarted on its own hangs at NCCL init waiting for its partner; prefer a supervisor that brings both down and runs <code>start --launch</code></td></tr>
+    </tbody>
+  </table>
+  <div class="la-callout warn"><b class="t">Day-to-day operation</b><p>Watch <code>MemAvailable</code> and <code>journalctl -k | grep NV_ERR_NO_MEMORY</code>; in <code>/metrics</code>, <code>kv_cache_usage</code> and preemptions. FlashInfer's autotune cache in <code>~/.cache/vllm</code> is the only per-node state that survives between launches — and, on lane 0.30, a persisted cache that differed between the nodes <b>hung TP2</b> in the autotune collective; that's why the lane points <code>VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR</code> to <code>/tmp</code>. The memory-reservation sysctls that saved TP1 cost 7–14% of decode on the dual kit and didn't prevent the error: they were left out.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Step 8 — Numbers, tuning levers and pitfalls</h2>
+  <p>With the server up, the question becomes: <i>where do the milliseconds go?</i> When decoding a single conversation, the GPU spends most of its time <b>reading weights</b> (<a data-ch="prefill-decode-kv">decode is bandwidth-bound</a>). The repository's performance report added up the bytes read per GPU in one step with MTP=3 (verifying 4 tokens + 3 one-token drafts): ≈9.2 GiB. At an effective 240 GB/s, that read alone takes <b>~41 ms</b>. But the step measured at S=1, with the full vocabulary, is <b>59–61 ms</b> (rerun of 2026-09-16: prose 59.3 ms, code 60.7 ms). How many tokens come out of each step? At 72.8% acceptance over 3 drafts (823 of 1,131), that's 2.18 accepted drafts plus the token the target always emits: \(\bar a \approx 3.2\) tokens per step (≈2.9 on prose in the 09-11 run). And 3.2 tokens / 61 ms ≈ <b>52 tok/s</b>, which matches the 52.1 measured. The math adds up, and it says something important: <b>~2/3 of the step is bandwidth</b>; the other ~17–20 ms are overhead outside the weight read.</p>
+
+  <div class="la-eq">
+    \[ \begin{gathered} t_{\text{step}} \approx \frac{B_{\text{step}}}{\beta_{\text{eff}}} + t_{\text{fixed}} \qquad\qquad \text{tok/s} \approx \frac{\bar a}{t_{\text{step}}} \\[6pt] \underbrace{\tfrac{9.2\ \text{GiB}}{240\ \text{GB/s}}}_{\approx 41\ \text{ms}} + \underbrace{20\ \text{ms}}_{t_{\text{fixed}}} \approx 61\ \text{ms} \;\Rightarrow\; \frac{3.2}{0.061\ \text{s}} \approx 52\ \text{tok/s} \end{gathered} \]
+    <ul class="la-eq-legend">
+      <li>\(B_{\text{step}}\): bytes read per GPU in one decode step (≈9.2 GiB with MTP=3, batch 1, full vocabulary)</li>
+      <li>\(\beta_{\text{eff}}\): effective LPDDR5x bandwidth (235–245 GB/s in practice, 273 in theory)</li>
+      <li>\(t_{\text{fixed}}\): overhead outside the weight read, obtained by difference (measured step − read ≈ 17–20 ms): the ~106 collectives (2–3 ms) and, by interpretation, the launches of the three draft passes, sampling and scheduling</li>
+      <li>\(\bar a\): tokens emitted per step = 1 + accepted drafts (≈3.2 at 72.8% acceptance; ≈2.9 on prose)</li>
+    </ul>
+  </div>
+
+  <div class="la-callout warn"><b class="t">A report calculation that doesn't add up</b><p>The performance report concluded that batch 1 was already “at the bandwidth ceiling”: 41 ms × ~2.2 tokens per step ≈ 53–56 tok/s, “exactly” the 55.8 measured. Interpretation: the 2.2 are the <i>accepted drafts</i> (72.8% × 3), without the token the target always emits; and the 55.8 tok/s come from an old README table (MTP off, different weights). With the measured steps, ~1/3 of the step lies outside the weight read: cutting bytes is still the biggest lever, but the fixed overhead is a target too.</p></div>
+
+  <p>The reduced vocabulary works as a test of the model. It removes ~1.1 GiB of reads per step (≈5 ms at 240 GB/s), and the measured step dropped by 6–7 ms (prose 59.9 → 53.3 ms; code 61.2 → 54.0 ms, run of 2026-09-11). So there are four levers: read fewer bytes, accept more tokens per step, serve more sequences per step (which amortizes the read <i>and</i> the overhead) or shrink the fixed overhead (communication, kernel launches).</p>
+
+  <figure class="la-fig wide" id="fig-bytes-passo" data-title="Where the bytes of a decode step go">
+    <div class="la-fig-stage" style="height:430px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Each bar is a slice of the ≈9.2 GiB read per GPU at every step (analytical model from the performance report; batch 1, MTP=3). The “read head” sweeps across the bars (in slow motion) once per step and releases the accepted tokens at the end. Initial controls: 2.9 tokens/step (prose, run of 2026-09-11) and 17 ms of <b>calibrated</b> overhead (measured step of ~58–61 ms minus the ~41 ms read). The reduced vocabulary is computed component by component; FP8-dense only has an estimate of the total (5.7 GiB), never measured on a GPU.</figcaption>
+  </figure>
+  <p>Notice that <code>lm_head</code> is the <b>largest</b> slice (26%): it's read four times per step — once by the target and three times by the drafter. That's why cutting the drafter's vocabulary to 47K ids is “the biggest single lever” of the step. It conflicts with FP8-dense for a mechanical reason: both overlays rewrite <code>nvidia/mtp.py</code>, and <code>start.sh</code> refuses to take both together. Notice the HyperConnections too: 13% of the bytes for a small module. They stay replicated on both GPUs and in BF16, because the model code hardcodes <code>quant_config=None</code> for them; only the FP8-dense overlay quantizes them.</p>
+
+  <h3>The numbers the recipe measured</h3>
+  <table>
+    <thead><tr><th>Change</th><th>Before → after</th><th>Conditions</th></tr></thead>
+    <tbody>
+      <tr><td>MTP=3</td><td>24.5 → <b>52.1 tok/s</b> (2.13×); acceptance 72.8% (89/74.5/60% by position)</td><td>batch 1, greedy</td></tr>
+      <tr><td>47k drafter vocabulary</td><td>+9.6% on average (code step 61.2 → 54.0 ms); rerun +8.4%</td><td>2026-09-11 and 09-16; tokens per step unchanged</td></tr>
+      <tr><td>65,536 “balanced” ids with only 8,305 real ones</td><td>acceptance 56.5% → <b>47.8%</b></td><td>2026-09-05: padding the vocabulary made it worse</td></tr>
+      <tr><td>65k language vocabulary (47k floor + Wikipedia; 7 files, opt-in)</td><td>Portuguese: tok/s <b>+9%</b> normalized (+16% raw); accepted per draft 0.96 → <b>1.39</b>. Range across the 7 languages: +9% (pt) to +53% (ru) normalized</td><td>2026-09-29, TP=2, temp. 0, thinking off; one boot per arm (German with ABBA); normalized = divided by the same boot's English control (±12% between boots)</td></tr>
+      <tr><td>FP8 KV (day-0)</td><td>2,131,159 → <b>3,652,200</b> tokens (1.70×); throughput −5.3% (prose −1.4%, code −9.2%)</td><td>GMU 0.835; 12/12 reasoning + needles</td></tr>
+      <tr><td>Block-drop off</td><td>2nd-turn TTFT 3.25 → 0.63 s; 3rd turn 1.12 → 0.59 s</td><td>9.5k-token session</td></tr>
+      <tr><td>Determinism (<code>VLLM_QSA_DET_TOPK</code>, <code>VLLM_MOE_DET_FINALIZE</code>)</td><td>logprob spread 0.25/6.07 → 0/0 nats; distinct greedy outputs 5/5 → 1/5; −4%</td><td>opt-in, day-0 only</td></tr>
+      <tr><td>Prefill (day-0)</td><td>~2,960 tok/s from 16k to 64k; 2,727 at 128k</td><td>sparse attention keeps the cost in check</td></tr>
+    </tbody>
+  </table>
+  <p>And the lane comparison, on the same pair of machines and with the same harness (CHANGELOG of 2026-09-25):</p>
+  <table>
+    <thead><tr><th>Metric</th><th>day-0 + #66</th><th>0.30 stock</th><th>lane 0.30</th></tr></thead>
+    <tbody>
+      <tr><td>Decode S=1 prose / code (tok/s)</td><td>56.1 / 75.8</td><td>52.5 / 61.5</td><td>57.6 / 71.5</td></tr>
+      <tr><td>Decode S=8 prose / code</td><td>225.8 / 421.9</td><td>194.4 / 316.5</td><td>219.8 / 420.7</td></tr>
+      <tr><td>2nd-turn TTFT (“turn 1”, 9.5k session)</td><td>0.63 s</td><td>0.28 s</td><td>—</td></tr>
+      <tr><td>1st identical 7.9k repeat (#62)</td><td>2.70 s (miss)</td><td>0.25 s (hit)</td><td>—</td></tr>
+      <tr><td>NLL (15,776 positions)</td><td>1.331</td><td>1.333</td><td>1.333</td></tr>
+    </tbody>
+  </table>
+  <p>Stock 0.30 is 5–15% slower because it drafts over all 248K tokens; with the reduced vocabulary port it's back to parity (without <i>breakable CUDA graphs</i>: prose 60.0/95.5/145.2/234.8 and code 76.5/140.2/248.0/441.2 tok/s at S=1/2/4/8). Careful: the benchmark panel's code prompt is synthetic (acceptance ~1.0 per position); the prose prompt (0.81/0.64/0.51) is the representative one. Individual cells vary ±20% between runs: trust averages of alternating repetitions.</p>
+
+  <div class="la-callout tip"><b class="t">The order of the levers, according to the repo itself</b><p>(1) Fewer bytes per step: reduced vocabulary (done), FP8-dense (analytical), K=2 if the 3rd position accepts little. (2) More accepted tokens: build the vocabulary from the <i>model's own output</i> on your traffic (<code>gen_draft_corpus.py</code> → <code>build_draft_vocab.py --balance-shards 2</code>), choosing the size by coverage, not by the id count. If your traffic is in another language, start from the seven 65k files the recipe already ships (<code>MTP_DRAFT_VOCAB=files/draft_vocab_&lt;lang&gt;_en_code_65k.txt</code>; es, zh, ja, de, pt, fr, ru; the default is still the 47k one). For anyone serving Portuguese: +9% normalized and +16% raw in tok/s, with accepted tokens per draft rising from 0.96 to 1.39 (TP=2, one boot per arm; details and caveats in <a data-ch="mtp-eagle-vocab">chapter 36</a>). (3) More sequences per step, up to <code>MAX_NUM_SEQS</code> and the KV. (4) Fixed overhead: NCCL knobs and a second cable, measuring with <code>nccl-tests</code>. (5) Kernels: a QSA profile for 48 SMs (<code>QSA_PROFILE=gb10</code>, split-K from 64 to 16 partitions, not measured), a <i>skinny</i> GEMM on <code>sm_121</code>. Changed <code>MAX_MODEL_LEN</code>, K, KV dtype, vocabulary, FP8-dense or QSA profile? Measure again.</p></div>
+
+  <div class="la-callout warn"><b class="t">Pitfalls that cost hours</b><p><b>Don't pass <code>--kv-cache-dtype fp8</code> by hand</b>: use the <code>.env</code> so the patch gets mounted along with it (and remember that the <code>.env</code> beats the environment). <b><code>PLE_OFFLOAD=true</code></b> on the dual kit asks for ~51 GB of “free CPU memory” that doesn't exist — in unified memory it's the same pool (log: <code>Available RAM: 44.92 GiB</code>). <b>A <code>.env</code> written from scratch</b> without <code>MAMBA_SSM_CACHE_DTYPE</code>, <code>MTP_DRAFT_VOCAB</code>, <code>MTP_DISABLE_BLOCK_DROP</code> and <code>MTP_INDEX_SHARE</code> loses four optimizations, because the <code>start.sh</code> fallbacks differ from <code>.env.sample</code>. <b>MTP with media</b>: the drafter doesn't receive the image embeddings and accepts less. <b>At the T=1.0</b> recommended by <code>generation_config</code> (top_p 0.95, top_k 20), rejection sampling accepts fewer drafts than under the benchmarks' greedy decoding.</p></div>
+
+  <div class="la-callout recipe" data-recipe="qwen"><b class="t"><span class="la-rb qwen"></span> Across the three recipes</b><p>Qwen is the recipe of <b>lanes</b> and <b>metadata fixes</b>: almost all the engineering goes into getting a mixed-precision checkpoint read correctly and into cutting bytes from the drafter. The <a data-ch="receita-glm">GLM recipe</a> solves the same “does it fit, and is it fast?” with 4-bit EXL3 and the DFlash2 block drafter; the <a data-ch="receita-deepseek">DeepSeek recipe</a>, up next, takes the idea of lanes to the extreme — three lanes with different images and hotfixes, a 1M context and a compressed KV. Take the method with you: budget first, preflight before the boot, one variable at a time.</p></div>
+</section>

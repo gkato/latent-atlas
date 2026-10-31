@@ -1,0 +1,403 @@
+<p class="la-lead"><a data-ch="dpo">DPO</a> swapped RLHF's RL loop for a logistic regression over pairs of responses and became the standard for open post-training. But the recipe carries three hidden assumptions. It treats the preference label as a probability that can be pushed all the way to infinity. It requires <i>pairs</i> (this response is better than that one). And at every step it pays for a second full model, the reference, scoring each response by the <i>sum</i> of its tokens' log-probs. Each famous variation tweaks one of these pieces. <b>IPO</b> swaps the logit for a parabola with a finite target and gives the temperature \(\tau\) back its power to hold the policy close to the reference. <b>KTO</b> drops the pairs and learns from a simple “good” or “bad”, using Kahneman and Tversky's prospect theory. <b>SimPO</b> throws away the reference, scores each response by its <i>mean</i> log-prob and demands a margin. Along the way come ORPO, CPO, R-DPO, β-DPO and DPOP. By the end you will compute all of these losses on the same toy pair, see where each one pushes the model, and know which one to pick, and how to configure it, for your data and your memory.</p>
+
+<section class="la-sec">
+  <h2>The theme: one loss, three assumptions</h2>
+  <p>Let's pin down the notation, which is the same as in the <a data-ch="dpo">previous chapter</a> and holds for the whole chapter. \(x\) is the prompt; \(y\) is a complete response, with \(|y|\) tokens; \(y_w\) is the preferred one (<i>winner</i>, “chosen”) and \(y_l\) the dispreferred one (<i>loser</i>, “rejected”). \(\pi_\theta\) is the model being trained and \(\pi_{\text{ref}}\) is the frozen <span class="la-term" data-term="modelo-de-referencia">reference model</span>, almost always the post-SFT model itself. The log-prob of a response is the sum of its tokens' log-probs, \(\log\pi(y\mid x)=\sum_t \log\pi(y_t\mid x,y_{&lt;t})\). The central piece is the log-ratio between policy and reference, measured in nats:</p>
+  <div class="la-eq">
+    \[ h_\theta(x,y)=\log\frac{\pi_\theta(y\mid x)}{\pi_{\text{ref}}(y\mid x)},\qquad \Delta h = h_\theta(x,y_w)-h_\theta(x,y_l),\qquad \mathcal L_{\text{DPO}}=-\mathbb E_{(x,y_w,y_l)\sim\mathcal D}\big[\log\sigma(\beta\,\Delta h)\big] \]
+    <ul class="la-eq-legend">
+      <li>\(h_\theta\): how much the policy raised (\(&gt;0\)) or lowered (\(&lt;0\)) the response relative to the reference</li>
+      <li>\(\beta h_\theta\): DPO's <span class="la-term" data-term="recompensa-implicita">implicit reward</span></li>
+      <li>\(\Delta h\): the log-ratio margin between preferred and rejected</li>
+      <li>\(\sigma(z)=1/(1+e^{-z})\): the <span class="la-term" data-term="sigmoide">sigmoid</span>; \(-\log\sigma(z)\) is the logistic loss</li>
+      <li>\(\beta\): price of the KL in the RL objective and scale of the logit in the loss (DPO, Eq. 7)</li>
+      <li>\(\mathcal D\): the dataset of triples \((x, y_w, y_l)\)</li>
+    </ul>
+  </div>
+  <p>Read this loss as a three-part machine. A <b>score</b> per response (\(\beta h\)). A <b>contrast function</b> between the two scores (the logistic of the difference). And an <b>anchor</b> that keeps the policy from running away, which in DPO lives inside the score, in the division by \(\pi_{\text{ref}}\). Almost the whole family fits this mold. What changes from one method to another is which piece gets swapped, and each swap attacks one of DPO's assumptions.</p>
+  <div class="la-cards">
+    <div class="la-card"><span class="ic">∞</span><h4>Assumption 1: the label is elastic</h4><p>The <span class="la-term" data-term="bradley-terry">Bradley–Terry</span> model behind DPO turns preferences into reward differences through the logit. A pair preferred 100% of the time asks for an infinite margin. <span class="la-term" data-term="ipo">IPO</span> swaps the <i>contrast</i>: a parabola with a finite target.</p></div>
+    <div class="la-card"><span class="ic">±</span><h4>Assumption 2: data comes in pairs</h4><p>Production logs bring “liked” and “disliked”, not pairs. <span class="la-term" data-term="kto">KTO</span> swaps the <i>data</i> and the <i>contrast</i>: each response is judged on its own against a reference point.</p></div>
+    <div class="la-card"><span class="ic">Σ</span><h4>Assumption 3: the reference and the sum</h4><p>The reference costs memory, and scoring by the sum makes long responses dominate the gradient and feeds verbosity (the raw sum, without a reference, even punishes a long preferred response). <span class="la-term" data-term="simpo">SimPO</span> swaps the <i>score</i> and the <i>anchor</i>: per-token mean, no reference, plus a margin \(\gamma\).</p></div>
+  </div>
+  <p>To compare apples with apples, the whole chapter uses the same toy pair from the research note. The numbers are <b>illustrative</b> (computed by script, not taken from any paper), but they were chosen to show the typical case of verbosity bias: the preferred response is the longer one.</p>
+  <table>
+    <thead><tr><th></th><th>\(y_w\) (preferred)</th><th>\(y_l\) (rejected)</th></tr></thead>
+    <tbody>
+      <tr><td>length \(|y|\)</td><td>20 tokens</td><td>10 tokens</td></tr>
+      <tr><td>\(\log\pi_{\text{ref}}(y\mid x)\)</td><td>−26.0</td><td>−15.0</td></tr>
+      <tr><td>\(\log\pi_\theta(y\mid x)\) (after a few steps)</td><td>−25.0</td><td>−17.0</td></tr>
+      <tr><td>\(h = \log\pi_\theta-\log\pi_{\text{ref}}\)</td><td><b>+1.0</b></td><td><b>−2.0</b></td></tr>
+      <tr><td>mean log-prob \(\frac{1}{|y|}\log\pi_\theta\)</td><td>−1.25</td><td>−1.70</td></tr>
+    </tbody>
+  </table>
+  <p>The figure opens the pair token by token. Each cell is the log-prob of one token; the summing machine walks along the response and accumulates. Change what is shown (reference, policy or the difference \(h\)) and how it is aggregated (sum or mean).</p>
+  <figure class="la-fig wide" id="fig-par" data-title="The toy pair, token by token">
+    <div class="la-fig-stage" style="height:400px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Top row: the preferred \(y_w\) (20 tokens); bottom row: the rejected \(y_l\) (10 tokens). Words play the role of tokens and the per-token log-probs are <b>illustrative</b>, chosen to add up exactly to the table's totals. The cursor walks along each response and the accumulator on the right shows the running sum or mean. In the “\(h\)” view, mint = the token went up relative to the reference, lilac = it went down.</figcaption>
+  </figure>
+  <p>Three facts from this figure come back in every section. By the <b>sum</b> of \(\log\pi_\theta\), the preferred response looks worse (−25 versus −17), even after training, because each token adds a negative term and it has twice as many tokens. The <b>reference</b> discounts that: DPO doesn't compare −25 with −17, it compares how much each response changed (+1 and −2), and the margin \(\Delta h=3\) is positive. With \(\beta=0.1\), the loss is 0.5544 and the gradient weight \(\sigma(-\beta\Delta h)\) is 0.4256, versus \(\log 2=0.6931\) and 0.5 at the start, when \(\pi_\theta=\pi_{\text{ref}}\). Finally, the per-token <b>mean</b> tells another story, with no reference at all: −1.25 versus −1.70, that is, the preferred response is already the more probable one per token. Keep these numbers in mind: they are the raw material of IPO, KTO and SimPO.</p>
+</section>
+
+<section class="la-sec">
+  <h2>IPO: when DPO believes the labels too much</h2>
+  <div class="la-callout info"><b class="t">First: the right name</b><p>You will find IPO expanded as <i>Identity Policy Optimization</i>. The name circulates for a reason: the OAIF paper (Guo et al., 2024), whose authors include Bilal Piot, also a coauthor of IPO, writes exactly “identity policy optimisation”. But the original paper, by Azar, Rowland, Piot, Guo, Calandriello, Valko and Munos (Google DeepMind, 2023; AISTATS 2024), defines a family called <b>ΨPO</b>, “Ψ-<i>preference optimisation</i>”, and calls the case where Ψ is the identity function “Identity-PO (IPO)”, without expanding the PO. By construction, the canonical expansion is <b>Identity Preference Optimization</b>. It is one and the same method; in this chapter we use the paper's name.</p></div>
+  <p>The paper's title is ambitious: <i>A General Theoretical Paradigm to Understand Learning from Human Preferences</i>. The idea is to take a step back from DPO. Instead of maximizing a reward, maximize a function \(\Psi\) of the <b>probability of beating</b> the responses that generated the data, without straying from the reference:</p>
+  <div class="la-eq">
+    \[ \max_\pi\ \mathbb E_{x\sim\rho,\ y\sim\pi(\cdot\mid x),\ y'\sim\mu(\cdot\mid x)}\Big[\Psi\big(p^*(y\succ y'\mid x)\big)\Big]-\tau\,\mathbb D_{\text{KL}}(\pi\,\|\,\pi_{\text{ref}}) \]
+    <ul class="la-eq-legend">
+      <li>\(\Psi:[0,1]\to\mathbb R\): a non-decreasing function that turns preference probability into “value”</li>
+      <li>\(p^*(y\succ y'\mid x)\): the true probability that a human prefers \(y\) to \(y'\)</li>
+      <li>\(\mu\): the policy that generated the dataset's pairs</li>
+      <li>\(\rho\): the prompt distribution</li>
+      <li>\(\tau&gt;0\): KL strength, the same role as DPO's \(\beta\)</li>
+      <li>\(\mathbb D_{\text{KL}}\): the <span class="la-term" data-term="divergencia-kl">KL divergence</span> to the reference</li>
+    </ul>
+  </div>
+  <p>This is the <span class="la-term" data-term="psi-po">ΨPO</span> objective (IPO, Eq. 6). By the same derivation that gives DPO's closed-form solution, the optimum is the reference “tilted” by the expected value: \(\pi^*(y)\propto\pi_{\text{ref}}(y)\exp\big(\tau^{-1}\,\mathbb E_{y'\sim\mu}[\Psi(p^*(y\succ y'))]\big)\) (Eq. 7). The paper's Proposition 1 closes the loop: if \(\Psi\) is the <b>logit</b>, \(\Psi(q)=\log\frac{q}{1-q}\), and preferences follow Bradley–Terry, then \(\mathbb E_{y'}[\Psi(p^*(y\succ y'))]=r(y)-\mathbb E_{y'}[r(y')]\): the reward itself, up to a constant. In other words, <b>RLHF and DPO have the same optimal policy as ΨPO with Ψ = logit</b>. DPO is not “the” preference method; it is one member of a family, the one that chose the logit.</p>
+  <h3>The problem with the logit</h3>
+  <p>The logit is unbounded. Near 1 it blows up: taking the preference probability from 0.98 to 0.99 requires +0.70 in logit, more than going from 0.5 to 0.6, which takes +0.41 (our calculation). In DPO this becomes a concrete demand on the margin. If, in a pair, the preferred response wins with frequency \(p\), the logistic loss is minimized when \(\beta\,\Delta h^*=\operatorname{logit}(p)\), that is, \(\Delta h^*=\operatorname{logit}(p)/\beta\). The reason fits in one line: the expected loss is \(-p\log\sigma(z)-(1-p)\log\sigma(-z)\), with \(z=\beta\Delta h\), and its derivative, \(\sigma(z)-p\), vanishes when \(\sigma(z)=p\), that is, \(z=\operatorname{logit}(p)\). For a <span class="la-term" data-term="preferencia-deterministica">deterministic preference</span>, \(p=1\), the optimal margin is <b>infinite, whatever \(\beta\) is</b>, and the optimal policy drives \(\pi(y_l)\) to zero. In the paper's words (paraphrased), the KL regularization becomes weaker and weaker the more deterministic the preferences are.</p>
+  <p>Now add finite data. Most datasets have <b>a single label per pair</b>. With one label, the empirical frequency \(\hat p\) can only be 0 or 1: every pair in the dataset is “deterministic”, even if the true preference is a lukewarm 0.8. With \(n\) labels and true preference \(p^*\), the chance that all of them agree is \(p^{*n}+(1-p^*)^n\) (our calculation): 1 with \(n=1\), 0.52 with \(n=3\) and 0.33 with \(n=5\), for \(p^*=0.8\). The paper notes that classic RLHF suffers less from this for a curious reason: the reward model is <b>underfit</b>. It never reaches infinite rewards, because it is trained with regularization and early stopping, and that underfitting regularizes the policy. DPO, by eliminating the reward model, loses this implicit protection.</p>
+  <figure class="la-fig wide" id="fig-psi" data-title="From label to target: logit × identity">
+    <div class="la-fig-stage" style="height:420px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>On the left, 16 pairs; each dot is one annotator label (mint = the preferred response won, pink = it lost) drawn with true probability \(p^*\), and below each pair is its empirical frequency \(\hat p\). On the right, the optimal margin \(\Delta h^*\) as a function of \(p\): DPO, \(\operatorname{logit}(p)/\beta\) (lilac), and IPO, \((2p-1)/(2\tau)\) (mint). Each pair becomes a point on each curve. Pairs with \(\hat p\in\{0,1\}\) send DPO's target to infinity (arrows). Here \(\beta=\tau\) so the scales can be compared.</figcaption>
+  </figure>
+  <p>With one label per pair, all of DPO's points run off to infinity, while IPO's stop at \(\pm 1/(2\tau)\). Raise \(n\) and the points spread across the middle of the curve, but DPO is still hostage to the unanimous pairs. IPO's curve is a bounded straight line, and that is what the next section derives.</p>
+</section>
+
+<section class="la-sec">
+  <h2>The IPO loss: a parabola with a finite target</h2>
+  <p>Choose \(\Psi=\) identity. The objective becomes \(\max_\pi\ p^*_\rho(\pi\succ\mu)-\tau\,\mathbb D_{\text{KL}}(\pi\,\|\,\pi_{\text{ref}})\) (IPO, Eq. 8): maximize the probability of beating the data policy, which never exceeds 1, without straying too far from the reference. Without the logit, nothing demands an infinite margin. What remains is to turn this into a loss that can be trained from samples.</p>
+  <p>The paper's path goes through <b>root-finding equations</b>. Define \(g(y)=\mathbb E_{y'\sim\mu}[\Psi(p^*(y\succ y'))]\) and the cross log-ratio \(h_\pi(y,y')=\log\frac{\pi(y)\,\pi_{\text{ref}}(y')}{\pi(y')\,\pi_{\text{ref}}(y)}\), which is exactly our \(\Delta h\). The optimal policy satisfies \(h^*(y,y')=\tau^{-1}\big(g(y)-g(y')\big)\) for every pair (Eq. 11). With \(\Psi=I\), the right-hand side is \(\tau^{-1}\big(p^*(y\succ\mu)-p^*(y'\succ\mu)\big)\). An equality that must hold on every pair becomes a least-squares regression:</p>
+  <div class="la-eq">
+    \[ L(\pi)=\mathbb E_{y,y'\sim\mu}\Big[\Big(h_\pi(y,y')-\frac{p^*(y\succ\mu)-p^*(y'\succ\mu)}{\tau}\Big)^2\Big] \]
+    <ul class="la-eq-legend">
+      <li>\(p^*(y\succ\mu)\): the probability that \(y\) beats a response drawn from the data policy</li>
+      <li>\(h_\pi(y,y')\): the log-ratio margin between \(y\) and \(y'\)</li>
+      <li>Theorem 2: if \(\operatorname{Supp}(\mu)=\operatorname{Supp}(\pi_{\text{ref}})\), \(L\) has a <b>unique</b> minimum, both local and global</li>
+    </ul>
+  </div>
+  <p>In logits, \(L\) is a strictly convex quadratic, except along the direction \((1,\dots,1)\), which doesn't change the softmax (IPO, Eq. 13 and Theorem 2). We don't know \(p^*\), but Proposition 3 shows that replacing it with a Bernoulli label \(I(y,y')\), which is 1 when \(y\) wins and 0 when it loses, gives the same loss up to a constant (Eq. 16):</p>
+  <div class="la-eq">
+    \[ L(\pi)=\mathbb E_{y,y'\sim\mu,\ I\sim\text{Bernoulli}(p^*(y\succ y'))}\Big[\big(h_\pi(y,y')-\tau^{-1}I(y,y')\big)^2\Big]+C \]
+    <ul class="la-eq-legend">
+      <li>\(I(y,y')\): one annotator's label for the ordered pair \((y,y')\)</li>
+      <li>\(C\): a constant that does not depend on \(\pi\)</li>
+    </ul>
+  </div>
+  <p>Each pair in the dataset then contributes twice, as \((y_w, y_l, I=1)\) and \((y_l, y_w, I=0)\). In the swapped order the margin flips sign, \(h(y_l,y_w)=-h\), and the residual becomes \((-h-0)^2=h^2\). The symmetry settles the math: \(\tfrac12\big[(h-\tau^{-1})^2+h^2\big]=\big(h-\tfrac{1}{2\tau}\big)^2+\tfrac{1}{4\tau^2}\). The same calculation gives the straight line of the previous figure. If the preferred response wins with frequency \(p\), the average of the two orders, \(\tfrac12\big[p(h-\tau^{-1})^2+(1-p)h^2\big]+\tfrac12\big[(1-p)(h+\tau^{-1})^2+p\,h^2\big]\), has derivative \(2h-(2p-1)\tau^{-1}\) and is minimized at \(h^*=(2p-1)/(2\tau)\): the mint line, which equals \(1/(2\tau)\) when \(p=1\). With \(p=1\) and the constant dropped, what remains is the IPO loss (Eq. 17, Algorithm 1):</p>
+  <div class="la-eq">
+    \[ \mathcal L_{\text{IPO}}=\mathbb E_{(x,y_w,y_l)\sim\mathcal D}\Big[\Big(\log\frac{\pi_\theta(y_w\mid x)\,\pi_{\text{ref}}(y_l\mid x)}{\pi_\theta(y_l\mid x)\,\pi_{\text{ref}}(y_w\mid x)}-\frac{1}{2\tau}\Big)^2\Big]=\mathbb E\Big[\Big(\Delta h-\frac{1}{2\tau}\Big)^2\Big] \]
+    <ul class="la-eq-legend">
+      <li>\(\Delta h\): the same log-ratio margin as in DPO</li>
+      <li>\(1/(2\tau)\): the <b>finite target</b> for the margin; large \(\tau\) = small target = stays close to the reference</li>
+      <li>at the start, \(\pi_\theta=\pi_{\text{ref}}\) and \(\Delta h=0\)</li>
+    </ul>
+  </div>
+  <p>Instead of pushing the margin to infinity, IPO <b>regresses</b> it toward a target. The gradient shows the qualitative difference (derivation from the research note):</p>
+  <div class="la-eq">
+    \[ \nabla_\theta\mathcal L_{\text{IPO}}=2\,\mathbb E\Big[\Big(\Delta h-\frac{1}{2\tau}\Big)\big(\nabla_\theta\log\pi_\theta(y_w\mid x)-\nabla_\theta\log\pi_\theta(y_l\mid x)\big)\Big] \qquad \text{vs.}\qquad \nabla_\theta\mathcal L_{\text{DPO}}=-\beta\,\mathbb E\Big[\sigma(-\beta\Delta h)\big(\nabla\log\pi_\theta(y_w)-\nabla\log\pi_\theta(y_l)\big)\Big] \]
+    <ul class="la-eq-legend">
+      <li>IPO, \(\Delta h&lt;1/(2\tau)\): the coefficient is negative and descent raises \(y_w\) and lowers \(y_l\), as in DPO</li>
+      <li>IPO, \(\Delta h&gt;1/(2\tau)\): the coefficient flips sign and descent <b>pulls back</b></li>
+      <li>DPO: the weight \(\sigma(-\beta\Delta h)\) only tends to zero; it never flips sign</li>
+    </ul>
+  </div>
+  <figure class="la-fig wide" id="fig-rampa" data-title="Ramp × parabola: the ball that never stops and the one that comes back">
+    <div class="la-fig-stage" style="height:430px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Top, the DPO loss, \(-\log\sigma(\beta\Delta h)\), a ramp that slopes down forever. Bottom, the IPO loss, \((\Delta h-1/(2\tau))^2\), a parabola with its bottom at \(1/(2\tau)\). The balls roll down the loss (normalized animation speeds) and the arrows show the direction of the push. “Push past the target” puts both balls beyond the bottom of the parabola. The “our pair” mark sits at \(\Delta h=3\) (sum, the paper's form) or \(\Delta h=0.25\) (per-token mean, TRL's form), with \(\beta=\tau\).</figcaption>
+  </figure>
+  <p>On our pair, in the paper's form (sum of log-probs), IPO gives very different verdicts depending on \(\tau\). With \(\tau=0.1\), the target is 5 and the pair (\(\Delta h=3\)) still falls short: loss 4 and derivative −4 with respect to \(\Delta h\), so descent raises the margin. With \(\tau=0.5\), the target is 1 and the pair has already passed it: loss 4, derivative +4, and descent pulls back. With \(\tau=1\), target 0.5, loss 6.25 and derivative +5. DPO, on the same pair, always pushes forward.</p>
+  <h3>Two toy experiments from the paper</h3>
+  <p><b>Two actions, deterministic preference</b> (IPO §5.3.1): \(p^*(y_1\succ y_2)=1\), with uniform \(\pi_{\text{ref}}\) and \(\mu\). DPO converges to \(\pi(y_1)=1\) for any \(\tau\). In IPO, \(p^*(y_1\succ\mu)=3/4\) and \(p^*(y_2\succ\mu)=1/4\). With uniform \(\mu\), half the time \(y'=y_1\) (a tie with itself, ½) and half the time \(y'=y_2\) (a win, 1): \((\tfrac12+1)/2=3/4\); for \(y_2\), \((0+\tfrac12)/2=1/4\). By Eq. 11, the difference, 1/2, divided by \(\tau\) is the optimal log-ratio between \(y_1\) and \(y_2\); with a uniform reference, the optimum is \(\pi^*(y_1)=\sigma(0.5\,\tau^{-1})\): 0.9933 with \(\tau=0.1\); 0.8808 with 0.25; 0.7311 with 0.5; 0.6225 with 1; 0.5622 with 2; 0.5250 with 5. As \(\tau\to\infty\) it goes back to uniform, and as \(\tau\to0\) it becomes deterministic: <b>\(\tau\) controls the distance from the reference again</b>.</p>
+  <p><b>Three actions, total order</b> (IPO §5.4): \(\mathcal D_1=\{(a,b),(b,c),(a,c)\}\), a softmax policy with \(\theta\in\mathbb R^3\), uniform reference, Adam with LR 0.01 for 18,000 steps (the paper uses mini-batch 9; the research note's reproduction, which the figure replays live, uses the full batch). Since the reference is uniform and the softmax cancels in differences, a pair's margin is just \(\theta_w-\theta_l\). IPO has a closed-form solution (derivation from the note): \(\theta_a-\theta_b=\theta_b-\theta_c=1/(3\tau)\).</p>
+  <figure class="la-fig wide" id="fig-bandit" data-title="3-action bandit: DPO collapses, IPO stays anchored">
+    <div class="la-fig-stage" style="height:420px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Real optimization, running in your browser: Adam (LR 0.01, \(\beta_1=0.9\), \(\beta_2=0.999\)), full batch, \(\theta\) initialized at zero. Bars: \(\pi(a), \pi(b), \pi(c)\); the dashed line is the uniform reference (1/3). Below, the trajectory of each probability against the step, on a log scale, up to 18,000. The values match the research note's table (for example, \(\tau=1\): IPO \((0.4484,\ 0.3213,\ 0.2302)\), DPO \((1,\ 0,\ 0)\)).</figcaption>
+  </figure>
+  <p>DPO learns the order and doesn't stop: for any \(\tau\), within 18,000 steps \(a\) takes everything and \(c\) vanishes, even though no data says \(c\) is unacceptable, only that it is worse. IPO learns the same order, but parks where \(\tau\) tells it to: with \(\tau=1\), \(c\) still keeps 23%. The paper shows a second scenario in which an action with no wins at all is zeroed out by DPO for every \(\tau\), while IPO keeps it close to the reference.</p>
+  <h3>\(\tau\) in practice: the normalization trap</h3>
+  <p>In TRL, IPO is the <code>DPOTrainer</code> itself with <code>loss_type</code> <code>"ipo"</code>, and the <code>beta</code> parameter plays the role of \(\tau\). Crucial detail: the current code <b>normalizes per token</b>. It uses each response's <i>mean</i> per-token log-ratio before subtracting \(1/(2\beta)\). The comment in the code says this isn't explicit in the paper, but was confirmed with the authors, and that the paper's results correspond to the normalized form. On our pair, \(\Delta h_{\text{norm}}=1/20-(-2)/10=0.25\), and the same \(\tau\) now means something else:</p>
+  <table class="la-params">
+    <thead><tr><th>\(\tau\) (<code>beta</code>)</th><th>target \(1/(2\tau)\)</th><th>loss, sum (\(\Delta h=3\))</th><th>loss, per-token mean (\(\Delta h=0.25\))</th></tr></thead>
+    <tbody>
+      <tr><td>0.1</td><td>5.0</td><td>4 (still goes up)</td><td>22.5625 (a target of 5 nats <i>per token</i>!)</td></tr>
+      <tr><td>0.5</td><td>1.0</td><td>4 (pulls back)</td><td>0.5625</td></tr>
+      <tr><td>1.0</td><td>0.5</td><td>6.25 (pulls back)</td><td>0.0625</td></tr>
+      <tr><td>2.0</td><td>0.25</td><td>7.5625</td><td>0.0000 (already on target)</td></tr>
+    </tbody>
+  </table>
+  <div class="la-callout warn"><b class="t">Watch the scale of τ</b><p>In the normalized form, \(\Delta h\) is about \(|y|\) times smaller than with the sum. A \(\tau=0.1\) asks for 5 nats <i>per token</i>, a huge departure from the reference; \(\tau\in[0.5,\ 2]\) gives targets from 1 to 0.25 nat per token. The sweep published in the SimPO paper (Table 7) uses \(\tau\in\{0.01,\ 0.1,\ 0.5,\ 1.0\}\) (without stating whether the implementation sums or averages per token). Values of \(\tau\) across implementations (sum × mean) <b>are not comparable</b>: check the code before copying a hyperparameter.</p></div>
+  <p><b>When to use it.</b> When labels are deterministic or there is only one per pair, when data is scarce or noisy, and when you want real anchoring to the reference without relying on early stopping. In the <i>Direct Alignment Algorithms</i> comparison by Rafailov, Chittepu, Park et al. (NeurIPS 2024; TL;DR with Pythia 1B to 6.9B), IPO seemed less prone to over-optimization, especially at 6.9B, and it was the only one in which the implicit reward accuracy showed some correlation, a weak one, with final quality, a correlation the authors attribute to model scale, not to the method. The risk is the opposite of DPO's: <b>underfitting</b> if \(1/(2\tau)\) is too small. In the Smaug paper (Pal et al., 2024), on a math dataset with low edit-distance pairs, IPO “does not improve”.</p>
+</section>
+
+<section class="la-sec">
+  <h2>KTO: prospect theory becomes a loss function</h2>
+  <p>KTO, by Ethayarajh, Xu, Muennighoff, Jurafsky and Kiela (ICML 2024; we use arXiv v5, from September 8, 2026), starts with an unexpected question: <i>why</i> does DPO work so well? The proposed answer is that DPO's loss unintentionally embeds a model of how humans perceive value. If that is what matters, you can write a loss that models this bias on purpose and, as a bonus, does away with pairs.</p>
+  <h3>Prospect theory in five minutes</h3>
+  <p>Offer someone a bet that pays $100 with an 80% chance and nothing with 20%. The expected value is $80. Even so, many people accept a guaranteed $60 rather than bet. Kahneman and Tversky's <span class="la-term" data-term="teoria-do-prospecto">prospect theory</span> explains this with two ideas: humans evaluate outcomes <b>relative to a reference point</b>, not in absolute terms, and they are <b>loss-averse</b>. Formally there is a <span class="la-term" data-term="funcao-de-valor">value function</span> \(v\), which maps an outcome to subjective value relative to \(z_0\), and a weighting function \(\omega\), which distorts probabilities (for example, by overestimating rare events); the utility is \(u(Z)=\sum_z\omega_z\,v(z-z_0)\). KTO ignores \(\omega\), because humans don't see the LLM's full distribution. The classic form from Tversky and Kahneman (1992) is (KTO, Eq. 4):</p>
+  <div class="la-eq">
+    \[ v(z;\lambda,\alpha,z_0)=\begin{cases}(z-z_0)^{\alpha} &amp; z\ge z_0\\[2pt] -\lambda\,(z_0-z)^{\alpha} &amp; z&lt;z_0\end{cases}\qquad \alpha\approx0.88,\ \ \lambda\approx2.25 \]
+    <ul class="la-eq-legend">
+      <li>\(z_0\): the reference point (the psychological “zero”)</li>
+      <li>\(\alpha&lt;1\): concavity in gains (risk aversion) and convexity in losses</li>
+      <li>\(\lambda&gt;1\): <span class="la-term" data-term="aversao-a-perda">loss aversion</span>, the curve is steeper below \(z_0\)</li>
+      <li>0.88 and 2.25: medians measured by Tversky and Kahneman</li>
+    </ul>
+  </div>
+  <p>With these medians, \(v(1)=1\) and \(v(-1)=-2.25\): losing one unit hurts 2.25 times as much as gaining one unit pleases. \(v(10)\approx7.586\) and \(v(-10)\approx-17.068\). The exact shape varies from person to person; what matters are three traits: a reference point, concavity in gains and loss aversion.</p>
+  <h3>HALOs: DPO was already “human”</h3>
+  <p>The paper defines a class of losses, <span class="la-term" data-term="halo">HALOs</span> (<i>human-aware losses</i>, Def. 3.4). The ingredients are the implicit reward \(r_\theta(x,y)=l(y)\log\frac{\pi_\theta(y\mid x)}{\pi_{\text{ref}}(y\mid x)}\), with a normalizer \(l\), a reference point distribution \(Q(Y'\mid x)\) and a non-decreasing value function \(v_{x,y}\). The human value of \((x,y)\) is \(v_{x,y}\big(r_\theta(x,y)-\mathbb E_Q[r_\theta(x,Y')]\big)\) (Eq. 5). A loss is a HALO if it can be written as \(\mathbb E_{x,y\sim\mathcal D}\big[a_{x,y}\,v_{x,y}(\cdot)\big]+C_{\mathcal D}\) with \(a_{x,y}\neq 0\) (Eq. 6), where \(l\), \(a\), \(v\) and \(C\) cannot depend on the policy or the reference; only \(Q\) can.</p>
+  <p>Theorem 3.5 says that <b>DPO and PPO-Clip are HALOs</b>; conditional SFT (CSFT) and SLiC are not. In the experiments, HALOs match or beat non-HALOs at every scale tested (Pythia 1.4B to 12B, Llama 7B to 30B), with a significant difference (p &lt; 0.05) only from 13B up. And a curious result motivated the method: an <b>offline PPO with dummy +1/−1 rewards</b> matches DPO at almost every scale (except Llama-30B). The right inductive bias seems to matter more than the learned reward.</p>
+  <h3>The KTO loss</h3>
+  <p>KTO makes three changes to the Kahneman–Tversky form. (1) It replaces the power \(\alpha\), which is numerically unstable, with a <b>logistic</b>, which is still concave in gains and convex in losses; a \(\beta\) controls saturation. (2) It splits loss aversion into two weights, \(\lambda_D\) for desirable examples and \(\lambda_U\) for undesirable ones. (3) It uses the policy's KL as the <b>reference point</b>: the human judges \(y\) against <i>all</i> possible outputs, so \(Q=\pi_\theta\) and \(z_0=\mathrm{KL}\big(\pi_\theta(y'\mid x)\,\|\,\pi_{\text{ref}}(y'\mid x)\big)\). The result is Eq. 8:</p>
+  <div class="la-eq">
+    \[ \mathcal L_{\text{KTO}}=\mathbb E_{x,y\sim\mathcal D}\big[\lambda_y-v(x,y)\big],\qquad v(x,y)=\begin{cases}\lambda_D\,\sigma\big(\beta\,(r_\theta(x,y)-z_0)\big) &amp; \text{if } y \text{ is desirable}\\[2pt] \lambda_U\,\sigma\big(\beta\,(z_0-r_\theta(x,y))\big) &amp; \text{if } y \text{ is undesirable}\end{cases} \]
+    <ul class="la-eq-legend">
+      <li>\(r_\theta(x,y)=\log\frac{\pi_\theta(y\mid x)}{\pi_{\text{ref}}(y\mid x)}\): our \(h\), without \(\beta\)</li>
+      <li>\(z_0\): the <span class="la-term" data-term="ponto-de-referencia-kto">reference point</span>, an estimate of the KL; <b>no gradient</b></li>
+      <li>\(\lambda_D, \lambda_U\): weights for desirable and undesirable examples</li>
+      <li>\(\lambda_y\): \(\lambda_D\) or \(\lambda_U\) depending on the label; it only makes the loss non-negative</li>
+      <li>\(\beta\): saturation of the logistic (an effect similar to DPO's \(\beta\))</li>
+    </ul>
+  </div>
+  <p>Notice: there are no pairs at all. Each example is a <span class="la-term" data-term="feedback-binario">binary label</span>, good or bad, and the “contrast” is against \(z_0\), not against another response. The paper's intuition for the reference point is elegant. If the model tries to raise the reward of a desirable example by brute force, raising the probability of everything, the KL rises too, the reference point rises with it and nothing is gained. The model is forced to learn what makes <i>that</i> output good. Since \(z_0\) receives no gradient, it only controls where the logistic saturates.</p>
+  <figure class="la-fig wide" id="fig-kt" data-title="Value function: Kahneman–Tversky × KTO">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption><b>“Value function” mode.</b> Left: the Tversky–Kahneman power function; the two points at \(\pm z\) show that the loss weighs \(\lambda\) times the gain. Right: KTO's value for a desirable (mint) and an undesirable (pink) example as a function of \(r_\theta\), with the reference point \(z_0\). The amber area is the “window” \(\beta\,\sigma(1-\sigma)\) that multiplies the gradient: it closes at the ends, and an example that is too easy or too hard stops pulling. The arrows on the points traveling along the curves show the strength of the gradient, which vanishes at the ends. <b>“Balance” mode.</b> The imbalance between desirable and undesirable examples and the recommended range for \(\lambda_D n_D/(\lambda_U n_U)\).</figcaption>
+  </figure>
+  <p>The amber window is Proposition 4.1 in chart form. For a desirable example, the gradient is \(-\lambda_D\,\beta\,\sigma(\cdot)\,(1-\sigma(\cdot))\,\nabla_\theta r_\theta\) (derivation from the research note). If an example's adjusted reward goes to \(\pm\infty\), its contribution to the gradient tends to zero. Examples that are too easy, or too hard (perhaps mislabeled), are ignored. That buys robustness to noise and, as a price, a risk of <b>underfitting</b> on complex distributions, which the paper suggests mitigating with a smaller \(\beta\) and more epochs. Compare with DPO, whose weight \(\sigma(-\beta\Delta h)\) closes on one side only: an extremely “inverted” pair keeps pulling at full strength.</p>
+</section>
+
+<section class="la-sec">
+  <h2>KTO in practice: z₀, thumbs up/down and the balance</h2>
+  <h3>Estimating z₀ without sampling</h3>
+  <p>The reference point is an expected KL, which would require sampling responses from the policy at every step, and that is slow. The paper's trick is to use <b>mismatched pairs</b> within the microbatch. In a microbatch of \(m\) examples \((x_i, y_i)\), pair each prompt with the response of the next example, \(\{(x_1,y_2),(x_2,y_3),\dots,(x_m,y_1)\}\):</p>
+  <div class="la-eq">
+    \[ \hat z_0=\max\Big(0,\ \frac{1}{m}\sum_{i=1}^{m}\log\frac{\pi_\theta(y_j\mid x_i)}{\pi_{\text{ref}}(y_j\mid x_i)}\Big),\qquad j=(i \bmod m)+1 \]
+    <ul class="la-eq-legend">
+      <li>\(y_j\): the response of <i>another</i> example in the microbatch, evaluated on prompt \(x_i\)</li>
+      <li>\(\max(0,\cdot)\): the <i>clamp</i>, because a KL can't be negative</li>
+      <li>cost: one extra forward (policy and reference) on the mismatched pairs</li>
+    </ul>
+  </div>
+  <p>Why responses from other prompts? Because the \(y_i\) themselves were chosen precisely for being canonically good or bad, and their rewards have magnitudes that are not at all representative of the policy. The estimator is <b>biased</b>: the clamp at zero adds upward bias and reduces variance. There is one case where you can skip the estimate and use \(\hat z_0=0\): if KTO comes after an SFT on the same desirable data and the SFT model is the reference, the estimated KL quickly tends to ~0. Without SFT, or with SFT on other data, you have to estimate it.</p>
+  <figure class="la-fig wide" id="fig-z0" data-title="The reference point z₀, assembled inside the microbatch">
+    <div class="la-fig-stage" style="height:430px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>The matrix crosses the prompts \(x_i\) (rows) with the responses \(y_j\) (columns) of a microbatch; each cell is \(\log\pi_\theta(y_j\mid x_i)-\log\pi_{\text{ref}}(y_j\mid x_i)\). The diagonal holds the rewards of the matched examples (✓ desirable, ✗ undesirable); the shifted diagonal, \(j=i+1\) (mod \(m\)), holds the mismatched pairs that estimate \(z_0\). With \(\beta=0.1\) and \(\lambda_D=\lambda_U=1\). <b>Illustrative</b> values, redrawn for each batch.</figcaption>
+  </figure>
+  <p>In TRL (<code>KTOTrainer</code>, stable since v1.8.0), the KL is the mean, aggregated across devices, of \(\log\pi_\theta-\log\pi_{\text{ref}}\) on the mismatched completions, with <code>.clamp(min=0)</code> and no gradient. The mismatched completions are built by shifting the batch by +1, which requires <code>train_sampling_strategy="sequential"</code> (the <code>KTOConfig</code> default) and a per-device batch <b>greater than 1</b>: with 1, the “KL” becomes the example's own reward. The documentation recommends a per-step batch of at least 4.</p>
+  <h3>Binary data and imbalance</h3>
+  <p>KTO only needs one desirable/undesirable label per example. Preference pairs become binary by assuming \(y_w\) is desirable and \(y_l\) undesirable, an assumption the paper itself calls naive; the <i>one-y-per-x</i> variant uses only one of the responses from each pair, eliminating any pairing. The real gain shows up with production data, which usually has far more “bad” than “good”, or the other way around. For this the paper gives a rule of thumb (Eq. 9), with \(n_D\) desirable and \(n_U\) undesirable examples:</p>
+  <div class="la-eq">
+    \[ \frac{\lambda_D\,n_D}{\lambda_U\,n_U}\in\Big[1,\ \frac{3}{2}\Big] \]
+    <ul class="la-eq-legend">
+      <li>the paper's example, ratio 1:10 (desirable:undesirable): \(\lambda_U=1\) and \(\lambda_D\in[10,\ 15]\)</li>
+      <li>default: \(\lambda_D=\lambda_U=1\); the TRL documentation suggests the range \([1,\ 4/3]\)</li>
+      <li>exception: when avoiding the worst matters more (toxicity), \(\lambda_Dn_D&lt;\lambda_Un_U\) may be better</li>
+    </ul>
+  </div>
+  <p>The previous figure's “balance” mode lets you set up this adjustment yourself. The rule implies that, once the imbalance is corrected, sensitivity to gains pays off more than sensitivity to losses on most benchmarks, a curious result for a method named in honor of loss aversion.</p>
+  <h3>What the paper reports</h3>
+  <p>KTO handles extreme imbalance, <b>matching DPO with up to 90% fewer desirable examples</b>. With good enough pretraining, you can skip SFT and go straight to KTO; with DPO, SFT is always needed for the best result. On Zephyr-β-SFT trained on UltraFeedback (Table 2), KTO (\(\beta=0.1\), \(\lambda_D=1\)) scored 53.5 on GSM8k, versus 40.0 for DPO and 39.0 for SFT; the one-y-per-x variant scored 50.0. The ablations tell the method's story: without \(z_0\), 49.5; with a concave value \(v=\log\sigma\), 42.5; with a <b>risk-neutral</b> value (\(v(\cdot)=\cdot\)), 42.0 on GSM8k, and BBH collapses to 6.1. The saturation is not decoration.</p>
+  <p>Two theoretical results complete the picture. Theorem 4.2 shows that maximizing preference likelihood does not identify the “prospect” utility: there are rewards in the same equivalence class, with the same optimal policy, and different value distributions. And Theorem 4.3 deals with <b>contradictory preferences</b>: if \(y_a\succ y_b\) in a proportion \(p\in(0.5,\ 1)\) and the opposite in the rest, and if \(p^{1/\beta}\pi_{\text{ref}}(y_a\mid x)&lt;(1-p)^{1/\beta}\pi_{\text{ref}}(y_b\mid x)\), DPO's optimal policy gives <i>more</i> probability to the minority response \(y_b\), while KTO's update with \(\lambda_D=\lambda_U\) increases that of the majority one. KTO has a better worst case under noise and intransitivity. The paper's recommendation (§4.5): binary feedback, especially imbalanced, calls for KTO; clean, transitive preferences favor DPO, because KTO can underfit; lots of noise or intransitivity favors KTO, and public datasets like SHP, OASST and even the synthetic UltraFeedback usually have this noise.</p>
+  <h3>Hyperparameters</h3>
+  <p>The <b>learning rate</b> is the most sensitive hyperparameter. KTO's optimum is usually 2× to 10× DPO's, because the adjusted reward is smaller in magnitude, and the default recommended in v5 is <b>5e-6 with AdamW</b>, with or without prior SFT, with an already instruction-tuned model and with LoRA. The diagnostic is useful: if the implicit rewards of desirable <i>and</i> undesirable examples drop together, the LR is too aggressive; ideally only the undesirable ones drop. (The paper's comparison experiments used DPO's LR with RMSProp, to be fair; the practical recommendation is different.) The microbatch needs <b>at least 2</b> examples to estimate \(z_0\); the experiments use an effective batch of 32 and the recommendation ranges from 8 to 128. For \(\beta\): 0.1 is the default; \([0.01,\ 0.10)\) if the model has already been tuned on the same data; \((0.10,\ 0.50]\) if the reference is already very good, such as an instruct model.</p>
+  <table class="la-params">
+    <thead><tr><th>Model</th><th>Method</th><th>LR</th><th>\(\beta\)</th></tr></thead>
+    <tbody>
+      <tr><td>Llama-3 8B</td><td>SFT+KTO</td><td>5e-6</td><td>0.05</td></tr>
+      <tr><td>Llama-3 8B</td><td>KTO</td><td>5e-6</td><td>0.10</td></tr>
+      <tr><td>Llama-3 8B (LoRA)</td><td>SFT+KTO</td><td>5e-6</td><td>0.05</td></tr>
+      <tr><td>Llama-3 8B Instruct</td><td>KTO</td><td>5e-6</td><td>0.25</td></tr>
+      <tr><td>Qwen2.5 3B Instruct</td><td>SFT+KTO</td><td>5e-6</td><td>0.10</td></tr>
+      <tr><td>Qwen2.5 3B Instruct</td><td>KTO</td><td>5e-6</td><td>0.50</td></tr>
+    </tbody>
+  </table>
+  <p>The table is Table 1 of v5 (UltraFeedback, AdamW, effective batch 32, gradient clip 10, \(\lambda_D=\lambda_U=1\)). In TRL, <code>KTOConfig</code> ships with <code>beta=0.1</code>, <code>desirable_weight=1.0</code> (\(\lambda_D\)), <code>undesirable_weight=1.0</code> (\(\lambda_U\)) and <code>learning_rate=1e-6</code>, a library default <b>different</b> from the paper's recommendation. On our pair, with \(\beta=0.1\), \(\lambda_D=\lambda_U=1\) and \(\hat z_0=0.5\) (illustrative): \(y_w\) as desirable (\(r=+1\)) has \(v=0.5125\) and loss 0.4875; \(y_l\) as undesirable (\(r=-2\)) has \(v=0.5622\) and loss 0.4378; mean 0.4627. The gradient coefficients \(\beta v(1-v)\) come out at ~0.025, about 0.6× DPO's on the same pair (0.0426). That helps build intuition for why KTO asks for a higher LR, although the real ratio depends on the data.</p>
+</section>
+
+<section class="la-sec">
+  <h2>SimPO: no reference, with a mean and a margin</h2>
+  <p>SimPO, by Meng, Xia and Chen (Princeton; NeurIPS 2024), starts from two complaints about DPO's implicit reward. The first is practical: it requires \(\pi_{\text{ref}}\) throughout training, which costs memory and compute. The second is conceptual: it <b>does not match the metric that guides generation</b>. In decoding, what counts is (approximately) the mean log-likelihood of the text under the policy, with no reference at all. The authors measured that, after DPO, only ~50% of training triples give the preferred response a higher mean log-prob than the rejected one. The model “gets” the pair right by the implicit reward and gets it wrong by the generation metric. The solution is to use the generation metric itself as the reward:</p>
+  <div class="la-eq">
+    \[ r_{\text{SimPO}}(x,y)=\frac{\beta}{|y|}\log\pi_\theta(y\mid x)=\frac{\beta}{|y|}\sum_{i=1}^{|y|}\log\pi_\theta(y_i\mid x,y_{&lt;i}) \]
+    <ul class="la-eq-legend">
+      <li>\(\frac{1}{|y|}\log\pi_\theta\): mean per-token log-prob (<span class="la-term" data-term="normalizacao-por-comprimento">length normalization</span>)</li>
+      <li>\(\beta\): reward scale (much larger than in DPO, because the mean is ~\(|y|\) times smaller than the sum)</li>
+      <li>there is no \(\pi_{\text{ref}}\) anywhere</li>
+    </ul>
+  </div>
+  <p>Why the mean? The sum punishes long responses, because each token adds a negative term. If the preferred response is longer, optimizing the sum forces the model to inflate the probability of long sequences, which raises the risk of degeneration. The ablation without normalization (“w/o LN”, Table 5) shows the effect: the Spearman correlation between mean log-prob and length goes from 0.34 (SimPO) to 0.82, and AlpacaEval 2 LC on Mistral-Base drops from 21.5 to 11.9.</p>
+  <h3>The margin γ: home-field advantage</h3>
+  <p>The second ingredient is a <span class="la-term" data-term="margem-alvo">target margin</span>. Bradley–Terry gains a “home-field advantage” \(\gamma&gt;0\): \(p(y_w\succ y_l\mid x)=\sigma\big(r(x,y_w)-r(x,y_l)-\gamma\big)\). It isn't enough for the preferred response to be better; it must be better by at least \(\gamma\). The loss is (SimPO, Eq. 6):</p>
+  <div class="la-eq">
+    \[ \mathcal L_{\text{SimPO}}=-\mathbb E_{(x,y_w,y_l)\sim\mathcal D}\Big[\log\sigma\Big(\frac{\beta}{|y_w|}\log\pi_\theta(y_w\mid x)-\frac{\beta}{|y_l|}\log\pi_\theta(y_l\mid x)-\gamma\Big)\Big] \]
+    <ul class="la-eq-legend">
+      <li>\(\gamma\): target margin, in reward units; usually given as the ratio \(\gamma/\beta\)</li>
+      <li>\(|y_w|, |y_l|\): lengths in tokens</li>
+      <li>with \(\gamma=0\) and without the division by \(|y|\), it becomes CPO's preference loss</li>
+    </ul>
+  </div>
+  <p>Quality improves with \(\gamma\) up to a point and then gets worse; zeroing \(\gamma\) cost 4.7 LC points on Mistral-Base (16.8 versus 21.5). IPO also has a “target margin” (\(1/(2\tau)\)), but its full objective did worse in this study. The gradient (Appendix F) shows the two mechanical differences from DPO:</p>
+  <div class="la-eq">
+    \[ \nabla_\theta\mathcal L_{\text{SimPO}}=-\beta\,\mathbb E\Big[s_\theta\Big(\frac{1}{|y_w|}\nabla_\theta\log\pi_\theta(y_w\mid x)-\frac{1}{|y_l|}\nabla_\theta\log\pi_\theta(y_l\mid x)\Big)\Big],\qquad s_\theta=\sigma\Big(\frac{\beta}{|y_l|}\log\pi_\theta(y_l)-\frac{\beta}{|y_w|}\log\pi_\theta(y_w)+\gamma\Big) \]
+    <ul class="la-eq-legend">
+      <li>\(s_\theta\): the pair's weight, high when the policy gives \(y_l\) more mean log-prob than \(y_w\) (plus the margin); it doesn't involve the reference</li>
+      <li>\(1/|y|\): each response's gradient is divided by its length; in DPO, long sequences get larger gradients and “dominate” training</li>
+    </ul>
+  </div>
+  <figure class="la-fig wide" id="fig-simpo" data-title="SimPO: sum × mean and the target margin">
+    <div class="la-fig-stage" style="height:450px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Top, the policy's per-token log-probs on the toy pair (the same as in the first figure) flowing into the aggregator: sum or mean. Middle, the rewards \(r_w\) and \(r_l\) on the number line, with the margin \(\gamma\) the preferred response has to open. Bottom, the logistic loss \(-\log\sigma(u)\) with \(u=r_w-r_l-\gamma\) and the pair's point. The presets are the configurations from the paper's Table 8 and the one from the README for Gemma.</figcaption>
+  </figure>
+  <p>In the figure, with \(\beta=2\) and \(\gamma=1\), the sum gives \(u=2\cdot(-25+17)-1=-17\) and a loss ≈ 17: the sum “thinks” the preferred response is much worse, and fixing that would require inflating the probability of the long sequence. The mean gives \(r_w=-2.5\), \(r_l=-3.4\), \(u=-0.1\), loss 0.7444 and weight 0.525: the pair is almost right, it just needs to open the margin. More points from the research note's table: with \(\beta=2.5\) and \(\gamma=0.3\), \(u=+0.825\) and loss 0.3634; with \(\beta=10\) and \(\gamma=5\), \(u=-0.5\) and loss 0.9741.</p>
+  <h3>DPO already had a margin, just a variable one</h3>
+  <p>SimPO's Appendix I rewrites DPO in a revealing way. Expanding the log-ratio:</p>
+  <div class="la-eq">
+    \[ \mathcal L_{\text{DPO}}=-\log\sigma\big(\beta\log\pi_\theta(y_w)-\beta\log\pi_\theta(y_l)-\gamma_{\text{ref}}\big),\qquad \gamma_{\text{ref}}=\beta\log\pi_{\text{ref}}(y_w)-\beta\log\pi_{\text{ref}}(y_l) \]
+    <ul class="la-eq-legend">
+      <li>\(\gamma_{\text{ref}}\): a <b>per-pair</b> margin, set by the reference</li>
+      <li>on our pair, \(\gamma_{\text{ref}}=0.1\cdot(-26+15)=-1.1\) (our calculation): a <i>negative</i> margin, which “forgives” the preferred response for being long</li>
+    </ul>
+  </div>
+  <p>In other words, DPO “is” a reference-free loss with a margin that varies from pair to pair. SimPO replaces that margin with the constant \(\gamma\), and the sum with the mean. In SimPO's Table 15, applying only normalization to DPO helps on Mistral-Base but not on Mistral-Instruct, and applying only \(\gamma\) to DPO doesn't help. There is also the middle ground, Tülu 3's <span class="la-term" data-term="ln-dpo">length-normalized DPO</span>, which keeps the reference and divides each log-ratio by the length: \(-\log\sigma\big(\frac{\beta}{|y_w|}h_w-\frac{\beta}{|y_l|}h_l\big)\). It was the best in Tülu 3, with \(\beta=5\), compared with SimPO and DPO. On our pair, with \(\beta=5\), the logit is \(5\cdot0.25=1.25\) and the loss 0.2519.</p>
+  <h3>No KL, so handle with care</h3>
+  <p>SimPO has no explicit KL. The authors attribute its stability to a small LR, diverse preference data and the LLM's intrinsic robustness, and they measure a low empirical KL (Fig. 5a). But there is a documented warning (Appendix J, Table 16): continuing to train Llama-3-8B-Instruct with LR 1e-6 gave AlpacaEval 2 LC 53.7, with GSM falling from 78.5 to 57.4 and MMLU from 61.7 to 54.9, a case of <span class="la-term" data-term="esquecimento-catastrofico">catastrophic forgetting</span>. With an LR of 4e-7 to 5e-7, the chat gains were smaller and GSM and MMLU were preserved. On Gemma-2-9B-it the LR barely mattered: in the released checkpoint (LR 8e-7), GSM went from 87.4 to 88.0 and MMLU from 72.7 to 72.2, with AlpacaEval 2 LC 72.4 and Arena-Hard 59.1. The repository README also notes that SimPO v0.2 (Llama-3) “struggles” with structured outputs such as JSON, and attributes this to forgetting combined with the high LR. In return, the efficiency gain is real: on Llama-3-Base 8B on 8×H100 (Fig. 5c), DPO took 73 minutes with a 77 GB peak and SimPO, 60 minutes with 69 GB.</p>
+  <table class="la-params">
+    <thead><tr><th>Configuration (Table 8)</th><th>\(\beta\)</th><th>\(\gamma\)</th><th>\(\gamma/\beta\)</th><th>LR</th></tr></thead>
+    <tbody>
+      <tr><td>Mistral-Base</td><td>2.0</td><td>1.6</td><td>0.80</td><td>3e-7</td></tr>
+      <tr><td>Mistral-Instruct</td><td>2.5</td><td>0.3</td><td>0.12</td><td>5e-7</td></tr>
+      <tr><td>Llama-3-Base</td><td>2.0</td><td>1.0</td><td>0.50</td><td>6e-7</td></tr>
+      <tr><td>Llama-3-Instruct</td><td>2.5</td><td>1.4</td><td>0.56</td><td>1e-6</td></tr>
+      <tr><td>Gemma-2-9B-it (README)</td><td>10</td><td>5</td><td>0.50</td><td>8e-7</td></tr>
+    </tbody>
+  </table>
+  <p>The paper's search grid: \(\beta\in[2.0,\ 2.5]\), \(\gamma\in\{0.3,\ 0.5,\ 1.0,\ 1.2,\ 1.4,\ 1.6\}\), LR in \(\{3, 5, 6\}\times10^{-7}\) and \(10^{-6}\), batch 128, 1 epoch, cosine with 10% warmup, max length 2,048. The current README works with <code>gamma_beta_ratio</code> (\(\gamma/\beta\)): 0.8 on Mistral-Base, 0.1 on Mistral-Instruct (the paper gives 0.12), 0.5 on Llama-3-Base, 0.55 on Llama-3-Instruct and 0.3 on Llama-3-Instruct v0.2 with \(\beta=10\). The README's recommendations: the LR is the most critical hyperparameter (search over 3e-7, 5e-7, 8e-7 and 1e-6; 5e-7 is better suited to reasoning such as math); \(\beta\) much larger than in DPO, from 2.0 to 2.5, sometimes 10; start with \(\gamma/\beta=0.5\) and grid over [0, 1]; keep the total batch at 128.</p>
+  <div class="la-callout warn"><b class="t">SimPO in TRL: mind the name</b><p>The “real” SimPO is the <code>CPOTrainer</code> from <code>trl.experimental.cpo</code> with <code>loss_type="simpo"</code> and <code>cpo_alpha=0.0</code> (zeroing CPO's NLL term). The default <code>simpo_gamma</code> is 0.5. The <code>DPOTrainer</code> has a <code>loss_type</code> <code>"sigmoid_norm"</code>, which the documentation associates with SimPO, but which <b>keeps the reference</b>: in practice it is length-normalized DPO, Tülu 3 style, not SimPO.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>The rest of the family: ORPO, CPO, R-DPO, β-DPO and DPOP</h2>
+  <p>With the “score + contrast + anchor” mold in hand, the other variants become easy to read: each one is DPO with one piece swapped. The map below lays out the family tree; click a method (or pick it from the menu) to see its loss, and filter by the type of swap.</p>
+  <figure class="la-fig wide" id="fig-familia" data-title="The DPO family tree">
+    <div class="la-fig-stage" style="height:470px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>DPO at the center; each edge says what changed to reach the neighbor. Particles flow from DPO to the variants. The filter highlights the methods that swap the anchor (reference), the data type, the contrast function or the length treatment. Below, the selected method's loss in compact notation (\(h\) = policy/reference log-ratio, \(\Delta h = h_w-h_l\)).</figcaption>
+  </figure>
+  <h3>ORPO: preference and SFT in a single stage</h3>
+  <p><span class="la-term" data-term="orpo">ORPO</span> (<i>Odds Ratio Preference Optimization</i>; Hong, Lee and Thorne, 2024) does SFT and preference <b>in a single step</b> and <b>without a reference</b>. It scores each response by the per-token mean, \(\log P_\theta(y\mid x)=\frac{1}{m}\sum_t\log P_\theta(y_t\mid x,y_{&lt;t})\), so that \(P_\theta\) is the geometric mean of the token probabilities, and compares the <span class="la-term" data-term="razao-de-chances">odds</span> of the two responses (Eq. 3 to 7):</p>
+  <div class="la-eq">
+    \[ \mathcal L_{\text{ORPO}}=\mathbb E\big[\mathcal L_{\text{SFT}}+\lambda\,\mathcal L_{\text{OR}}\big],\qquad \mathcal L_{\text{OR}}=-\log\sigma\Big(\log\frac{\text{odds}_\theta(y_w\mid x)}{\text{odds}_\theta(y_l\mid x)}\Big),\qquad \text{odds}_\theta(y\mid x)=\frac{P_\theta(y\mid x)}{1-P_\theta(y\mid x)} \]
+    <ul class="la-eq-legend">
+      <li>\(\mathcal L_{\text{SFT}}\): the (per-token) NLL of the preferred response, i.e. SFT itself</li>
+      <li>\(\lambda\): weight of the preference term (default 0.1; ablation 0.1 / 0.5 / 1.0)</li>
+      <li>\(P_\theta\): geometric mean of the token probabilities</li>
+    </ul>
+  </div>
+  <p>The gradient of the odds term is \(\delta(d)\,h(d)\) (Eq. 8 to 10), with \(\delta(d)=\big[1+\frac{\text{odds}(y_w)}{\text{odds}(y_l)}\big]^{-1}\), a penalty that vanishes when the pair is already right, and \(h(d)=\frac{\nabla\log P_\theta(y_w)}{1-P_\theta(y_w)}-\frac{\nabla\log P_\theta(y_l)}{1-P_\theta(y_l)}\). The factor \(1/(1-P)\) is ~1 when \(P\) is small and grows as \(P\) approaches 1 (our reading of Eq. 10; the paper's text says the factor amplifies the gradient when \(P\) is low, but the math shows the opposite: \(1/(1-P)\approx1\) for small \(P\) and it blows up as \(P\to1\)): a rejected response that the model already finds very likely gets a stronger push down. Why odds and not the probability ratio? According to the authors (§7.1), the log probability ratio leads to a more extreme discrimination against the rejected response; in joint SFT, a softer contrast preserves domain adaptation. With \(\lambda=0.1\), the log-probs of chosen and rejected responses stay close and those of the rejected ones don't even drop; \(\lambda=1.0\) hurt extraction, math and reasoning on MT-Bench and improved the open-ended categories. Without a reference, ORPO does <b>half the forwards</b> of DPO. The reported training uses a peak LR of 8e-6 for 10 epochs (OPT, Phi-2, Llama-2), picking the checkpoint with the lowest validation loss. In TRL (<code>trl.experimental.orpo</code>), <code>beta</code> is the paper's \(\lambda\). On our pair: \(P_w=e^{-1.25}=0.2865\), \(P_l=e^{-1.70}=0.1827\), odds 0.4016 and 0.2235, log of the ratio 0.5859, \(\mathcal L_{\text{OR}}=0.4425\), \(\mathcal L_{\text{SFT}}=1.25\) and a total of 1.2943.</p>
+  <h3>CPO: the uniform reference</h3>
+  <p><span class="la-term" data-term="cpo">CPO</span> (<i>Contrastive Preference Optimization</i>; Xu et al., 2024) was born in machine translation (ALMA-R), where human “gold” translations are sometimes worse than those of strong models, and plain SFT would copy that ceiling. The approximation is to take \(\pi_{\text{ref}}\) as <b>uniform</b>: the reference terms cancel out and what remains is \(\mathcal L(\pi_\theta;U)=-\mathbb E\big[\log\sigma\big(\beta\log\pi_\theta(y_w)-\beta\log\pi_\theta(y_l)\big)\big]\) (Eq. 3). Theorem 1 shows that, if the reference were the “ideal” policy of the preferred responses, DPO's loss (plus a constant) would be upper-bounded by this uniform version. A <i>behavior cloning</i> constraint, \(\mathbb E[\mathrm{KL}(\pi_w\|\pi_\theta)]&lt;\epsilon\), becomes, through the Lagrangian (with multiplier 1), an NLL term on the preferred responses: \(\mathcal L_{\text{CPO}}=\mathcal L(\pi_\theta,U)-\mathbb E[\log\pi_\theta(y_w\mid x)]\). Watch out for length: without normalization, the preference uses <b>summed</b> log-probs. On our pair, \(\mathcal L_{\text{prefer}}=-\log\sigma(0.1\cdot(-25+17))=1.1711\): CPO sees the pair as “wrong” and pushes hard. In the SimPO paper (Table 10), CPO generates responses ~50% longer than SimPO on Arena-Hard, which favors CPO on that benchmark, since Arena-Hard does not penalize length. In TRL: <code>CPOTrainer</code>, <code>cpo_alpha=1.0</code> (BC weight), <code>beta=0.1</code>.</p>
+  <h3>R-DPO: charging for length</h3>
+  <p>Park, Rafailov, Ermon and Finn (2024) measured the size of the problem: on the HH and TL;DR datasets there is a small preference bias toward long responses, and unregularized DPO produces responses <b>~2× longer</b>, outside the dataset's distribution. On HH with \(\beta=0.1\), this already happens in the first 10% of the epoch. The fix, <span class="la-term" data-term="r-dpo">R-DPO</span>, puts length into the RL objective: \(\max\ \mathbb E[r(x,y)-\alpha|y|]-\beta\,\mathbb D_{\text{KL}}\) (Eq. 6). The optimum is \(\pi^*\propto\pi_{\text{ref}}\,e^{(r-\alpha|y|)/\beta}\), so \(r=\beta\log\frac{\pi^*}{\pi_{\text{ref}}}+\beta\log Z+\alpha|y|\), and the same DPO trick gives (Eq. 9):</p>
+  <div class="la-eq">
+    \[ \mathcal L_{\text{R-DPO}}=-\mathbb E\Big[\log\sigma\Big(\beta\,\Delta h+\alpha\,\big(|y_w|-|y_l|\big)\Big)\Big] \]
+    <ul class="la-eq-legend">
+      <li>\(\alpha\): price per token of length (0.01 on HH and 0.05 on TL;DR in the paper's Fig. 2)</li>
+      <li>when \(y_w\) is longer, the positive term already “explains” part of the preference and the implicit margin needs to be smaller (interpretation)</li>
+    </ul>
+  </div>
+  <p>The paper reports up to <b>20%</b> improvement in <i>win rate</i> when controlling for length; the sweeps use \(\alpha\in\{0,\ 0.005,\ 0.01\}\) on HH and \(\{0,\ 0.2,\ 0.5\}\) on TL;DR, with \(\beta\in\{0.05,\ 0.1,\ 0.5\}\), and the scales depend on \(\beta\) and on the typical length. On our pair, with \(\beta=0.1\) and \(\alpha=0.01\): logit \(0.3+0.01\cdot10=0.4\) and loss 0.5130. An important caveat comes from the DAA over-optimization analysis: correcting for length shifts the KL–<i>win rate</i> frontier, but does <b>not</b> eliminate over-optimization.</p>
+  <h3>β-DPO: a β that adapts to the batch</h3>
+  <p><span class="la-term" data-term="beta-dpo">β-DPO</span> (Wu et al., NeurIPS 2024) measures each pair's discrepancy, \(M_i=r(y_w^{(i)})-r(y_l^{(i)})\), with the implicit reward computed using a \(\beta_0\). The per-instance version, \(\beta_i=[1+\alpha(M_i-M_0)]\beta_0\) (Eq. 5), can destabilize training; the one actually used is <b>per batch</b>, \(\beta_{\text{batch}}=\big[1+\alpha\big(\mathbb E_{i\in\text{batch}}[M_i]-M_0\big)\big]\beta_0\) (Eq. 6), with \(M_0\) updated by a moving average (Eq. 7). There is also a filter that samples \(|\text{batch}|\times\rho\) examples with a Gaussian weight around \(M_0\) (Eq. 8 and 9; \(\rho=0.8\) by default). The principle: “easy” pairs, with a large gap, call for a <b>larger</b> \(\beta\) (caution against noise); close, high-quality pairs call for a <b>smaller</b> \(\beta\) (an assertive update). Values: \(\beta_0=0.1\), optimal \(\alpha\) typically between 0.6 and 1.0. With \(\alpha=0.6\) and \(M_0=0.2\), a batch with \(\bar M=0\) gives \(\beta=0.088\) and one with \(\bar M=1\) gives 0.148.</p>
+  <h3>DPOP: no knocking down the preferred response</h3>
+  <p>Remember the <span class="la-term" data-term="deslocamento-de-verossimilhanca">likelihood displacement</span> from the previous chapter: since DPO's loss only sees the margin, \(\log\pi_\theta(y_w)\) can <b>fall</b> together with \(\log\pi_\theta(y_l)\), as long as \(y_l\) falls more, and the mass moves to other responses. Razin et al. (ICLR 2025) show an alarming case: in an alignment run meant to <i>increase</i> refusals on unsafe prompts, Llama-3-8B-Instruct's refusal rate on SORRY-Bench dropped from 74.4% to 33.4%. <span class="la-term" data-term="dpop">DPOP</span> (DPO-Positive; Pal et al., 2024, the Smaug paper) attacks this directly:</p>
+  <div class="la-eq">
+    \[ \mathcal L_{\text{DPOP}}=-\mathbb E\Big[\log\sigma\Big(\beta\Big(\Delta h-\lambda\max\Big(0,\ \log\frac{\pi_{\text{ref}}(y_w\mid x)}{\pi_\theta(y_w\mid x)}\Big)\Big)\Big)\Big] \]
+    <ul class="la-eq-legend">
+      <li>the penalty is zero while \(\pi_\theta(y_w)\ge\pi_{\text{ref}}(y_w)\) and grows when the preferred response drops below the reference</li>
+      <li>the paper's values: \(\beta=0.3\), \(\lambda=50\) (ablation 5, 50, 500), LR 5e-5, AdamW, 1,000 steps</li>
+    </ul>
+  </div>
+  <p>On MetaMath, with low edit-distance pairs, DPO and SLiC “fail catastrophically”, IPO does not improve and only DPOP improves. On our pair, if \(\log\pi_\theta(y_w)\) drops to −27 (\(h_w=-1\)), DPO with \(\beta=0.3\) only sees a smaller margin (logit \(0.3\cdot(-1+2)=0.3\), loss 0.5544), with no way to tell this case apart from a rejected response that went up; DPOP's penalty, on the other hand, is 1, and its logit goes to \(0.3\cdot(1-50)=-14.7\): loss 14.7. DPOP “screams” when the preferred response drops.</p>
+</section>
+
+<section class="la-sec">
+  <h2>The same pair, seven losses</h2>
+  <p>Time to put everything on the same workbench. The calculator below evaluates seven losses on the toy pair, with the reference fixed (−26 and −15, lengths 20 and 10) and the policy free: you control \(\log\pi_\theta(y_w)\) and \(\log\pi_\theta(y_l)\). For each method it shows the loss and the <b>push</b> that gradient descent gives each log-prob, \(-\partial\mathcal L/\partial\log\pi_\theta(y)\): positive raises the response, negative lowers it. On the plane, each point is a policy state; the arrows give the direction of each method's push, and the particle follows the flow of the chosen method.</p>
+  <figure class="la-fig wide" id="fig-calc" data-title="Calculator: the same pair under every loss">
+    <div class="la-fig-stage" style="height:470px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Fixed hyperparameters: DPO \(\beta=0.1\); IPO \(\tau=0.5\) (sum, the paper's form); KTO \(\beta=0.1\), \(\hat z_0=0.5\), \(\lambda_D=\lambda_U=1\) (loss = mean of the two examples, pushes per example); SimPO \(\beta=2\), \(\gamma=1\); ORPO \(\lambda=0.1\) (with per-token NLL); R-DPO \(\beta=0.1\), \(\alpha=0.01\); CPO \(\beta=0.1\) (preference term only). The arrows on the plane show direction only; the magnitude is in the table. Dashed lines: \(\Delta h=0\) (lilac), the IPO target \(\Delta h=1\) (mint) and SimPO's \(u=0\) boundary (pink).</figcaption>
+  </figure>
+  <p>In the “after a few steps” state (−25 and −17), the table reproduces the research note: DPO 0.5544; IPO 4.0 (the pair has already passed the target 1, and IPO pulls \(y_w\) down and \(y_l\) up); KTO 0.4627; SimPO 0.7444; ORPO 1.2943; R-DPO 0.5130; CPO 1.1711. A few contrasts, which hold for any \(\log\pi\) you choose:</p>
+  <ul>
+    <li><b>DPO, R-DPO and CPO push along the diagonal</b> (\(+1, -1\)): only the difference matters. R-DPO merely shifts the point where the weight saturates.</li>
+    <li><b>SimPO pushes the short response harder.</b> The push is \(\propto(1/|y_w|,\ -1/|y_l|)\), so \(y_l\), with 10 tokens, gets twice the push of \(y_w\), with 20. The \(u=0\) boundary has slope \(|y_l|/|y_w|=1/2\) on the plane, versus 1 for DPO's lines.</li>
+    <li><b>IPO has a finish line.</b> The particle stops at the target \(\Delta h=1/(2\tau)\); DPO keeps walking along the diagonal forever.</li>
+    <li><b>KTO treats each response on its own</b>, with windows that close at the ends, and ORPO pulls \(y_w\) up even when the pair is already ordered, because of the NLL.</li>
+  </ul>
+  <p>Try the “displacement” preset: both responses drop (−28 and −21). The margin grows (\(\Delta h=4\)) and DPO's loss <i>decreases</i> to 0.5130, even with the preferred response 2 nats below the reference. It is likelihood displacement in miniature. SimPO, having no reference, has no way of even knowing that something dropped; ORPO keeps pulling \(y_w\) up through the NLL. Putting the tables together gives the research note's message: when the preferred response is longer, methods <b>without a reference and without normalization</b> (CPO, SLiC) see a “wrong” pair and push hard; DPO discounts length through the reference; SimPO and normalized DPO remove it through the mean; R-DPO discounts it explicitly.</p>
+</section>
+
+<section class="la-sec">
+  <h2>In practice: choose, configure and serve</h2>
+  <p>The table summarizes the family with the values as published. “F” is one forward per pair (or per example); only the policy has a backward.</p>
+  <table class="la-params">
+    <thead><tr><th>Method</th><th>Reference?</th><th>Data</th><th>Cost per step</th><th>Published hyperparameters</th><th>Risks</th><th>When to use</th></tr></thead>
+    <tbody>
+      <tr><td><b>DPO</b></td><td>yes (precomputable; LoRA with the adapter disabled)</td><td>pairs</td><td>2F policy + 2F reference</td><td>\(\beta\) 0.1 (0.01–0.5); LR 5e-7–1e-6; 1 epoch; batch 64–128</td><td>overfits deterministic preferences; displacement; verbosity; over-optimization hump</td><td>the default, with good-quality pairs and prior SFT</td></tr>
+      <tr><td><b>IPO</b></td><td>yes</td><td>pairs</td><td>same as DPO</td><td>\(\tau\): published sweep 0.01–1 (implementation scale not stated); in TRL's <code>DPOTrainer</code>, which uses the per-token mean, reasonable targets call for \(\tau\approx0.5\)–2; target \(1/(2\tau)\)</td><td>anchors even with deterministic labels; may underfit</td><td>little data, single label per pair, noise</td></tr>
+      <tr><td><b>KTO</b></td><td>yes, plus the estimated KL</td><td><b>binary</b>, tolerates imbalance</td><td>2F policy + 2F reference per example (matched + mismatched)</td><td>\(\beta\) 0.1 (0.01–0.5); \(\lambda_Dn_D/\lambda_Un_U\in[1,\,1.5]\); LR ~5e-6; microbatch ≥ 2</td><td>robust to noise and intransitivity; risk of underfitting</td><td>good/bad feedback, production logs, imbalanced classes</td></tr>
+      <tr><td><b>SimPO</b></td><td><b>no</b></td><td>pairs</td><td>2F policy</td><td>\(\beta\) 2–2.5 (up to 10); \(\gamma/\beta\approx0.5\); LR 3e-7–1e-6; batch 128</td><td>no KL: forgetting with a high LR</td><td>tight memory; aligning training with generation</td></tr>
+      <tr><td><b>ORPO</b></td><td><b>no</b></td><td>pairs (NLL on the chosen one)</td><td>2F policy</td><td>\(\lambda\) 0.1 (0.1–1.0); LR 8e-6 at ≤ 7B</td><td>a high \(\lambda\) hurts deterministic tasks</td><td>no prior SFT; single stage</td></tr>
+      <tr><td><b>CPO</b></td><td><b>no</b></td><td>pairs + NLL</td><td>2F policy</td><td>\(\beta\) 0.1; BC weight 1</td><td>sum of log-probs is length-sensitive</td><td>translation; imperfect “gold”</td></tr>
+      <tr><td><b>R-DPO</b></td><td>yes</td><td>pairs + lengths</td><td>same as DPO</td><td>\(\alpha\) 0.005–0.05 (up to 0.5 on TL;DR)</td><td>does not solve over-optimization</td><td>dataset with length bias</td></tr>
+      <tr><td><b>β-DPO</b></td><td>yes</td><td>pairs</td><td>DPO + batch statistics</td><td>\(\beta_0\) 0.1; \(\alpha\) 0.6–1.0; \(\rho\) 0.8</td><td>more knobs to tune</td><td>data of mixed quality</td></tr>
+      <tr><td><b>DPOP</b></td><td>yes</td><td>pairs</td><td>same as DPO</td><td>\(\beta\) 0.3; \(\lambda\) 50</td><td>a large \(\lambda\) dominates the loss</td><td>low edit-distance pairs (math)</td></tr>
+    </tbody>
+  </table>
+  <p>A decision guide, our own interpretation of the recommendations in the papers themselves:</p>
+  <ol class="la-steps">
+    <li><b>Have pairs and an SFT?</b> Start with DPO. If the labels are deterministic or few, or if over-optimization shows up, go with IPO. If verbosity bothers you, R-DPO or length-normalized DPO.</li>
+    <li><b>Have “good/bad” labels or a strong imbalance?</b> KTO, with \(\lambda_D, \lambda_U\) tuned by Eq. 9.</li>
+    <li><b>Short on memory, no room for a reference?</b> SimPO, with a conservative LR, or ORPO, if you haven't done SFT yet.</li>
+    <li><b>Is the preferred response's likelihood dropping and behavior getting worse?</b> Filter pairs (the <span class="la-term" data-term="ches">CHES</span> score from Razin et al.), use DPOP or add an NLL on the preferred responses.</li>
+    <li><b>Can you generate and judge during training?</b> Go online/iterative: it is the biggest structural leap (in OAIF, the online version beat the offline one in ~66% of human evaluations, averaged over DPO, IPO and SLiC).</li>
+  </ol>
+  <figure class="la-fig wide" id="fig-decisao" data-title="Which variant? Decision and memory">
+    <div class="la-fig-stage" style="height:450px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>On the left, the decision path for your data and your situation. On the right, training memory by formula, <b>without activations</b>: AdamW in mixed precision ≈ 16 bytes per parameter (weights, gradients and optimizer states, ZeRO accounting) plus 2 bytes per parameter for the reference in BF16 (zero if the log-probs are precomputed). With LoRA, the frozen base in BF16 (2 bytes/parameter) also serves as the reference, with the adapters disabled. An estimate, not a measurement.</figcaption>
+  </figure>
+  <p>The memory math explains the popularity of reference-free methods. For an 8B model, full fine-tuning needs ~128 GB just for states, the entire unified memory of a DGX Spark (128 GB), before activations; the reference adds ~16 GB. With LoRA, the base in BF16 takes ~16 GB and serves as both policy and reference, and SimPO's advantage shrinks to compute (2 forwards instead of 4). The full math, with activations, gradient checkpointing and ZeRO, is in <a data-ch="treino-memoria-lora">chapter 51</a>.</p>
+  <h3>Configuring in TRL and MLX</h3>
+  <p>In TRL (1.14 on PyPI; the <code>main</code> read during research is 1.15.0.dev0), the three main variants change only a few lines compared with a DPO script:</p>
+  <pre data-lang="python"><code># IPO: the same DPOTrainer, a different loss. beta = τ, and the log-ratio is a per-token MEAN.
+args = DPOConfig(loss_type=["ipo"], beta=0.5)        # sweep τ; don't copy τ from another implementation
+
+# KTO: dataset {prompt, completion, label}; pairs become chosen→True, rejected→False
+from trl import KTOConfig, KTOTrainer
+args = KTOConfig(beta=0.1, desirable_weight=1.0, undesirable_weight=1.0,   # λ_D, λ_U (Eq. 9)
+                 per_device_train_batch_size=4,      # &gt; 1: the KL uses completions from OTHER examples
+                 gradient_accumulation_steps=4,
+                 learning_rate=5e-6,                 # the paper's recommendation; TRL's default is 1e-6
+                 max_length=2048)                    # train_sampling_strategy="sequential" is the default
+
+# Real SimPO: CPOTrainer without the NLL term
+from trl.experimental.cpo import CPOConfig, CPOTrainer
+args = CPOConfig(loss_type="simpo", cpo_alpha=0.0, beta=2.5, simpo_gamma=1.375,
+                 learning_rate=1e-6, num_train_epochs=1)   # high LR = risk of forgetting</code></pre>
+  <p>On the Mac, plain <code>mlx-lm</code> doesn't do preference optimization. <code>mlx-lm-lora</code> 3.1.3 has <code>--train-mode</code> <code>dpo</code>, <code>cpo</code> and <code>orpo</code>, among others, and <code>--dpo-cpo-loss-type</code> \(\in\) {<code>sigmoid</code>, <code>hinge</code>, <code>ipo</code>, <code>dpop</code>}: IPO and DPOP are there, but <b>there is no KTO or SimPO</b>. For binary data on the Mac, one way out is to convert the labels into pairs (best positive × worst negative per prompt) and use DPO. <a data-ch="receita-pos-treino">Chapter 63</a> builds these recipes end to end.</p>
+  <p><b>What to monitor.</b> For the methods with a reference, TRL's metrics are the implicit rewards: <code>rewards/chosen</code>, <code>rewards/rejected</code>, <code>rewards/margins</code> and <code>rewards/accuracies</code>, plus <code>logps/chosen</code> (if it keeps falling, that's displacement). In KTO, track the estimated <code>kl</code> (it should stay positive and stable) and check that only the undesirable rewards drop. In all of them: the mean generation length and the <i>win rate</i> <b>per checkpoint</b>. In the DAA analysis, the best point showed up at only ~25% of an epoch when the KL budget is loose; looking only at the end of training hides the over-optimization hump.</p>
+  <div class="la-callout recipe" data-recipe="all"><b class="t"><span class="la-rb all"></span> Bridge to Module 1</b><p><b>Serving doesn't change.</b> IPO, KTO and SimPO produce weights with the same architecture as the starting model; if training used LoRA, the adapter can be merged before quantization, and the vLLM serving recipe stays the same (<a data-ch="receita-do-zero">chapter 46</a>). <b>Online needs fast inference.</b> TRL's <code>OnlineDPOTrainer</code> (<code>trl.experimental.online_dpo</code>) accepts <code>loss_type</code> <code>sigmoid</code> or <code>ipo</code> and generates responses with <code>use_vllm</code>, in <code>colocate</code> or <code>server</code> mode: everything Module 1 taught about the KV cache and continuous batching turns into training speed. <b>Aligning is not editing.</b> The GLM abliteration (<a data-ch="abliteracao">chapter 19</a>) removes a refusal direction without any training; likelihood displacement shows the reverse path, a DPO <i>designed</i> to increase refusals that cut them from 74.4% to 33.4%. One possible reading (our interpretation): alignment behaviors live in directions of the residual stream, and preference optimization moves them, not always on purpose.</p></div>
+  <p>All the methods in this chapter start from fixed pairs or labels and a supervised loss. The <a data-ch="awr-contrastivo">next chapter</a> opens up the other side of the family: the path of <b>regression</b> (AWR, ReST, RAFT: an SFT on samples weighted by the reward, with weight \(\exp(A/\beta)\) in AWR, or filtered by it, with a threshold in ReST and best-of-\(K\) in RAFT, the limiting case of this weighting; the exponential weight leads to the same “tilted” optimum as DPO) and the path of <b>contrast</b> (InfoNCE, SLiC, CPL), where you will discover that DPO is exactly an InfoNCE with a single negative.</p>
+</section>

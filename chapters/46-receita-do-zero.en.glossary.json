@@ -1,0 +1,86 @@
+{
+ "cabecalho-safetensors": {
+  "t": "Safetensors header",
+  "d": "The start of a <code>.safetensors</code> file: 8 bytes holding the size N (a 64-bit little-endian integer) followed by N bytes of JSON with the <code>dtype</code>, <code>shape</code> and <code>data_offsets</code> of every tensor. You can read it without downloading the data."
+ },
+ "range-request": {
+  "t": "Range request (HTTP)",
+  "d": "An HTTP request with the <code>Range: bytes=a-b</code> header, which asks for just one slice of the file. Used in triage to read the safetensors headers of ~1 GB shards without downloading them."
+ },
+ "pre-sharding": {
+  "t": "Pre-sharding",
+  "d": "A checkpoint saved already sliced for a specific tensor-parallel degree (in MiMo, <code>tp_size: 4</code> in the fused QKV). Running at a different TP requires reassembling the slices and, sometimes, requantizing."
+ },
+ "diffkv": {
+  "t": "DiffKV",
+  "d": "Attention in which K and V have different head dimensions (in MiMo, 192 and 128). Common kernels assume <code>head_size_v == head_size</code>; vLLM has dedicated backends (<code>TRITON_ATTN_DIFFKV</code>, <code>FLASH_ATTN_DIFFKV</code>)."
+ },
+ "attention-sink": {
+  "t": "Attention sink",
+  "d": "An extra learned logit in the attention softmax, one per head, that gives attention a place to “dump” probability mass. It stabilizes short windows; in MiMo only the SWA layers have a sink."
+ },
+ "memoria-unificada": {
+  "t": "Unified memory (UMA)",
+  "d": "CPU and GPU use the same physical memory pool (LPDDR5X on the GB10). The OS, the page cache and the host processes compete with vLLM for the same bytes."
+ },
+ "gmu": {
+  "t": "GMU (--gpu-memory-utilization)",
+  "d": "The fraction of CUDA-visible memory that vLLM may use for weights, activations, CUDA graphs and KV cache. On the GB10 each 0.01 is worth ~1.2 GiB taken from the host’s headroom; the alternative is to pin the pool with <code>--kv-cache-memory</code>."
+ },
+ "alocador-kv-hibrido": {
+  "t": "Hybrid KV allocator",
+  "d": "The part of vLLM that groups layers with the same KV type (global, window, Mamba, drafter) and gives each group pages of the same size. Incomplete groups waste space: in MiMo, 9 global layers in groups of 5 take up 10 slots (+11%)."
+ },
+ "kld": {
+  "t": "KLD (KL divergence)",
+  "d": "\\( D_{KL}(P\\|Q)=\\sum_t P(t)\\log\\frac{P(t)}{Q(t)} \\): how far the candidate Q’s next-token distribution strays from the reference P, in nats. The preferred metric for comparing quantizations; perplexity alone hides errors that cancel out."
+ },
+ "w4a16-w4a8-w4a4": {
+  "t": "W4A16 / W4A8 / W4A4",
+  "d": "Weight bits / activation bits inside the GEMM. Fewer activation bits give more compute throughput (especially in prefill) and more error. In MiMo, Marlin MXFP4 in W4A16 or W4A8 (<code>VLLM_MARLIN_INPUT_DTYPE=fp8</code>)."
+ },
+ "tensor-parallel": {
+  "t": "Tensor parallel (TP)",
+  "d": "Splitting each of the model’s matrices across GPUs (by columns or rows), with all-reduces to combine the results: two per layer in a Transformer block. It requires heads, KV heads and widths to divide by the TP degree."
+ },
+ "overlay": {
+  "t": "Overlay",
+  "d": "A <code>.py</code> file of the installed package replaced by a bind-mount (<code>-v file:target:ro</code>), generated from the pinned image’s own file by a fail-closed patch. It fixes the engine without rebuilding the image."
+ },
+ "fail-closed": {
+  "t": "Fail-closed",
+  "d": "The property of a patch that, faced with any surprise (a missing or duplicated anchor, a different hash), aborts with a clear error instead of producing a half-modified file. It is the opposite of failing silently."
+ },
+ "paridade-truncada": {
+  "t": "Truncated parity",
+  "d": "A numerical test that compares the engine and the reference (HF) with the same first N layers of the model (<code>--hf-overrides '{\"num_hidden_layers\": N}'</code>), via KLD and top-1 agreement of the logprobs. It isolates kernel and loading errors without having to run the whole model in the reference."
+ },
+ "tool-call-storm": {
+  "t": "Tool-call storm",
+  "d": "A failure in which the model repeats the same tool call dozens or hundreds of times. In MiMo it showed up with the near-greedy decoding of vLLM’s defaults; <code>--generation-config auto</code> and the MOPD checkpoint mitigate it."
+ },
+ "aceitacao-especulativa": {
+  "t": "Acceptance (spec decode)",
+  "d": "How many drafted tokens the target accepts per step (and the per-position rate, which decays with position). Read from <code>/metrics</code> as Δaccepted/Δdrafts; together with the step cost, it is what decides k."
+ },
+ "needle-test": {
+  "t": "Needle-in-a-haystack",
+  "d": "A long-context test: it hides a fact (the “needle”) at various depths of a long text and asks about it at the end. It catches mask and window bugs that short prompts do not reveal."
+ },
+ "teto-de-banda": {
+  "t": "Bandwidth decode ceiling",
+  "d": "The upper bound on a single stream’s tok/s without speculation: memory bandwidth ÷ bytes read per step (active experts + everything that is dense). For MiMo at TP2, ~273 GB/s ÷ ~6.4 GB ≈ 43 tok/s; in practice, 50–65% of that."
+ },
+ "ab-a": {
+  "t": "A/B/A",
+  "d": "An experiment design: baseline, change and baseline again, with repetitions and a median per arm. It separates the effect of the change from the system’s drift (page cache, autotune, temperature); you accept only if B beats both baselines."
+ },
+ "plugin-out-of-tree": {
+  "t": "Out-of-tree plugin (vLLM)",
+  "d": "A Python package with an entry point in the <code>vllm.general_plugins</code> group that registers models, quantization methods or ops without forking vLLM (<code>ModelRegistry.register_model(\"Arch\", \"package.module:Class\")</code>)."
+ },
+ "mopd": {
+  "t": "MOPD (MiMo post-training)",
+  "d": "A post-training stage that distills several specialized teachers on the student’s own samples (<i>on-policy</i>); the card describes the MOPD2 version as <i>Multi-Prefix Multi-Teacher On-Policy Distillation</i>. The MiMo-V2.6-Flash-MOPD checkpoint is the RL one with that extra stage: same architecture, same config and same drafter, different weights."
+ }
+}

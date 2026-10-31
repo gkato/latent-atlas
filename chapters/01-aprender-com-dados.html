@@ -1,0 +1,341 @@
+<p class="la-lead">Antes de ser servido, um modelo precisou ser ensinado. O GLM-5.3-Flash chega à receita como 321.323.031.390 números. O DeepSeek-V4-Flash chega como 284 bilhões, e o Qwen3.8-Flash-Next como 125 bilhões mais uma tabela de 51 bilhões. Ninguém escreveu esses números à mão. Todos foram <b>aprendidos</b>: botões minúsculos foram girados, um pouco de cada vez, até o modelo errar cada vez menos ao prever o próximo pedaço de texto. Este capítulo conta essa história desde o começo. Você vai ver o que é uma função com parâmetros, como se mede o erro, como o gradiente diz para onde girar cada botão e por que existem otimizadores como AdamW e Muon. A história termina na fronteira que organiza toda a plataforma: na inferência, os botões congelam. Saber o que o treino decidiu é o que permite dizer o que uma receita pode mudar e o que ela nunca deve tocar.</p>
+
+<section class="la-sec">
+  <h2>Aprender é ajustar uma função</h2>
+  <p>Esqueça os LLMs por um instante. Uma sorveteria quer prever quantos picolés vai vender a partir da temperatura do dia. Ela tem um caderno com 12 dias anotados: a temperatura \(x_i\) e as vendas \(y_i\). Um <b>modelo</b> é qualquer regra que transforma \(x\) numa previsão \(\hat y\). A regra mais simples é uma reta:</p>
+  <div class="la-eq">
+    \[ \hat y \;=\; f_\theta(x) \;=\; w\,x + b, \qquad \theta = (w,\ b) \]
+    <ul class="la-eq-legend">
+      <li>\(x\): a entrada (temperatura, em °C)</li>
+      <li>\(\hat y\): a previsão do modelo (picolés vendidos)</li>
+      <li>\(w\): inclinação, quantos picolés a mais por grau</li>
+      <li>\(b\): intercepto, a “venda base” da reta</li>
+      <li>\(\theta\): o vetor com <b>todos</b> os parâmetros, aqui só dois números</li>
+    </ul>
+  </div>
+  <p>Os números \(w\) e \(b\) são os <span class="la-term" data-term="pesos">parâmetros</span> do modelo, também chamados de pesos. <b>Aprender</b> é escolhê-los a partir dos dados para que as previsões fiquem perto do que aconteceu. Mais importante ainda, elas precisam ficar perto do que <i>vai</i> acontecer em dias que o caderno ainda não registrou. Esse é o <span class="la-term" data-term="aprendizado-de-maquina">aprendizado de máquina</span> em uma frase: ajustar os parâmetros de uma função a exemplos. Na figura abaixo, gire os dois botões e tente encaixar a reta nos pontos.</p>
+  <figure class="la-fig" id="fig-reta" data-title="A máquina de dois botões">
+    <div class="la-fig-stage" style="height:390px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Cada casquinha é um dia do caderno. As molas ligam cada ponto à reta e mostram o <b>resíduo</b> \(\hat y_i - y_i\). Com “mostrar quadrados” ligado, cada resíduo vira um quadrado de lado igual ao erro, e a média das áreas é o MSE (o placar embaixo da máquina). A linha tracejada é a reta ótima de mínimos quadrados. Dados ilustrativos.</figcaption>
+  </figure>
+  <p>Repare no placar. Existe uma posição dos botões que torna a média das áreas a menor possível, a reta ótima. Para uma reta existe até uma fórmula fechada que a calcula de uma vez (mínimos quadrados). Para 300 bilhões de botões não há fórmula nenhuma. Vamos precisar descer uma montanha no escuro, que é o assunto da seção 4.</p>
+
+  <h3>Do picolé ao próximo token</h3>
+  <p>Um LLM segue exatamente a mesma ideia, com uma entrada mais rica e muito mais botões. A entrada \(x\) é uma sequência de <a data-ch="tokens-embeddings">tokens</a>. A saída não é um número, e sim uma distribuição de probabilidade sobre o vocabulário inteiro, a resposta para a pergunta “qual é o próximo token?”. A <span class="la-term" data-term="arquitetura">arquitetura</span> (atenção, MoE, normalizações, Partes II e III) é o formato da função \(f_\theta\). Os pesos são o \(\theta\).</p>
+  <div class="la-table-wrap" style="position:relative"><table>
+    <thead><tr><th>Modelo</th><th>Parâmetros \(\theta\)</th><th>Ativos por token</th><th>Saídas por posição (vocabulário)</th></tr></thead>
+    <tbody>
+      <tr><td><span class="la-rb glm"></span> GLM-5.3-Flash</td><td>321.323.031.390 (card: 320B)</td><td>~18B</td><td>154.880</td></tr>
+      <tr><td><span class="la-rb qwen"></span> Qwen3.8-Flash-Next</td><td>125B + 51B (tabela N-gram) + ~4B (MTP)</td><td>~6B</td><td>248.320</td></tr>
+      <tr><td><span class="la-rb ds"></span> DeepSeek-V4-Flash</td><td>284B (+ ~19,8B do rascunhador DSpark, estimativa pelas formas)</td><td>~13B</td><td>129.280</td></tr>
+    </tbody>
+  </table></div>
+  <div class="la-callout analogy"><b class="t">Analogia: uma mesa de som com 300 bilhões de botões</b><p>Imagine uma mesa de som de estúdio com centenas de bilhões de botões. Nenhum botão sozinho significa alguma coisa (o que controla o botão número 17.233.901?). O som só sai certo pela combinação de todos. <b>Treinar</b> é ajustar todos ao mesmo tempo, ouvindo o resultado e corrigindo. <b>Servir</b> é tocar a música com os botões colados com fita adesiva. É isso que as três receitas fazem.</p></div>
+  <p>Vale separar desde já duas espécies de número. Os botões que o treino ajusta sozinho são <b>parâmetros</b>. As escolhas que um humano faz antes de treinar são <span class="la-term" data-term="hiperparametro">hiperparâmetros</span>: a forma da função (reta? parábola? 45 camadas?), a taxa de aprendizado, o tamanho do lote, os pesos de cada termo da perda. Guarde a distinção. No fim do capítulo veremos que o <code>config.json</code> de um checkpoint mistura os dois tipos, e que uma receita precisa saber quais campos ainda valem na inferência.</p>
+</section>
+
+<section class="la-sec">
+  <h2>De onde vêm os exemplos</h2>
+  <p>Para ajustar botões precisamos de exemplos com resposta: pares (entrada, saída desejada). No <span class="la-term" data-term="aprendizado-supervisionado">aprendizado supervisionado</span> clássico, quem fornece a resposta é um humano. Esta foto é um gato, este e-mail é spam, esta avaliação é positiva. Funciona, mas cada rótulo custa tempo e dinheiro, e ninguém vai rotular trilhões de exemplos.</p>
+  <p>O truque que tornou os LLMs possíveis é o <span class="la-term" data-term="aprendizado-auto-supervisionado">aprendizado auto-supervisionado</span>, em que a própria sequência fornece a resposta. Pegue qualquer texto, esconda o próximo token e peça ao modelo para adivinhá-lo. Um texto com \(N\) tokens vira \(N-1\) exemplos de graça, e a internet inteira vira um gabarito. Compare os dois modos na figura.</p>
+  <figure class="la-fig" id="fig-esteira" data-title="A esteira do próximo token">
+    <div class="la-fig-stage" style="height:380px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>No modo auto-supervisionado, a janela de contexto (lilás) avança sobre a frase e o token seguinte (menta) é o alvo. Cada posição gera um par (contexto → alvo) sem ninguém precisar rotular. No modo supervisionado, cada par depende de um anotador humano. Ligue “todas as posições de uma vez” para ver a escada que um Transformer calcula num único forward. Frase ilustrativa.</figcaption>
+  </figure>
+  <p>Repare na escada que aparece com “todas as posições de uma vez”. Cada linha é um prefixo mais longo, e o alvo de cada linha é o token seguinte. Um Transformer calcula todas essas linhas num único forward, desde que nenhuma posição possa espiar o futuro. Essa proibição é a <span class="la-term" data-term="mascara-causal">máscara causal</span>, que você verá em <a data-ch="atencao">Atenção</a>. É também o mesmo formato do <span class="la-term" data-term="teacher-forcing">teacher forcing</span> que as receitas usam para medir o estrago de uma quantização.</p>
+  <div class="la-eq">
+    \[ \log p_\theta(x_1,\dots,x_N) \;=\; \sum_{t=1}^{N} \log p_\theta\big(x_t \mid x_{&lt;t}\big) \qquad\qquad \mathcal{L}(\theta) \;=\; -\frac{1}{N}\sum_{t=1}^{N} \log p_\theta\big(x_t \mid x_{&lt;t}\big) \]
+    <ul class="la-eq-legend">
+      <li>\(x_t\): o token na posição \(t\)</li>
+      <li>\(x_{&lt;t}\): o prefixo, todos os tokens antes de \(t\)</li>
+      <li>\(p_\theta(\cdot \mid x_{&lt;t})\): a distribuição que o modelo dá ao próximo token</li>
+      <li>\(\mathcal{L}(\theta)\): a perda média por token, o número que o treino tenta diminuir</li>
+    </ul>
+  </div>
+  <p>A primeira igualdade é só a regra da cadeia da probabilidade. A probabilidade de um texto inteiro é o produto das probabilidades de cada token dado o que veio antes, e o logaritmo transforma o produto em soma. Treinar para prever o próximo token é, portanto, treinar para dar alta probabilidade a textos reais. E um modelo que sabe avaliar a probabilidade de um texto também sabe gerar texto: basta sortear um token de cada vez dessa distribuição, como veremos em <a data-ch="geracao-amostragem">Gerando texto</a>.</p>
+
+  <h3>Pré-treino, pós-treino e alvos extras</h3>
+  <p>O treino de um modelo de fronteira acontece em fases. O <span class="la-term" data-term="pre-treino">pré-treino</span> é o auto-supervisionado gigante: segundo o card, o DeepSeek-V4 foi pré-treinado em mais de 32 trilhões de tokens, e o GLM-5.3-Flash, segundo o seu card, viu 30 trilhões de tokens multimodais. O <span class="la-term" data-term="pos-treino">pós-treino</span> transforma esse “completador de texto” num assistente. No DeepSeek-V4, o card descreve SFT (ajuste supervisionado com pares instrução → resposta), aprendizado por reforço com GRPO (a “resposta certa” vem de uma recompensa) e uma consolidação final por destilação on-policy. A mecânica de todas as fases é a deste capítulo: uma perda, um gradiente e um otimizador.</p>
+  <p>O sinal auto-supervisionado também não precisa parar no próximo token. O mesmo texto fornece o token <i>depois</i> do próximo. É assim que se treinam os módulos <span class="la-term" data-term="mtp">MTP</span> que viram rascunhadores embutidos no GLM e no Qwen (<a data-ch="ngram-mtp">N-gram &amp; MTP</a>). E é assim que o rascunhador DSpark do DeepSeek aprende a propor blocos inteiros de tokens, como veremos na seção 8.</p>
+  <div class="la-callout why"><b class="t">Por que isso importa para quem serve modelos</b><p>O objetivo de treino define o que o forward sabe fazer, e vários parâmetros de inferência carregam essa memória. O Qwen serve seu MTP com <code>num_speculative_tokens: 3</code>, reaplicando uma única camada que foi treinada em vários passos. O GLM usa <code>DFLASH_TOKENS=7</code> porque o DFlash2 foi treinado com blocos de 8 (1 âncora + 7 rascunhos). O DeepSeek não deve rascunhar menos de 5 tokens, porque o bloco treinado do DSpark tem 5 (versões novas do vLLM chegam a recusar). Você vai encontrar parâmetros assim por toda a plataforma.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Medindo o erro: funções de perda</h2>
+  <p>A <span class="la-term" data-term="funcao-de-perda">função de perda</span> \(\mathcal{L}(\theta)\) transforma “quão errado o modelo está” num único número. Ela é a bússola do treino, e tudo o que o otimizador faz é tentar diminuí-la. A perda certa depende do tipo de resposta.</p>
+  <h3>Números contínuos: o erro quadrático</h3>
+  <div class="la-eq">
+    \[ \mathrm{MSE}(\theta) \;=\; \frac{1}{N}\sum_{i=1}^{N}\big(f_\theta(x_i) - y_i\big)^2 \]
+    <ul class="la-eq-legend">
+      <li>\(N\): número de exemplos</li>
+      <li>\(f_\theta(x_i) - y_i\): o resíduo do exemplo \(i\)</li>
+      <li>o quadrado: a área dos quadrados da primeira figura</li>
+    </ul>
+  </div>
+  <p>O <span class="la-term" data-term="mse">erro quadrático médio</span> faz três coisas ao elevar o resíduo ao quadrado. Deixa todo erro positivo. Pune erros grandes muito mais que os pequenos (errar por 10 custa 100 vezes errar por 1). E produz uma função lisa, sem quinas, o que facilita a vida do gradiente.</p>
+  <h3>Categorias: probabilidade e entropia cruzada</h3>
+  <p>Prever o próximo token não é prever um número. É escolher um entre \(V\) itens. O modelo produz uma nota crua por token, os <span class="la-term" data-term="logits">logits</span>, e a <span class="la-term" data-term="softmax">softmax</span> transforma essas notas em probabilidades positivas que somam 1 (ela ganha capítulo próprio em <a data-ch="geracao-amostragem">Gerando texto</a>). A perda natural responde a uma pergunta: <i>quanta probabilidade o modelo deu ao token que realmente veio?</i></p>
+  <div class="la-eq">
+    \[ p_v = \frac{e^{z_v}}{\sum_{j} e^{z_j}} \qquad\quad \ell \;=\; -\ln p_y \;=\; -z_y + \ln\sum_{j} e^{z_j} \qquad\quad H(P,Q) = -\sum_v P(v)\,\ln Q(v) \]
+    <ul class="la-eq-legend">
+      <li>\(z_v\): logit do token \(v\)</li>
+      <li>\(p_v\): probabilidade que o modelo dá ao token \(v\)</li>
+      <li>\(y\): o token que realmente veio</li>
+      <li>\(\ell\): a perda daquela posição, a “surpresa”</li>
+      <li>\(H(P,Q)\): entropia cruzada entre a distribuição verdadeira \(P\) e a do modelo \(Q\). Com \(P\) concentrada no token certo, ela vira \(-\ln Q(y)\)</li>
+    </ul>
+  </div>
+  <p>Essa é a <span class="la-term" data-term="entropia-cruzada">entropia cruzada</span>. A média dela sobre as posições é a <span class="la-term" data-term="nll">log-verossimilhança negativa</span> (NLL) da seção anterior, e maximizar a verossimilhança dos dados é o mesmo que minimizá-la. São três nomes para a mesma conta. Na figura, mexa no logit do token certo e observe a perda.</p>
+  <figure class="la-fig" id="fig-ce" data-title="A régua da surpresa">
+    <div class="la-fig-stage" style="height:380px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>À esquerda, a distribuição do próximo token para “O gato subiu no ___”. O token certo, “telhado”, tem estrela. À direita, a curva \(-\ln p\) com o ponto atual, e o rosto que fica mais espantado conforme a perda cresce. A curva tracejada é o erro quadrático \((1-p)^2\), para comparar. Logits ilustrativos.</figcaption>
+  </figure>
+  <p>Repare na forma da curva. Com \(p_y = 1\), a perda é zero. Com \(p_y = 0{,}5\), vale \(\ln 2 \approx 0{,}69\) nat, que é exatamente 1 bit. Quando \(p_y \to 0\), ela dispara para o infinito. A entropia cruzada é implacável com erros <i>confiantes</i>: dar 1% ao token certo custa 4,6 nats, e 0,01% custa 9,2. Já o erro quadrático aplicado à probabilidade (a curva tracejada) nunca passa de 1. Ele mal diferencia “errei feio” de “errei muito feio”.</p>
+  <div class="la-callout math"><b class="t">O gradiente mais bonito do deep learning</b><p>Derive \(\ell = -z_y + \ln\sum_j e^{z_j}\) em relação a cada logit e sobra \(\dfrac{\partial \ell}{\partial z_v} = p_v - \mathbb{1}[v = y]\): <b>probabilidade prevista menos probabilidade desejada</b>. O token certo recebe um empurrão para cima de tamanho \(1 - p_y\). Cada token errado recebe um empurrão para baixo igual à probabilidade que roubou. O sinal não satura: enquanto houver erro, há gradiente.</p></div>
+  <h3>Nats, bits e o chute uniforme</h3>
+  <p>Com logaritmo natural, a unidade de informação é o <span class="la-term" data-term="nats">nat</span>. Com logaritmo na base 2, é o bit, e 1 nat \(= 1/\ln 2 \approx 1{,}443\) bit. O PyTorch usa \(\ln\), e é por isso que perdas de treino e as <span class="la-term" data-term="kld">KLDs</span> das receitas aparecem em nats. A KLD (divergência de Kullback–Leibler) mede o quanto uma distribuição se afasta de outra; ela volta no fim desta seção. Um jeito de sentir a escala: um modelo recém-inicializado, que espalha a probabilidade por igual pelo vocabulário, tem perda \(\ln V\).</p>
+  <div class="la-table-wrap" style="position:relative"><table>
+    <thead><tr><th>Modelo</th><th>\(V\)</th><th>\(\ln V\) (nats)</th><th>\(\log_2 V\) (bits)</th></tr></thead>
+    <tbody>
+      <tr><td><span class="la-rb glm"></span> GLM-5.3-Flash</td><td>154.880</td><td>11,95</td><td>17,24</td></tr>
+      <tr><td><span class="la-rb qwen"></span> Qwen3.8-Flash-Next</td><td>248.320</td><td>12,42</td><td>17,92</td></tr>
+      <tr><td><span class="la-rb ds"></span> DeepSeek-V4-Flash</td><td>129.280</td><td>11,77</td><td>16,98</td></tr>
+    </tbody>
+  </table></div>
+  <p>O treino derruba esse ponto de partida para algo na faixa de 1,5 a 2 nats por token em texto geral (ordem de grandeza típica). Um número real ajuda. No relatório técnico do Qwen3.8-Next, modelos de ablação de 25B parâmetros (3B ativos), treinados em 560B tokens, terminam com perda (em nats, a convenção usual) entre 1,617 e 1,590. O 1,617 vem do resíduo pré-norm clássico, o bloco padrão que normaliza a entrada de cada subcamada e soma a saída de volta ao vetor do token. O 1,590 vem do <span class="la-term" data-term="gated-residual">Gated Residual</span>, uma variante dessa soma controlada por portas, que a seção 6 apresenta. Diferenças de centésimos de nat decidem arquiteturas. A <span class="la-term" data-term="perplexidade">perplexidade</span> \(e^{\mathcal{L}}\) traduz isso em “número efetivo de opções”: \(e^{1{,}59}\approx 4{,}9\). O modelo hesita, em média, como se escolhesse entre cinco tokens.</p>
+  <div class="la-callout recipe" data-recipe="glm"><b class="t"><span class="la-rb glm"></span> A mesma régua na receita</b><p>A unidade que mede o aprendizado também mede o estrago da quantização. Na receita GLM, o checkpoint EXL3 de 4 bpw fica a 0,0246 nat de KLD do professor BF16 (no nível do FP8 oficial), contra 0,0605 do NVFP4. São nats de novo, agora medindo a distância entre duas distribuições em vez da surpresa com o texto. O capítulo <a data-ch="medindo-qualidade">Medindo qualidade</a> detalha essa régua.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>A paisagem da perda e a descida do gradiente</h2>
+  <p>Fixe os dados. A perda passa a ser uma função só dos parâmetros: cada combinação de botões dá um número. Com dois parâmetros dá para desenhar essa função como um mapa de relevo, a <span class="la-term" data-term="superficie-de-perda">superfície de perda</span>, e treinar vira um problema de geografia: achar o ponto mais baixo. Com 321 bilhões de parâmetros o mapa tem 321 bilhões de dimensões e ninguém consegue vê-lo, mas a matemática é a mesma.</p>
+  <p>Imagine que estamos no escuro, num ponto qualquer da montanha. Não enxergamos o vale, mas sentimos a inclinação do chão sob os pés. Essa inclinação é o <span class="la-term" data-term="gradiente">gradiente</span>, o vetor das derivadas parciais, uma por parâmetro. Ele aponta para onde a perda <i>sobe</i> mais depressa. Dar um passo no sentido oposto é a <span class="la-term" data-term="descida-do-gradiente">descida do gradiente</span>:</p>
+  <div class="la-eq">
+    \[ \nabla_\theta \mathcal{L} = \Big(\frac{\partial \mathcal{L}}{\partial \theta_1},\ \dots,\ \frac{\partial \mathcal{L}}{\partial \theta_P}\Big) \qquad\qquad \theta_{t+1} \;=\; \theta_t \;-\; \eta\,\nabla_\theta \mathcal{L}(\theta_t) \]
+    <ul class="la-eq-legend">
+      <li>\(\partial\mathcal{L}/\partial\theta_j\): quanto a perda muda por unidade de \(\theta_j\), com os outros botões parados</li>
+      <li>\(P\): número de parâmetros</li>
+      <li>\(\eta\): taxa de aprendizado, o tamanho do passo</li>
+      <li>\(t\): o número do passo de treino</li>
+    </ul>
+  </div>
+  <p>A derivada parcial tem uma leitura bem física. Empurre o botão \(j\) um tiquinho \(\epsilon\) e veja a perda mudar: \(\partial\mathcal{L}/\partial\theta_j \approx [\mathcal{L}(\theta + \epsilon\, e_j) - \mathcal{L}(\theta)]/\epsilon\). Na figura, a bolinha segue exatamente a regra acima. Mude a <span class="la-term" data-term="taxa-de-aprendizado">taxa de aprendizado</span> e clique no mapa para largá-la em outro lugar.</p>
+  <figure class="la-fig" id="fig-descida" data-title="A bolinha que desce no escuro">
+    <div class="la-fig-stage" style="height:400px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Mapa de relevo de uma perda com dois parâmetros: quanto mais claro (no tema escuro) ou mais escuro (no claro), mais baixa a perda. A seta é o próximo passo \(-\eta\nabla\mathcal{L}\): aponta no sentido de \(-\nabla\mathcal{L}\) e cresce com \(\eta\) (com um limite de tamanho, para caber no mapa). O rastro mostra o caminho. No canto, a curva de treino (perda × passo). Há um mínimo global e uma cavidade rasa no canto inferior esquerdo. Os leitores dão o \(\eta\) máximo estável em cada vale. Superfície ilustrativa.</figcaption>
+  </figure>
+  <p>Três lições saem desse brinquedo. <b>Um passo pequeno demais</b> desce com segurança, mas leva uma eternidade. <b>Um passo grande demais</b> atravessa o vale e sobe a parede do outro lado. Um pouco maior ainda e cada passo piora o anterior, até a perda explodir. Isso tem conta: num vale quadrático com curvatura máxima \(\lambda_{\max}\), a descida só é estável se \(\eta &lt; 2/\lambda_{\max}\). A direção mais íngreme dita o passo de todas as outras. E a curvatura é <i>local</i>. Na tigela do mínimo global da figura, a maior curvatura vale 5, e o limite é \(\eta &lt; 0{,}40\). A cavidade do canto é bem mais apertada (curvatura máxima ≈ 20,6), e lá o limite cai para \(\eta \approx 0{,}10\). Faça o teste com o botão “largar perto do mínimo local”. Com \(\eta = 0{,}05\), a bolinha assenta na cavidade em poucos passos. Com \(\eta = 0{,}2\), ela fica quicando lá dentro sem nunca parar. Com \(\eta = 0{,}3\), é arremessada para fora e termina no mínimo global, onde esse mesmo passo é estável. Por fim, <b>o ponto de partida importa</b>. Largue a bolinha perto da cavidade do canto e ela pode ficar presa num mínimo local.</p>
+  <div class="la-callout deep"><b class="t">Aprofundamento: mínimos locais em bilhões de dimensões</b><p>Em dimensões altíssimas, um ponto de gradiente zero raramente é um mínimo em <i>todas</i> as direções. É muito mais comum que seja uma sela, que desce em algumas direções e sobe em outras. Na prática, redes grandes raramente ficam presas em mínimos locais ruins. Os vilões do treino de LLMs são outros: vales estreitos e mal condicionados, passos instáveis e picos súbitos de perda. São eles que motivam os otimizadores da seção 6.</p></div>
+  <h3>Quem calcula 321 bilhões de derivadas?</h3>
+  <p>A fórmula de diferenças finitas exigiria um forward por parâmetro, o que é impraticável. A solução é aplicar a regra da cadeia de trás para frente pela rede, a <b>retropropagação</b> (backpropagation). Ela obtém todas as derivadas de uma vez, a um custo de mais ou menos dois forwards. É o assunto do próximo capítulo, <a data-ch="redes-neurais">Redes neurais</a>. Por enquanto basta saber que o gradiente existe e é barato.</p>
+  <div class="la-callout deep"><b class="t">O gradiente mora até dentro da arquitetura</b><p>Algumas camadas do GLM (<span class="la-term" data-term="kda">KDA</span>) e do Qwen (<span class="la-term" data-term="gdn">Gated DeltaNet</span>) são de <i>atenção linear</i>. Elas guardam o passado numa matriz de memória \(S\), que funciona como um dicionário: cada token produz uma chave \(k_t\) e um valor \(v_t\) (dois vetores), e a leitura \(S^\top k_t\) deveria devolver \(v_t\). A regra que atualiza essa memória tem duas partes. Primeiro, a memória esquece um pouco: \(S' = \alpha_t \odot S\), com \(\alpha_t \in (0, 1]\) calculado pelo modelo (um escalar por cabeça no Gated DeltaNet, um fator por canal no KDA). Depois vem um passo de descida do gradiente feito <i>durante a inferência</i>, a regra delta:</p>
+    <div class="la-eq">\[ S_t \;=\; S' - \beta_t\,\nabla_{S'}\,\tfrac12\big\lVert S'^\top k_t - v_t\big\rVert^2 \;=\; S' - \beta_t\,k_t\big(S'^\top k_t - v_t\big)^\top \]</div>
+    <p>A taxa \(\beta_t\) também é calculada pelo próprio modelo a cada token. O \(\alpha_t\) é um esquecimento parente do weight decay da seção 7, que puxa os pesos em direção a zero. Os pesos continuam congelados; quem “aprende” é a memória da camada (<a data-ch="atencao-linear">Atenção linear</a>).</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Minibatches e SGD: descer com um mapa borrado</h2>
+  <p>A seção anterior escondeu um detalhe: a perda é uma média sobre <i>todos</i> os exemplos. O gradiente exato exigiria passar os 32 trilhões de tokens do DeepSeek-V4 pela rede a cada passo. Ninguém faz isso. Em vez disso, sorteia-se um <span class="la-term" data-term="minibatch">minibatch</span>, um punhado de exemplos, e usa-se o gradiente médio dele como estimativa. Essa é a descida do gradiente estocástica, o <span class="la-term" data-term="sgd">SGD</span>.</p>
+  <div class="la-eq">
+    \[ g_B = \frac{1}{B}\sum_{i \in \mathcal{B}} \nabla_\theta\, \ell_i(\theta), \qquad \mathbb{E}\big[g_B\big] = \nabla_\theta \mathcal{L}(\theta), \qquad \operatorname{Var}\big[g_B\big] = \frac{\sigma^2}{B} \]
+    <ul class="la-eq-legend">
+      <li>\(B\): tamanho do minibatch</li>
+      <li>\(\mathcal{B}\): os exemplos sorteados neste passo</li>
+      <li>\(\ell_i\): a perda do exemplo \(i\)</li>
+      <li>\(\sigma^2\): a variância do gradiente de um único exemplo</li>
+    </ul>
+  </div>
+  <p>A estimativa é <b>não viesada</b>: em média, aponta para o lugar certo. O ruído dela cai com \(1/\sqrt{B}\), então quadruplicar o lote corta o ruído pela metade, ao preço de quatro vezes mais contas por passo. Na figura, o problema é a reta da sorveteria, agora com 64 dias e temperatura normalizada. As setinhas finas são gradientes de minibatches diferentes no mesmo ponto; a seta grossa é o gradiente exato.</p>
+  <figure class="la-fig" id="fig-sgd" data-title="O leque de gradientes barulhentos">
+    <div class="la-fig-stage" style="height:390px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>O mapa é a perda verdadeira (os 64 pontos) em função de \(w\) e \(b\). A cada passo, o SGD sorteia \(B\) pontos e anda na direção do gradiente <i>deles</i> (seta cor-de-rosa). O leque cinza mostra outros sorteios possíveis no mesmo lugar. No painel, o espalhamento medido do gradiente para cada tamanho de lote.</figcaption>
+  </figure>
+  <p>Com \(B = 1\), o leque de setas é enorme e a trajetória parece bêbada, mas ainda chega ao vale, e cada passo custou 1/64 do preço. Com o lote inteiro, a trajetória é limpa, porém cara. O treino real fica no meio: lotes grandes o bastante para ocupar bem as GPUs e pequenos o bastante para dar muitos passos. Em LLMs o lote é contado em tokens, tipicamente na casa dos milhões por passo (ordem de grandeza). Uma passada completa pelos dados é uma <span class="la-term" data-term="epoca">época</span>, e no pré-treino de LLMs é comum ver cada token uma vez só, ou poucas.</p>
+  <h3>A taxa de aprendizado também tem roteiro</h3>
+  <p>Na prática, \(\eta\) não fica constante. Ela começa pequena e sobe por alguns milhares de passos (o aquecimento, ou <i>warmup</i>), fica alta enquanto o modelo aprende o grosso e decai no fim, para ele assentar no fundo do vale. O ruído do SGD parece um defeito, mas costuma ajudar: ele sacode o modelo para fora de vales estreitos demais.</p>
+  <div class="la-callout warn"><b class="t">Falsos amigos: warmup e batch na inferência</b><p>Duas palavras deste capítulo voltam no vLLM com outro sentido. <i>Warmup</i>, no treino, é a rampa da taxa de aprendizado. No servidor, é a rodada que compila kernels e captura CUDA graphs antes de atender a primeira requisição (<a data-ch="cuda-graphs-warmup">CUDA graphs &amp; warmup</a>). <i>Batch</i>, no treino, é o minibatch que estima o gradiente. No servidor, é o conjunto de requisições processadas juntas num passo, sem gradiente nenhum (<a data-ch="scheduler-batching">Scheduler &amp; batching</a>). O nome é o mesmo, mas os mundos são diferentes.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Otimizadores: momentum, Adam/AdamW e Muon</h2>
+  <p>A regra \(\theta \leftarrow \theta - \eta\, g\) é o <span class="la-term" data-term="otimizador">otimizador</span> mais simples. Os que se usam de verdade guardam memória do passado e reescalam o passo. São três ideias, em ordem histórica.</p>
+  <h3>Momentum: a bola pesada</h3>
+  <div class="la-eq">
+    \[ v_{t} = \beta\, v_{t-1} + g_t, \qquad \theta_{t+1} = \theta_t - \eta\, v_t \]
+    <ul class="la-eq-legend">
+      <li>\(v\): a “velocidade”, uma soma dos gradientes recentes que decai com o tempo</li>
+      <li>\(\beta\): a memória, tipicamente 0,9</li>
+      <li>\(g_t\): o gradiente (de minibatch) do passo \(t\)</li>
+    </ul>
+  </div>
+  <p>Com <span class="la-term" data-term="momentum">momentum</span>, o parâmetro não obedece só à inclinação de agora: ele ganha embalo. Nas direções em que o gradiente troca de sinal a cada passo (as paredes de um vale estreito), as contribuições se cancelam. Na direção em que ele aponta sempre para o mesmo lado (o fundo do vale), elas se somam. O efeito é correr onde importa e oscilar menos onde atrapalha.</p>
+  <h3>Adam e AdamW: um passo sob medida para cada botão</h3>
+  <div class="la-eq">
+    \[ m_t = \beta_1 m_{t-1} + (1-\beta_1)\,g_t, \quad s_t = \beta_2 s_{t-1} + (1-\beta_2)\,g_t^{2}, \quad \hat m_t = \frac{m_t}{1-\beta_1^{t}},\ \ \hat s_t = \frac{s_t}{1-\beta_2^{t}} \]
+    \[ \theta_{t+1} \;=\; \theta_t \;-\; \eta\Big(\frac{\hat m_t}{\sqrt{\hat s_t} + \epsilon} \;+\; \lambda\,\theta_t\Big) \]
+    <ul class="la-eq-legend">
+      <li>\(m\): média móvel do gradiente (o momento de 1ª ordem)</li>
+      <li>\(s\): média móvel do gradiente ao quadrado, coordenada por coordenada (2ª ordem)</li>
+      <li>\(\beta_1, \beta_2\): as memórias, tipicamente 0,9 e 0,95–0,999</li>
+      <li>\(\hat m, \hat s\): correção de viés, porque as médias começam em zero</li>
+      <li>\(\epsilon\): evita divisão por zero</li>
+      <li>\(\lambda\): weight decay desacoplado, o “W” do AdamW</li>
+    </ul>
+  </div>
+  <p>O <span class="la-term" data-term="adam">Adam</span> divide o momento pela raiz do tamanho típico do gradiente de <i>cada coordenada</i>. Um botão com gradientes enormes anda com passos contidos. Um botão com gradientes minúsculos ganha passos proporcionalmente maiores. Na prática, cada parâmetro anda algo da ordem de \(\eta\) por passo, seja qual for a escala do seu gradiente. O <span class="la-term" data-term="adamw">AdamW</span> corrige um detalhe. O <span class="la-term" data-term="weight-decay">weight decay</span> (puxar todo peso um pouco em direção a zero, uma forma de regularização que volta na seção 7) é aplicado <i>fora</i> da divisão por \(\sqrt{\hat s}\). Se ficasse dentro, os botões de gradiente grande quase não seriam regularizados. O AdamW foi o padrão de uma década para treinar Transformers. Na corrida abaixo, três corredores largam do mesmo ponto numa ravina: a descida simples, o momentum e o Adam.</p>
+  <figure class="la-fig" id="fig-corrida" data-title="Corrida de otimizadores na ravina">
+    <div class="la-fig-stage" style="height:390px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Uma ravina cuja parede tem curvatura 160 vezes maior que a do fundo (40 contra 0,25). A descida simples (âmbar) ziguezagueia entre as paredes, o momentum (lilás) ganha embalo e o Adam (rosa) normaliza cada coordenada. O controle “taxas ×” multiplica as três taxas; acima de ~1,1× a descida simples passa do limite \(2/\lambda_{\max}\) e diverge. Troque para a ravina girada e compare.</figcaption>
+  </figure>
+  <p>Na ravina alinhada aos eixos, o Adam dispara. A parede íngreme e o fundo plano correspondem a coordenadas diferentes, e a divisão por coordenada equaliza as duas. Agora gire a ravina 45°. A dificuldade é a mesma (as mesmas curvaturas), mas ela não está mais alinhada aos eixos: cada coordenada enxerga um pedaço da parede e um pedaço do fundo, e a vantagem do Adam some. Com taxa fixa, ele fica oscilando no fundo do vale. O Adam só enxerga <i>coordenadas</i>. Os pesos de um LLM, porém, são <i>matrizes</i>, e as direções importantes de uma matriz quase nunca coincidem com os eixos dela. É daí que nasce o Muon.</p>
+
+  <h3>Muon: ortogonalizar a atualização</h3>
+  <p>O <span class="la-term" data-term="muon">Muon</span> (<i>MomentUm Orthogonalized by Newton–Schulz</i>) trata cada matriz de pesos \(W\in\mathbb{R}^{m\times n}\) como um objeto inteiro. Ele acumula o momento \(M\) como de costume. Antes de aplicar o passo, porém, troca \(M\) pela <span class="la-term" data-term="matriz-ortogonal">matriz ortogonal</span> mais próxima. Uma matriz ortogonal só gira (ou reflete) os vetores, sem esticar nem encolher nenhuma direção. Para achar a mais próxima, usa-se a <span class="la-term" data-term="svd">SVD</span>, a decomposição em <span class="la-term" data-term="valores-singulares">valores singulares</span>: toda matriz se escreve como \(M = U\Sigma V^\top\), uma rotação \(V^\top\), um esticamento \(\Sigma\) diferente em cada eixo e outra rotação \(U\) (<a data-ch="tensores-algebra">Tensores &amp; álgebra</a> mostra isso com figuras). O passo do Muon usa \(UV^\top\): as mesmas direções, com todos os esticamentos (os valores singulares) trocados por 1.</p>
+  <div class="la-eq">
+    \[ M_t = \mu\, M_{t-1} + G_t, \qquad O_t = \operatorname{orth}(M_t) \approx U V^\top, \qquad W_{t+1} = W_t - \eta\, O_t \]
+    <ul class="la-eq-legend">
+      <li>\(G_t\): o gradiente da matriz \(W\) no passo \(t\)</li>
+      <li>\(M_t\): o momento (\(\mu \approx 0{,}95\))</li>
+      <li>\(U, V\): as direções singulares (rotações) de \(M_t\)</li>
+      <li>\(\Sigma\): os valores singulares, quanto \(M\) estica cada direção</li>
+      <li>\(O_t\): a atualização ortogonalizada</li>
+    </ul>
+  </div>
+  <p>Por que isso ajuda? O gradiente de uma matriz costuma ser dominado por poucas direções: um ou dois valores singulares enormes e uma cauda longa de pequenos. Um passo de SGD ou de Adam gasta quase todo o seu orçamento nessas poucas direções. Ortogonalizar dá a mesma importância a todas as direções que o gradiente indica, e as direções raras deixam de ser afogadas pelas dominantes. Geometricamente, a atualização deixa de ser um charuto e vira uma esfera, orientada pelo gradiente.</p>
+  <p>Calcular uma decomposição em valores singulares a cada passo sairia caro. O Muon usa a iteração de <span class="la-term" data-term="newton-schulz">Newton–Schulz</span>, que chega perto de \(UV^\top\) só com multiplicações de matrizes, o prato favorito de uma GPU:</p>
+  <div class="la-eq">
+    \[ X_0 = \frac{M}{\lVert M\rVert_F}, \qquad X_{k+1} = a\,X_k + b\,(X_kX_k^\top)\,X_k + c\,(X_kX_k^\top)^2X_k \quad\Longrightarrow\quad \sigma \;\mapsto\; a\sigma + b\sigma^3 + c\sigma^5 \]
+    <ul class="la-eq-legend">
+      <li>\(\lVert M\rVert_F = \sqrt{\sum_{ij} M_{ij}^2} = \sqrt{\sum_i \sigma_i^2}\): norma de Frobenius, o “comprimento” da matriz inteira. Ela é sempre maior ou igual ao maior valor singular, então dividir por ela garante \(\sigma \le 1\) no início</li>
+      <li>\(a, b, c\): os coeficientes do polinômio. Cada iteração aplica o mesmo polinômio a cada valor singular, sem mexer em \(U\) e \(V\)</li>
+      <li>\((3{,}4445;\ -4{,}7750;\ 2{,}0315)\): os coeficientes do Muon, que levam valores pequenos para perto de 1 bem depressa</li>
+      <li>\((2;\ -1{,}5;\ 0{,}5)\): o polinômio de “polimento”, com ponto fixo exato em 1</li>
+    </ul>
+  </div>
+  <p>Na figura, a matriz da esquerda é um momento de brinquedo 5×5 dominado por uma direção. A da direita é o resultado depois de \(k\) iterações. Embaixo, cada bolinha é um valor singular sendo levado pelo polinômio.</p>
+  <figure class="la-fig wide" id="fig-muon" data-title="Muon: da elipse à esfera">
+    <div class="la-fig-stage" style="height:430px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>À esquerda, o momento \(M\) (5×5, valores reais da conta) e a matriz \(X_k\) após \(k\) iterações de Newton–Schulz. À direita, o polinômio da iteração atual aplicado aos valores singulares (bolinhas) e as elipses das duas direções mais fortes antes e depois. Embaixo de cada elipse, a razão entre o eixo maior e o menor (1 = círculo). O leitor “desvio de \(X X^\top\) de \(I\)” mede o quanto falta para \(X_k\) ser ortogonal. Com os coeficientes rápidos do Muon, a esfera é só aproximada: em \(k = 5\) a razão cai de 2,5 para ~1,5 e os eixos trocam de papel, porque cada \(\sigma\) oscila dentro da faixa 0,7–1,2. Troque para “DeepSeek-V4 (8 + 2)” e vá até \(k = 10\) para ver o círculo. A matriz é ilustrativa; os coeficientes são os reais.</figcaption>
+  </figure>
+  <p>Com os coeficientes do Muon, os valores singulares minúsculos crescem cerca de 3,4 vezes por iteração (a derivada do polinômio em zero é \(a = 3{,}4445\)). Em cinco iterações, que é o número da implementação original, todos caem numa faixa entre ~0,7 e ~1,2. Eles não convergem exatamente para 1, porque o polinômio foi escolhido para ser <i>rápido</i>, não exato. O polinômio de polimento \(2\sigma - 1{,}5\sigma^3 + 0{,}5\sigma^5\) faz o contrário. Ele vale exatamente 1 em \(\sigma = 1\) e tem derivada zero ali, o que dá convergência quadrática, mas cresce devagar a partir de valores pequenos. O esquema híbrido do DeepSeek-V4 junta os dois: 8 iterações rápidas e 2 de polimento.</p>
+
+  <h3>Quem treina com qual otimizador</h3>
+  <p>Os relatórios técnicos do Qwen3.8 e do DeepSeek-V4 dizem <i>quais</i> pesos cada otimizador atualiza. Para ler essa divisão, e o argumento de estabilidade que vem logo depois, você precisa de um vocabulário mínimo de arquitetura. Cada peça ganha capítulo próprio mais adiante; aqui basta a ideia.</p>
+  <div class="la-cards">
+    <div class="la-card"><h4>Embeddings e cabeça de predição</h4><p>As <span class="la-term" data-term="embedding">embeddings</span> são a tabela de entrada: uma linha (um vetor) por token do vocabulário, consultada pelo id do token. A cabeça de predição (<code>lm_head</code>) é a matriz de saída, que transforma o último vetor em \(V\) logits. Ficam nas duas pontas da rede (<a data-ch="tokens-embeddings">Tokens &amp; embeddings</a>).</p></div>
+    <div class="la-card"><h4>Roteador</h4><p>Num MoE, o <span class="la-term" data-term="roteador">roteador</span> é uma camada pequena que dá uma nota a cada expert e escolhe os poucos experts que vão processar cada token (<a data-ch="mixture-of-experts">Mixture of Experts</a>).</p></div>
+    <div class="la-card"><h4>RMSNorm</h4><p>A <span class="la-term" data-term="rmsnorm">RMSNorm</span> divide o vetor pela raiz da média dos quadrados das suas coordenadas, \(x/\sqrt{\operatorname{mean}(x_i^2)+\varepsilon}\), para ele ter tamanho típico ~1, e multiplica por um ganho aprendido por coordenada (os “pesos” da RMSNorm). A versão <i>sem peso</i> pula o ganho. É o regulador de volume dos blocos (<a data-ch="redes-neurais">Redes neurais</a>, <a data-ch="bloco-transformer">Bloco Transformer</a>).</p></div>
+    <div class="la-card"><h4>Sigmoide e portas</h4><p>A <span class="la-term" data-term="sigmoide">sigmoide</span> \(\sigma(z) = 1/(1+e^{-z})\) espreme qualquer número no intervalo (0, 1). Multiplicar um sinal por ela é uma <b>porta</b> (gate): o próprio modelo decide, a cada token, quanto deixar passar (<a data-ch="redes-neurais">Redes neurais</a>).</p></div>
+    <div class="la-card"><h4>GatedNorm e Gated Residual</h4><p>O <span class="la-term" data-term="gatednorm">GatedNorm</span> do Qwen3.8 é uma RMSNorm seguida de uma porta sigmoide calculada do próprio vetor. O Gated Residual usa essa leitura com porta no fluxo residual (a “estrada” em que cada camada soma sua contribuição ao vetor do token), alargado para 4 ramos. A porta passa por <b>projeções de baixo posto</b>: duas matrizes finas que espremem o vetor por um gargalo estreito (posto 320) e barateiam a conta (<a data-ch="hiperconexoes">Hiperconexões</a>).</p></div>
+    <div class="la-card"><h4><span style="text-transform:none;letter-spacing:0">mHC</span></h4><p>O <span class="la-term" data-term="mhc">mHC</span> é a solução do GLM e do DeepSeek para alargar a mesma estrada: 4 fluxos residuais misturados a cada camada por uma matriz 4×4 domada (duplamente estocástica, o que limita o ganho de sinal). Parte dos coeficientes é calculada a partir do token; a <b>parte estática</b> é formada pelos vieses e fatores de escala aprendidos como constantes, iguais para todo token (<a data-ch="hiperconexoes">Hiperconexões</a>).</p></div>
+  </div>
+  <p>Repare no padrão das duas colunas abaixo (a leitura é nossa, não dos relatórios). O Muon fica com as grandes matrizes que transformam vetores dentro dos blocos, onde “ortogonalizar a atualização” faz sentido. O AdamW fica com as peças que não se comportam assim: tabelas consultadas por linha, vetores de ganho (ortogonalizar um vetor não significa nada) e matrizes pequenas ou especiais, como o roteador e os coeficientes do mHC.</p>
+  <div class="la-compare">
+    <div data-recipe="qwen"><h4>Qwen3.8-Flash-Next</h4><p>Muon com o momento ortogonalizado por 8 iterações de Newton–Schulz nas matrizes “lineares”, e AdamW nas embeddings, no roteador e nas projeções de baixo posto do Gated Residual (relatório técnico). No teste de estresse com 4× a taxa de aprendizado ótima, AdamW + arquitetura Qwen3.5 teve 183 picos de perda a cada 10 mil passos; Muon + Gated Residual teve zero. A comparação mistura otimizador e arquitetura: o GatedNorm sozinho reduz os picos de 32,0 para 3,2 a cada 10 mil passos.</p></div>
+    <div data-recipe="ds"><h4>DeepSeek-V4-Flash</h4><p>Muon com Newton–Schulz híbrido de 10 iterações: 8 com (3,4445; −4,7750; 2,0315) e 2 com (2; −1,5; 0,5). AdamW só para embeddings, cabeças de predição, a parte estática do mHC e os pesos das RMSNorm (relatório técnico). O card resume o motivo: convergência mais rápida e mais estabilidade de treino. Não usa QK-Clip, porque aplica RMSNorm direto nas queries e nas entradas de KV.</p></div>
+    <div data-recipe="glm"><h4>GLM-5.3-Flash</h4><p>O inventário do checkpoint e da receita não documenta o otimizador de treino, então não vamos chutar. Do treino, o <code>config.json</code> traz apenas campos como <code>initializer_range: 0.02</code> e <code>router_aux_loss_coef: 0.001</code>, que não têm efeito na inferência (seção 9).</p></div>
+  </div>
+  <div class="la-callout deep"><b class="t">Picos de perda e o QK-Clip</b><p>Um <span class="la-term" data-term="loss-spike">pico de perda</span> é um salto súbito da perda no meio do treino, às vezes irrecuperável. Um mecanismo conhecido vem da atenção (<a data-ch="atencao">Atenção</a>). Nela, cada token compara seu vetor de pergunta, a query \(q\), com o vetor de etiqueta de cada token anterior, a key \(k\), e a nota é o produto escalar \(q\cdot k\). Essas notas são os logits da atenção. Se \(q\) e \(k\) crescem sem limite durante o treino, as notas explodem, a softmax satura (toda a atenção vai para um token só) e o gradiente enlouquece. Um remédio usado em outros treinos com Muon é o <span class="la-term" data-term="qk-clip">QK-Clip</span>: quando o maior logit de atenção passa de um limiar, as matrizes \(W_Q\) e \(W_K\) que produzem \(q\) e \(k\) são reescaladas para baixo. (Fonte externa aos inventários das receitas: o QK-Clip foi descrito no relatório técnico do Kimi K2.) O DeepSeek-V4 e o Qwen3.8 dispensam o truque com uma escolha de <i>arquitetura</i>. O Qwen normaliza \(q\) e \(k\) por cabeça com uma RMSNorm antes do produto, a <span class="la-term" data-term="qk-norm">QK-Norm</span>. O DeepSeek-V4 aplica uma RMSNorm sem peso em cada cabeça de \(q\) e uma <code>kv_norm</code> no único latente de KV, que todas as cabeças compartilham. Nos dois casos, o tamanho dos logits fica limitado por construção.</p></div>
+  <div class="la-callout why"><b class="t">Por que isso importa na inferência</b><p>O otimizador não existe na inferência. Ele não vai para o checkpoint, e nenhuma receita o carrega. O que fica são as escolhas de arquitetura que deixaram o treino estável, e essas precisam ser executadas exatamente como no treino: a RMSNorm sem peso em cada cabeça de Q e a <code>kv_norm</code> do DeepSeek, a QK-Norm do Qwen, as portas sigmoides do GatedNorm e do Gated Residual, a mistura do mHC. Um kernel que “simplifique” uma dessas normalizações ou portas (trocando o \(\varepsilon\) ou pulando o ganho, por exemplo) muda o modelo.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Generalizar, não decorar</h2>
+  <p>Baixar a perda nos exemplos de treino é fácil demais. Com botões suficientes, um modelo pode simplesmente decorar cada exemplo. O que queremos é <span class="la-term" data-term="generalizacao">generalização</span>: acertar dados que ele nunca viu. Para medir isso, os dados são divididos em <span class="la-term" data-term="treino-validacao-teste">treino, validação e teste</span>. O conjunto de treino ajusta os parâmetros. O de validação escolhe hiperparâmetros e diz quando parar. O de teste fica trancado até o fim e dá a nota honesta.</p>
+  <p>Na figura, ajustamos um polinômio a pontos com ruído. O grau do polinômio é a capacidade do modelo: um polinômio de grau \(d\) tem \(d+1\) botões.</p>
+  <figure class="la-fig" id="fig-overfit" data-title="Decorar o ruído ou aprender a curva">
+    <div class="la-fig-stage" style="height:380px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Pontos de treino (cheios) e de validação (vazados) vêm da mesma curva verdadeira (tracejada) mais ruído. O polinômio (rosa) é ajustado só aos pontos de treino. À direita, o erro de treino e o de validação para cada grau; a estrela marca o ponto doce da validação. Dados ilustrativos.</figcaption>
+  </figure>
+  <p>Com grau baixo, o modelo é rígido demais e erra tanto no treino quanto na validação. Isso é <span class="la-term" data-term="underfitting">underfitting</span>. Aumentando o grau, as duas perdas caem juntas, até um ponto doce. Dali em diante a perda de treino continua caindo, mas a de validação sobe. O polinômio começa a costurar o ruído, contorcendo-se entre os pontos: é o <span class="la-term" data-term="overfitting">overfitting</span>. Os controles mostram três remédios. <b>Mais dados</b>: com mais pontos de treino, o ruído fica difícil de decorar. <b>Regularização</b>: penalizar pesos grandes alisa a curva. <b>Parar cedo</b>: ficar com o modelo do ponto doce da validação.</p>
+  <div class="la-eq">
+    \[ \mathcal{L}_{\text{reg}}(\theta) = \mathcal{L}(\theta) + \frac{\lambda}{2}\lVert\theta\rVert^2 \quad\Longrightarrow\quad \nabla\mathcal{L}_{\text{reg}} = \nabla\mathcal{L} + \lambda\,\theta \]
+    <ul class="la-eq-legend">
+      <li>\(\lambda\): força da <span class="la-term" data-term="regularizacao">regularização</span></li>
+      <li>\(\lVert\theta\rVert^2\): soma dos quadrados dos pesos</li>
+      <li>\(\lambda\,\theta\): o termo que puxa cada peso para zero a cada passo, que é o weight decay do AdamW</li>
+    </ul>
+  </div>
+  <p>LLMs de fronteira vivem num regime curioso. São enormes, mas o pré-treino vê cada token poucas vezes, então decorar o corpus não é o risco dominante, e a perda de validação costuma acompanhar a de treino de perto. O risco que aparece é mais sutil: o <b>vazamento</b>. Se as perguntas de um benchmark estavam no texto usado para treinar, a nota de “teste” mede memória, não capacidade.</p>
+  <div class="la-callout warn"><b class="t">A mesma disciplina vale para quem mede receitas</b><p>Quando uma receita compara quantizações ou kernels, ela está fazendo validação: textos fixos, gabaritos congelados, a mesma semente. Ajustar parâmetros olhando os mesmos poucos prompts em que se reporta o resultado é o overfitting do engenheiro de inferência. O capítulo <a data-ch="medindo-qualidade">Medindo qualidade</a> mostra os <span class="la-term" data-term="protocolo-congelado">protocolos congelados</span> que evitam essa armadilha.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Perdas sob medida: como o DSpark aprendeu a rascunhar</h2>
+  <p>Perdas de verdade raramente vêm sozinhas. Quando queremos que o modelo aprenda várias coisas ao mesmo tempo, somamos perdas com pesos: \(\mathcal{L} = \sum_i \lambda_i\, \mathcal{L}_i\). Os pesos \(\lambda_i\) são hiperparâmetros e dizem ao gradiente o que priorizar. O rascunhador DSpark, que o DeepSeek usa para decodificação especulativa, é um exemplo perfeito, e cada termo da sua perda explica um parâmetro da receita.</p>
+  <p>Uma prévia do DSpark (os detalhes estão em <a data-ch="dflash-dspark">DFlash2 &amp; DSpark</a>): é um rascunhador leve no custo por token. Ele tem ~19,8B parâmetros no total, em 3 estágios com MoE, mas só ≈0,84B (3 × ~0,28B) trabalham em cada token de rascunho; os dois números são estimativas feitas a partir das formas dos tensores. O DSpark lê estados internos do modelo principal e propõe, de uma só vez, um bloco de tokens futuros. O modelo grande verifica o bloco inteiro num único forward e aceita um prefixo dele. Um rascunho só vale se for aceito. Em média, a aceitação de uma posição é \(\sum_x \min(p, q) = 1 - \mathrm{TV}(p, q)\), onde \(q\) é a distribuição do rascunho e \(p\) a do alvo (<a data-ch="especulacao-fundamentos">Especulação: fundamentos</a>). O artigo do DSpark descreve esta perda de treino:</p>
+  <div class="la-eq">
+    \[ \mathcal{L}_{\text{DSpark}} = \sum_{k} w_k\Big[\,0{,}1\,\mathcal{L}^{(k)}_{\text{CE}} \;+\; 0{,}9\,\mathcal{L}^{(k)}_{\text{TV}} \;+\; 1{,}0\,\mathcal{L}^{(k)}_{\text{conf}}\Big], \qquad w_k = e^{-(k-1)/\gamma} \]
+    \[ \mathcal{L}_{\text{TV}} = \tfrac12\sum_x \big|\,p(x) - q(x)\,\big|, \qquad \mathcal{L}_{\text{conf}} = -\big[c^*\ln c + (1-c^*)\ln(1-c)\big], \qquad c^* = 1 - \mathrm{TV}(p,q) \]
+    <ul class="la-eq-legend">
+      <li>\(k\): posição no bloco de rascunho (1 = logo após o último token aceito)</li>
+      <li>\(q,\ p\): distribuições do rascunho e do alvo naquela posição</li>
+      <li>\(\mathcal{L}_{\text{CE}}\): entropia cruzada do rascunho com o token de referência</li>
+      <li>\(\mathcal{L}_{\text{TV}}\): <span class="la-term" data-term="distancia-tv">distância de variação total</span></li>
+      <li>\(c\): saída da cabeça de confiança, uma sigmoide, portanto sempre entre 0 e 1</li>
+      <li>\(c^*\): a probabilidade analítica de aceitação, a meta de \(c\)</li>
+      <li>\(w_k\): peso por posição, que decai com \(k\)</li>
+    </ul>
+  </div>
+  <p>Leia termo a termo. A <b>entropia cruzada</b> (peso 0,1) é o velho “acerte o próximo token”, julgado um token de referência por vez. A <b>distância TV</b> (peso 0,9, o maior entre os dois termos que treinam as distribuições do rascunho) compara as distribuições inteiras de uma vez, e \(1 - \mathrm{TV}\) é exatamente a aceitação esperada. Dos pesos que moldam \(q\), o DSpark põe 90% no que a verificação vai cobrar. A <span class="la-term" data-term="bce">entropia cruzada binária</span> (BCE, peso 1,0) treina a <span class="la-term" data-term="confidence-head">cabeça de confiança</span>, uma sigmoide que estima a chance de cada posição ser aceita. Como a meta \(c^*\) sai de uma conta, esse termo também é auto-supervisionado. Um detalhe que a figura mostra: a meta \(c^*\) é um número entre 0 e 1, não um 0 ou 1 exato, e por isso a BCE nunca chega a zero. O mínimo dela, atingido quando \(c = c^*\), é a entropia \(H(c^*) = -[c^*\ln c^* + (1-c^*)\ln(1-c^*)]\), a incerteza que a própria meta carrega. Só o que passa desse piso é erro que o gradiente consegue corrigir. Por fim, o peso \(w_k\), que decai com a posição, reflete a matemática da aceitação: a posição 4 só conta se as posições 1, 2 e 3 tiverem sido aceitas antes, então errar cedo custa mais caro. Depois do treino, uma calibração de temperatura por posição ajusta as confianças (STS é a sigla que o artigo do DSpark usa para essa etapa).</p>
+  <figure class="la-fig wide" id="fig-dspark" data-title="A mesa de mixagem da perda do DSpark">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Cinco posições de um bloco de rascunho. Em cada cartão, as barras lilás são o alvo \(p\) e as menta são o rascunho \(q\), sobre um vocabulário de brinquedo; embaixo, a meta \(c^*\) (traço) e a confiança prevista \(c\) (bolinha). A marca “ref” aponta o token de referência, aquele que a CE cobra. O gráfico mostra a contribuição ponderada de cada termo por posição e, em tracejado, a sobrevivência do prefixo \(\prod c^*\). A BCE contra uma meta suave \(c^*\) nunca chega a zero: seu mínimo é a entropia \(H(c^*)\) (hachurado), atingido quando \(c = c^*\). Só a parte sólida verde é erro corrigível. Por isso a barra da BCE parece a maior de todas: quase toda a sua altura é piso, não erro. Pesos 0,1/0,9/1,0 são os do DSpark; distribuições e confianças são ilustrativas. O valor de γ na ponderação não está nas fontes (o inventário usa a mesma letra para o bloco treinado, de 5), e o controle começa em 5 só como ilustração.</figcaption>
+  </figure>
+  <p>Mexa em γ e veja o treino quase desistir das posições finais (γ pequeno) ou tratá-las quase como as primeiras (γ grande). Suba a “qualidade” do rascunho e observe as barras menta encostarem nas lilás: a TV cai, a meta de confiança sobe e a sobrevivência do prefixo se estende pelo bloco. É isso que o treino persegue, gradiente a gradiente.</p>
+  <div class="la-inrecipe" data-recipe="ds"><div class="la-inrecipe-h"><span class="la-rb ds"></span><span class="k">Parâmetros</span><code>dspark_block_size: 5</code> · <code>MTP_NUM_TOKENS=6</code></div><div class="la-inrecipe-b"><p>O <code>dspark_block_size = 5</code> do <code>config.json</code> é o tamanho do bloco com que o DSpark foi treinado. Rascunhar menos de 5 posições trunca o bloco: no vLLM 0.25.2 isso passa em silêncio, e a partir do 0.26 é rejeitado. No lane Vision-Exp, uma regra de reuso de módulos MTP ainda exige que \(k\) seja divisível por 3, por isso a receita usa <code>MTP_NUM_TOKENS=6</code> (uma query de ruído a mais). O hotfix opcional <i>block-k</i> remove a regra para o DSpark e libera \(k = 5\), com ganho de 2–10% em fluxo único. O \(k\) certo é o que respeita o treino.</p></div></div>
+
+  <h3>QAT: treinar já vendo o arredondamento</h3>
+  <p>Uma última variação não mexe na fórmula da perda, e sim no forward: o <span class="la-term" data-term="qat">QAT</span> (<i>quantization-aware training</i>). Durante o treino, certos tensores passam por um par quantizar → dequantizar, a <span class="la-term" data-term="quantizacao-simulada">quantização simulada</span>. O forward já enxerga os valores arredondados que a inferência verá, e a perda cobra o erro que esse arredondamento causa. Só que o arredondamento é uma escada, com derivada zero em quase todo lugar. Por isso o backward usa o <span class="la-term" data-term="ste">estimador straight-through</span>: finge que a escada é a identidade e deixa o gradiente passar. O modelo aprende a tolerar o arredondamento.</p>
+  <div class="la-eq">
+    \[ \text{forward: } \hat w = s\cdot \operatorname{round}(w/s) \qquad\qquad \text{backward (STE): } \frac{\partial \hat w}{\partial w} \approx 1 \]
+    <ul class="la-eq-legend">
+      <li>\(s\): a escala do bloco quantizado</li>
+      <li>\(\operatorname{round}\): arredondar para o valor representável mais próximo</li>
+      <li>STE: tratar a escada como se fosse a reta \(\hat w = w\) na hora de derivar</li>
+    </ul>
+  </div>
+  <p>Nas receitas, quase tudo é quantização pós-treino (PTQ): o modelo foi treinado em alta precisão e comprimido depois (EXL3 no GLM, NVFP4 no Qwen). A exceção é o DeepSeek-V4. O KV cache das dimensões sem RoPE foi treinado com simulação FP8, em blocos de 64 e com escala \(2^{\lceil \log_2(\text{amax}/448)\rceil}\). Por isso o layout FP8 do KV não é degradação: é o regime em que o modelo aprendeu. A receita o usa via <code>--kv-cache-dtype nvfp4_ds_mla</code>, que apesar do nome é byte-idêntico ao <code>fp8_ds_mla</code> (<a data-ch="kv-cache-quantizado">KV cache quantizado</a>). O mesmo vale para o <span class="la-term" data-term="lightning-indexer">indexador</span> da atenção esparsa do DeepSeek-V4, o pontuador barato que escolhe quais tokens antigos cada query vai ler (<a data-ch="atencao-esparsa">Atenção esparsa</a>). O Q e o K do indexador foram treinados vendo FP4 simulado, em blocos de 32, depois de uma rotação de Hadamard (uma matriz ortogonal que espalha os valores extremos entre as coordenadas antes do arredondamento). Por isso o cache do indexador em <span class="la-term" data-term="mxfp4">MXFP4</span>, que a receita liga com <code>DSPARK_ENABLE_MXFP4_INDEXER_CACHE=1</code> (opcional, padrão 0), também é um formato nativo do modelo, e não uma aproximação nova. E até a PTQ inteligente minimiza uma perda. O EXL3 escolhe os códigos que minimizam o erro na <i>saída</i> de cada camada, \(\operatorname{tr}\big((\hat W - W)\,H\,(\hat W - W)^\top\big)\), só que sem retreinar o modelo (<a data-ch="hadamard-trelica-exl3">Hadamard, treliças &amp; EXL3</a>).</p>
+</section>
+
+<section class="la-sec">
+  <h2>Treino vs inferência: o que congela e o que a receita escolhe</h2>
+  <p>Juntando tudo, o laço de treino é este: sortear um minibatch, fazer o forward, calcular a perda, fazer o backward para obter os gradientes e deixar o otimizador atualizar os pesos. Repita isso por dezenas ou centenas de milhares de passos (ordem de grandeza). A <span class="la-term" data-term="inferencia">inferência</span> é o que sobra quando se arranca tudo menos o <span class="la-term" data-term="forward-pass">forward</span>. Não há perda, porque não existe resposta certa para comparar. Não há gradiente e não há otimizador. Os <span class="la-term" data-term="pesos-congelados">pesos estão congelados</span>. Percorra os passos na figura.</p>
+  <figure class="la-fig wide" id="fig-laco" data-title="O laço de treino e a linha de montagem da inferência">
+    <div class="la-fig-stage" style="height:420px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Os passos 1 a 5 são uma volta do laço de treino: dados → forward → perda → backward → otimizador. No passo 6 os pesos recebem o cadeado, e no 7 sobra só o forward, que gera um token por vez e guarda o KV cache. O ligador “QAT” insere quantizar/dequantizar no forward do treino. A barra inferior compara os bytes por parâmetro de treinar e de servir o modelo escolhido (a de treino segue uma regra de bolso).</figcaption>
+  </figure>
+  <p>A diferença de memória é brutal. Treinar com AdamW em precisão mista costuma exigir cerca de 16 bytes por parâmetro só de estado: pesos BF16 (2), gradientes BF16 (2), a cópia mestra em FP32 (4) e os dois momentos do Adam em FP32 (4 + 4). Essa é a regra de bolso clássica, e ela ainda não conta as ativações guardadas para o backward. Para os 321 bilhões de parâmetros do GLM, a conta passa de 5 TB. Servir o mesmo modelo na receita cabe em ~164 GiB de pesos EXL3 (cerca de 4,4 bits por parâmetro), mais o <span class="la-term" data-term="kv-cache">KV cache</span>. O Muon economiza um buffer, porque guarda só o momento, mas não muda a ordem de grandeza. É por isso que dois DGX Spark servem um modelo cujo treino exigiu um datacenter.</p>
+  <h3>O que a receita herda e o que ela escolhe</h3>
+  <p>Pesos congelados delimitam o trabalho de uma receita. Ela <b>não pode</b> mudar o que o modelo aprendeu. Ela <b>pode</b> mudar como o forward é calculado: o formato numérico dos pesos e do KV (quantização), os kernels que fazem as contas, a divisão do trabalho entre as máquinas, o agendamento das requisições, o sorteio dos tokens e a presença de um rascunhador que propõe tokens para verificação. Cada uma dessas escolhas aproxima ou reorganiza o mesmo forward. Por isso toda receita mede se o resultado continua igual ao da referência.</p>
+  <p>Até a abliteração, que muda o comportamento do modelo, respeita a fronteira. Na receita GLM, <code>ABLIT=1</code> edita as matrizes <code>o_proj</code> (as projeções de saída da atenção) na hora da carga, e nada é regravado no disco. É álgebra linear sobre pesos congelados, não treino (<a data-ch="abliteracao">Abliteração</a>).</p>
+  <div class="la-table-wrap" style="position:relative"><table class="la-params">
+    <thead><tr><th>Parâmetro</th><th>Valor</th><th>Receita</th><th>O que faz</th><th>Por que importa na inferência</th></tr></thead>
+    <tbody>
+      <tr><td><code>router_aux_loss_coef</code></td><td>0,001</td><td><span class="la-rb glm"></span> <span class="la-rb qwen"></span></td><td>Peso da perda auxiliar que, no treino, pune carga desigual entre experts</td><td>Nenhum efeito na inferência. Explica por que os experts chegam balanceados (<a data-ch="mixture-of-experts">MoE</a>)</td></tr>
+      <tr><td><code>initializer_range</code></td><td>0,02</td><td><span class="la-rb glm"></span> <span class="la-rb qwen"></span> <span class="la-rb ds"></span></td><td>Desvio padrão do sorteio inicial dos pesos</td><td>Nenhum efeito: só valeu antes do primeiro passo de treino</td></tr>
+      <tr><td><code>topk_method</code></td><td><code>noaux_tc</code></td><td><span class="la-rb glm"></span> <span class="la-rb ds"></span></td><td>Balanceamento sem perda auxiliar: um viés por expert, ajustado fora do gradiente durante o treino</td><td>O viés (<span class="la-term" data-term="e-score-correction-bias">e_score_correction_bias</span>) chega congelado no checkpoint e entra só na escolha do top-k</td></tr>
+      <tr><td><code>num_experts_per_tok</code></td><td>8</td><td><span class="la-rb glm"></span></td><td>Quantos experts cada token usa, fixado no treino</td><td>Sem os aliases de config (já presentes no vLLM que a imagem da receita fixa), valia o default 7: “routing 7 experts/token instead of the trained 8”</td></tr>
+      <tr><td><code>rms_norm_eps</code> (visão)</td><td>1e-6 (o checkpoint diz 1e-5)</td><td><span class="la-rb glm"></span></td><td>O \(\varepsilon\) somado à média dos quadrados dentro da raiz da RMSNorm, na torre de visão (a parte do GLM que lê imagens)</td><td>A torre foi treinada com 1e-6. Com 1e-5, as descrições saem repetitivas ou degradadas, então o código do modelo no vLLM da receita força 1e-6</td></tr>
+      <tr><td><code>DFLASH_TOKENS</code></td><td>7</td><td><span class="la-rb glm"></span></td><td>Tokens propostos por passo pelo DFlash2</td><td>O bloco treinado tem 8 = 1 âncora + 7 rascunhos</td></tr>
+      <tr><td><code>num_speculative_tokens</code> (MTP)</td><td>3</td><td><span class="la-rb qwen"></span></td><td>Reaplica 3 vezes a única camada MTP, treinada em vários passos</td><td>Aceitação por posição de 89 / 74,5 / 60% (lote 1, greedy). O próprio vLLM avisa que reaplicar a mesma camada MTP pode reduzir a aceitação</td></tr>
+      <tr><td><code>dspark_block_size</code></td><td>5</td><td><span class="la-rb ds"></span></td><td>Tamanho do bloco com que o DSpark foi treinado</td><td><i>k</i> &lt; 5 trunca blocos; o lane Vision-Exp usa <i>k</i> = 6 pela regra de divisibilidade</td></tr>
+      <tr><td>KV NoPE em FP8 (QAT)</td><td>blocos de 64, escala potência de 2</td><td><span class="la-rb ds"></span></td><td>O treino simulou a quantização do KV</td><td>Servir o KV em FP8 é o regime nativo do modelo, não uma aproximação</td></tr>
+      <tr><td>Q/K do indexador em FP4 (QAT) · <code>DSPARK_ENABLE_MXFP4_INDEXER_CACHE</code></td><td>blocos de 32, após Hadamard · flag opcional (padrão 0)</td><td><span class="la-rb ds"></span></td><td>O treino simulou FP4 nas entradas do indexador; com a flag em 1, a receita passa <code>use_fp4_indexer_cache</code> ao vLLM e guarda o K do indexador em MXFP4</td><td>O cache MXFP4 é o formato em que o indexador aprendeu a pontuar, e, segundo a receita, deve ler metade dos bytes de K por chave pontuada (efeito esperado)</td></tr>
+      <tr><td>Otimizador</td><td>Muon + AdamW</td><td><span class="la-rb qwen"></span> <span class="la-rb ds"></span></td><td>Como os pesos foram atualizados</td><td>Não vai para o checkpoint. Ficam as normalizações que tornaram o treino estável (QK-Norm no Qwen; RMSNorm de Q e <code>kv_norm</code> no DeepSeek), que precisam ser executadas exatamente</td></tr>
+    </tbody>
+  </table></div>
+  <div class="la-inrecipe" data-recipe="glm"><div class="la-inrecipe-h"><span class="la-rb glm"></span><span class="k">Adaptação no vLLM</span><code>glm5_next.py</code> · aliases de config</div><div class="la-inrecipe-b"><p>O checkpoint do GLM usa nomes de campo do SGLang (<code>num_experts_per_tok</code>, <code>hc_mult</code>, <code>mla_use_nope</code>…), e a classe de config do vLLM esperava outros nomes. No commit do vLLM que a imagem da receita fixa (<code>487ecf187</code>), o <code>glm5_next.py</code> lê os dois. Sem isso, o modelo subia sem erro nenhum e roteava 7 experts por token em vez dos 8 do treino. É a lição do capítulo em forma de bug: o forward da inferência precisa ser <i>a mesma função</i> que foi treinada, e um único número fora do lugar muda o modelo em silêncio.</p></div></div>
+  <div class="la-callout tip"><b class="t">Para levar para as próximas partes</b><p>Diante de qualquer campo, flag ou patch de uma receita, pergunte: isso muda a <b>função</b> que o treino ajustou, ou só o <b>jeito de calculá-la</b>? No primeiro caso, só é aceitável se reproduzir o treino (eps, número de experts, tamanho de bloco, formato do QAT). No segundo, precisa ser medido contra a referência (KLD, paridade numérica, aceitação).</p></div>
+  <p>Falta uma peça: como calcular de uma vez o gradiente de 321 bilhões de botões? E, antes disso, o que são exatamente as camadas que transformam tokens em probabilidades? O próximo capítulo abre a caixa, com neurônios, camadas, funções de ativação e a retropropagação que faz tudo isso funcionar (<a data-ch="redes-neurais">Redes neurais</a>).</p>
+</section>

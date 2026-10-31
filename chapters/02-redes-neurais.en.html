@@ -1,0 +1,371 @@
+<p class="la-lead">Behind acronyms like SwiGLU, RMSNorm, <code>rms_norm_eps</code> and <code>output_gate_type: sigmoid</code> there is a simple piece: a <span class="la-term" data-term="neuronio-artificial">neuron</span> that multiplies numbers by weights, adds everything up and decides how much of the result to let through. Put millions of them in layers, connect the layers with shortcuts and normalize the numbers along the way, and you have the skeleton of any LLM, from GLM-5.3-Flash to DeepSeek-V4-Flash. In this chapter you will build that piece from scratch, watch the plane fold on screen, train a network live in the browser and understand why the recipes copy every ε and every activation function from the checkpoint so carefully.</p>
+
+<section class="la-sec">
+  <h2>The neuron: weigh, sum, decide</h2>
+  <p>Imagine a party bouncer with a clipboard. For each guest he looks at a few features (\(x_1\): on the list? \(x_2\): showed up in flip-flops?), gives each one a weight (being on the list counts a lot, in favor; flip-flops count a little, against), adds everything up, subtracts his own bad mood and decides. That bouncer is an artificial neuron. The entire math fits on one line:</p>
+  <div class="la-eq">
+    \[ z = \sum_{i=1}^{n} w_i\,x_i + b = \mathbf w^\top \mathbf x + b, \qquad a = f(z) \]
+    <ul class="la-eq-legend">
+      <li>\(\mathbf x \in \mathbb R^n\): the inputs (the features the neuron looks at)</li>
+      <li>\(\mathbf w \in \mathbb R^n\): the <b>weights</b>, learned during training. The sign says whether the input counts in favor (+) or against (−), and the magnitude says how much</li>
+      <li>\(b\): the <span class="la-term" data-term="vies">bias</span>, a threshold that shifts the decision</li>
+      <li>\(z\): the <span class="la-term" data-term="pre-ativacao">pre-activation</span>, the raw “score”</li>
+      <li>\(f\): the <span class="la-term" data-term="funcao-de-ativacao">activation function</span>, which turns the score into a response (step, sigmoid, ReLU…)</li>
+      <li>\(a\): the output, or activation, of the neuron</li>
+    </ul>
+  </div>
+  <p>Work one out by hand. With \(\mathbf x = (2, -1)\), \(\mathbf w = (0.5,\ 1.5)\) and \(b = 0.2\): \(z = 0.5\cdot 2 + 1.5\cdot(-1) + 0.2 = -0.3\). If \(f\) is ReLU, the output is \(\max(0, -0.3) = 0\): the neuron stays silent. If \(f\) is the sigmoid, the output is \(1/(1+e^{0.3}) \approx 0.4256\), a “maybe, leaning toward no”.</p>
+  <h3>What a neuron sees: a line</h3>
+  <p>The set of points where \(\mathbf w^\top \mathbf x + b = 0\) is a line in the plane (in \(n\) dimensions, a hyperplane). The vector \(\mathbf w\) is perpendicular to that line and points toward the side where \(z\) grows. The signed distance from a point to the line is \(z/\lVert\mathbf w\rVert\); in other words, \(z\) is that distance multiplied by \(\lVert\mathbf w\rVert\) (positive on the side \(\mathbf w\) points to). A neuron answers two questions: which side of the line the point is on, and how far away.</p>
+  <p>In the figure below, each point in the plane is a guest. The background shows the neuron's response \(a = f(z)\) at each position, and the diamond is a guest wandering around the plane. On the left you see the same neuron drawn as a graph: the inputs flow through the weights to the summation node and then through the activation.</p>
+  <figure class="la-fig" id="fig-neuronio" data-title="The bouncer neuron">
+    <div class="la-fig-stage" style="height:400px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Move \(w_1\), \(w_2\) and \(b\). The dashed line is the boundary \(z = 0\) and the arrow is \(\mathbf w\), always perpendicular to it. The thickness of each edge in the graph is \(|w_i|\) and its color is the sign. Hover over the plane to move the guest. The counter shows how many of the 16 points the neuron classifies correctly. The data are illustrative.</figcaption>
+  </figure>
+  <p>Notice two things. First, changing \(b\) only slides the line, without rotating it. What rotates it is the ratio between \(w_1\) and \(w_2\). Second, with the default controls you can get all 16 points right, because the two clouds are separated by a line. If the pink points sat in two opposite corners (the <b>XOR</b> pattern), no line would do it.</p>
+  <div class="la-callout deep"><b class="t">Deep dive · a bit of history</b><p>Rosenblatt's perceptron (1958) was exactly this neuron with a step as its activation. In 1969, Minsky and Papert showed that a single neuron cannot solve XOR, and the field cooled off for years. The way out, known ever since, is to stack neurons in <b>layers</b> and train them all together. What was missing was an efficient way to train them, which only caught on in the 1980s with backpropagation (section 6).</p></div>
+  <p>In an LLM, a neuron's input is the entire vector that represents a token. In GLM-5.3-Flash and DeepSeek-V4-Flash that vector has 4,096 numbers (<code>hidden_size</code>); in Qwen3.8-Flash-Next, 2,560. A single neuron in the intermediate layer of a GLM <span class="la-term" data-term="expert">expert</span> (one of the small FFNs in an <span class="la-term" data-term="mixture-of-experts">MoE</span> layer, <a data-ch="mixture-of-experts">chapter 11</a>) therefore has 4,096 weights, and the expert has 2,048 of those neurons. Nobody programs them one by one: they come packed in a matrix.</p>
+</section>
+
+<section class="la-sec">
+  <h2>The linear layer: a matrix that bends space</h2>
+  <p>Put \(m\) neurons side by side, all looking at the same input \(\mathbf x\). Each one has its own weight vector. Stack those vectors as the <b>rows</b> of a matrix and you have a <span class="la-term" data-term="camada-linear">linear layer</span>:</p>
+  <div class="la-eq">
+    \[ \mathbf y = W\mathbf x + \mathbf b, \qquad W \in \mathbb R^{m\times n},\quad y_i = \sum_{j=1}^{n} W_{ij}\,x_j + b_i \]
+    <ul class="la-eq-legend">
+      <li>\(n\): input width (<i>in_features</i>); \(m\): output width (<i>out_features</i>), that is, the number of neurons</li>
+      <li>row \(i\) of \(W\): the weights of neuron \(i\); column \(j\) of \(W\): where input \(j\) “pushes” the output</li>
+      <li>\(\mathbf b \in \mathbb R^m\): one bias per neuron (many LLMs don't use it)</li>
+      <li>cost: \(m\cdot n\) multiplications and additions per token, or \(2mn\) <abbr title="floating-point operations">FLOPs</abbr></li>
+    </ul>
+  </div>
+  <p>Checkpoints store \(W\) in this <code>[out, in]</code> convention, the same one PyTorch's <code>nn.Linear</code> uses. When the GLM inventory says that an expert's <code>gate_proj</code> has shape <code>[2048, 4096]</code>, it is saying: 2,048 neurons, each with 4,096 weights, 8.4 million numbers.</p>
+  <h3>The geometry: what a matrix does to the plane</h3>
+  <p>A \(2\times 2\) matrix transforms the plane in a very specific way: the origin stays put, lines stay lines, and parallel lines stay parallel and evenly spaced. The trick to reading any matrix is to look at its <b>columns</b>: the first column is where the vector \(\hat{\mathbf e}_1 = (1,0)\) goes, the second is where \(\hat{\mathbf e}_2 = (0,1)\) goes. Everything else follows by linearity. The bias \(\mathbf b\) shifts everything as a block (the transformation becomes <b>affine</b>).</p>
+  <figure class="la-fig" id="fig-geometria" data-title="A matrix bends the plane">
+    <div class="la-fig-stage" style="height:420px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Pick a matrix. The grid and the letter “F” deform continuously from the identity to \(W\). The mint and lavender arrows are the columns of \(W\), that is, the images of \(\hat{\mathbf e}_1\) and \(\hat{\mathbf e}_2\). The determinant is the area factor: with \(\det W = 0\) (“flatten”) the whole plane collapses onto a line. Turn on “ReLU after” to see the first nonlinearity fold the plane.</figcaption>
+  </figure>
+  <p>Three observations that will come back many times along the trail:</p>
+  <ol class="la-steps">
+    <li><b>The determinant measures what is lost.</b> With \(\det W = 0\) the matrix has <i>rank</i> 1: two dimensions go in, one comes out, and the information in the other is lost for good. Low-rank matrices are a deliberate way to compress, and they will reappear in <span class="la-term" data-term="mla">MLA</span> (<a data-ch="mla">chapter 12</a>) and in the low-rank gates of GLM and Qwen.</li>
+    <li><b>Reflecting flips the letter.</b> The mirrored “F” shows \(\det W &lt; 0\): the orientation of the plane was turned inside out.</li>
+    <li><b>ReLU folds.</b> After the matrix, ReLU zeroes the negative coordinates. Everything that was outside the first quadrant is squashed against the axes. It is the first operation in the figure that is <i>not</i> linear.</li>
+  </ol>
+  <h3>Why stacking linear layers doesn't help</h3>
+  <p>Apply two linear layers in sequence: \(W_2(W_1\mathbf x + \mathbf b_1) + \mathbf b_2 = (W_2W_1)\,\mathbf x + (W_2\mathbf b_1 + \mathbf b_2)\). The result is <b>another</b> affine transformation, with matrix \(W_2W_1\). A hundred linear layers in a row are equivalent to a single one. The network would be stuck with transformations that keep lines straight, and none of them separates XOR. That is why every neural network interleaves its matrices with nonlinear functions.</p>
+  <div class="la-callout why"><b class="t">Why this matters if you serve models</b><p>Almost all of an LLM's parameters live in linear layers. Serving the model is, to a large extent, reading those matrices from memory and multiplying them by vectors. Quantizing is storing \(W\) with fewer bits (<a data-ch="quantizacao-fundamentos">Part IV</a>). <span class="la-term" data-term="tensor-parallel">Tensor parallelism</span> is splitting \(W\) by rows or columns across GPUs (<a data-ch="paralelismos">chapter 38</a>). Every optimization in the recipes starts from understanding that “layer” means “matrix”.</p></div>
+  <p>A bookkeeping detail: a linear layer has \(m\cdot n\) weights plus \(m\) biases. The decoders of the three models skip the bias in the attention projections (<code>attention_bias: false</code> in GLM and Qwen), which saves parameters and simplifies quantization. The vision towers (<span class="la-term" data-term="vit">ViT</span>, the Transformer that reads the image, <a data-ch="multimodal">chapter 17</a>) still use bias: the MLPs of Qwen's ViT, the SwiGLU MLP of GLM's ViT and DeepSeek's <span class="la-term" data-term="merger-visual">Aligner</span> have <code>bias</code>.</p>
+</section>
+
+<section class="la-sec">
+  <h2>Activation functions: the zoo of folds</h2>
+  <p>The activation function is what gives the network the power to fold space. A good activation has to be cheap, have a derivative that is easy to compute (training depends on it, section 6) and not <span class="la-term" data-term="saturacao-ativacao">saturate</span> too much: if the curve goes flat, the derivative goes to zero and learning stops. Each family strikes this balance in its own way, and the three recipes use almost all of them, each in a different role.</p>
+  <figure class="la-fig" id="fig-ativacoes" data-title="Activation zoo">
+    <div class="la-fig-stage" style="height:430px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Pick a function and drag the probe \(z\). The thick curve is \(f(z)\) and the dashed one is \(f'(z)\) (turn on “derivative”). The other functions stay in the background for comparison. Each little dot is a value of \(z\) that rises from the axis to \(f(z)\) and then slides over to the vertical axis: it is the function taking inputs to outputs. If you leave the slider alone, the probe wanders on its own (the slider shows “auto”). The card shows the formula and where the function appears in the recipes. With GELU selected, “tanh approximation” draws the <code>gelu_pytorch_tanh</code> variant and the maximum difference from exact GELU, computed on the fly.</figcaption>
+  </figure>
+  <h3>The six you need to know</h3>
+  <dl class="la-kv">
+    <dt><span class="la-term" data-term="sigmoide">Sigmoid</span> \(\sigma(z) = \frac{1}{1+e^{-z}}\)</dt>
+    <dd>Squashes any number into \((0, 1)\). The derivative \(\sigma(1-\sigma)\) never exceeds 0.25, so dozens of sigmoids in series multiply the gradient by small numbers until it vanishes. It fell out of use as a hidden-layer activation, but became the <b>gate</b> function par excellence: a number between 0 and 1 is exactly “how much to let through”.</dd>
+    <dt><span class="la-term" data-term="tanh">tanh</span> \(\tanh(z) = 2\sigma(2z) - 1\)</dt>
+    <dd>A sigmoid stretched to \((-1, 1)\) and centered at zero. It reigned in recurrent networks (LSTM). Today it shows up as a component of other functions: in the fast GELU approximation and in the logit <span class="la-term" data-term="softcap-logits">softcap</span> \(c\cdot\tanh(z/c)\).</dd>
+    <dt><span class="la-term" data-term="relu">ReLU</span> \(\max(0, z)\)</dt>
+    <dd>The cheapest one: a single comparison. Derivative 1 for \(z&gt;0\) and 0 for \(z&lt;0\), with no saturation on the positive side. It leaves many neurons at exactly zero (sparse activations). The risk is the <span class="la-term" data-term="neuronio-morto">dead neuron</span>: if \(z\) stays negative for every input, the gradient is zero forever.</dd>
+    <dt><span class="la-term" data-term="softplus">Softplus</span> \(\ln(1+e^{z})\)</dt>
+    <dd>A smoothed ReLU: always positive, with derivative \(\sigma(z)\). It is the choice when you need a <b>strictly positive</b> number that comes out of an unconstrained computation, such as a decay rate.</dd>
+    <dt><span class="la-term" data-term="gelu">GELU</span> \(z\,\Phi(z)\)</dt>
+    <dd>\(\Phi\) is the cumulative distribution function of the standard normal. GELU multiplies \(z\) by the probability that a standard normal falls below \(z\), a smooth “probabilistic ReLU” with a small negative dip (minimum ≈ −0.17). Popularized by BERT and GPT-2. There is a tanh approximation, \(\tfrac{z}{2}\big(1+\tanh(\sqrt{2/\pi}\,(z + 0.044715\,z^3))\big)\), which PyTorch calls <code>gelu_pytorch_tanh</code>.</dd>
+    <dt><span class="la-term" data-term="silu">SiLU / Swish</span> \(z\,\sigma(z)\)</dt>
+    <dd>The input multiplied by its own sigmoid: the neuron “authorizes itself” to pass. Smooth, non-monotonic (minimum ≈ −0.278 at \(z\approx -1.278\)) and unbounded above. It is the activation the three LLMs declare in <code>config.json</code> (<code>hidden_act: silu</code>), because it is the “gate” half of SwiGLU (section 5).</dd>
+  </dl>
+  <div class="la-callout info"><b class="t">Recipe acronyms you will run into</b><p>The table below, and the rest of the chapter, mentions pieces of the three models that will only be studied later on. For now it is enough to know what each one is. Hover over an acronym to see its short definition.</p>
+    <ul>
+      <li><b><span class="la-term" data-term="gdn">GDN</span> · <span class="la-term" data-term="kda">KDA</span></b>: recurrent linear attention, which summarizes the past in a fixed-size state instead of keeping every token. GDN (Gated DeltaNet) is in 36 of Qwen's layers, and KDA in 34 of GLM's layers (<a data-ch="atencao-linear">ch. 14</a>).</li>
+      <li><b><span class="la-term" data-term="dsa">DSA</span> · <span class="la-term" data-term="qsa">QSA</span> · <span class="la-term" data-term="lightning-indexer">lightning indexer</span></b>: sparse attention. A cheap indexer scores the old tokens and the expensive attention reads only the best ones: DSA in GLM, QSA in Qwen, the <span class="la-term" data-term="csa-hca">CSA</span> indexer in DeepSeek. <span class="la-term" data-term="swa">SWA</span> is the sliding window (<a data-ch="atencao-esparsa">ch. 13</a>).</li>
+      <li><b>MLA</b>: attention in which K and V come out of a compressed per-token latent, used by GLM and DeepSeek (<a data-ch="mla">ch. 12</a>).</li>
+      <li><b>MoE</b>: the FFN becomes hundreds of experts, and a <span class="la-term" data-term="roteador">router</span> picks a few per token. There is also a <span class="la-term" data-term="shared-expert">shared expert</span> that always runs (<a data-ch="mixture-of-experts">ch. 11</a>).</li>
+      <li><b><span class="la-term" data-term="mhc">mHC</span> · <span class="la-term" data-term="gated-residual">Gated Residual</span></b>: the residual stream (section 9) widened to 4 streams. mHC is in GLM and DeepSeek, and the Gated Residual (GR) in Qwen (<a data-ch="hiperconexoes">ch. 15</a>).</li>
+      <li><b><span class="la-term" data-term="ple">PLE</span></b>: Qwen's <span class="la-term" data-term="ngram-embedding">N-gram embedding</span> memory, a giant table looked up by hashing bigrams and trigrams (<a data-ch="ngram-mtp">ch. 16</a>).</li>
+      <li><b><span class="la-term" data-term="mtp">MTP</span> · <span class="la-term" data-term="dflash2">DFlash2</span> · <span class="la-term" data-term="dspark">DSpark</span></b>: <span class="la-term" data-term="rascunhador">drafters</span> for <span class="la-term" data-term="decodificacao-especulativa">speculative decoding</span>, small networks that propose several tokens for the big model to check in one go (<a data-ch="especulacao-fundamentos">ch. 35</a>).</li>
+      <li><b>ViT · <span class="la-term" data-term="merger-visual">merger/Aligner</span></b>: the vision tower and the translator that brings its vectors to the LLM's width (<a data-ch="multimodal">ch. 17</a>).</li>
+      <li><b><span class="la-term" data-term="fp32">FP32</span> · <span class="la-term" data-term="bf16">BF16</span> · <span class="la-term" data-term="fp16">FP16</span> · <span class="la-term" data-term="fp8-e4m3">FP8</span></b>: number formats with 32, 16, 16 and 8 bits. Fewer bits take less memory, but represent values with less precision (<a data-ch="numeros-no-computador">ch. 4</a> and <a data-ch="fp8-fp4-microescala">ch. 21</a>).</li>
+    </ul></div>
+  <div class="la-table-wrap"><table class="la-params">
+    <thead><tr><th>Activation</th><th>Where it appears</th><th>Recipe</th><th>Why this one, there</th></tr></thead>
+    <tbody>
+      <tr><td>SiLU</td><td>All FFNs and experts (SwiGLU); short causal conv + SiLU on q, k, v in KDA (GLM) and GDN (Qwen); inside the Gated Residual read gate and the PLE conv (Qwen); SwiGLU MLP of DeepSeek's ViT; SwiGLU MLP (with bias) of GLM's ViT and GLM's SwiGLU merger 4096 → 10240 → 4096, with <code>swiglu_limit</code> 10</td><td><span class="la-rb all"></span></td><td>Smooth and unbounded: preserves magnitude and gives well-behaved gradients. <code>hidden_act</code> must be <code>silu</code>: the vLLM code used by GLM and DeepSeek rejects any other activation</td></tr>
+      <tr><td>Sigmoid</td><td>Gates: GDN and attention outputs, Gated Residual read and write, the PLE gate and the shared expert gate (Qwen); KDA's \(\beta\) and output gate, router, mHC <code>pre</code>/<code>post</code> weights (GLM); mHC, <code>hc_head</code> and DSpark's confidence head (DeepSeek)</td><td><span class="la-rb all"></span></td><td>Bounded to \((0,1)\): says “how much passes” and never amplifies. <code>post = 2·σ(·)</code> extends the range to \((0,2)\)</td></tr>
+      <tr><td>Softplus</td><td>GDN decay: \(\alpha_t = \exp(-e^{A_{\log}}\,\mathrm{softplus}(W_a\mathbf x + \texttt{dt\_bias}))\) (Qwen); router score \(\sqrt{\mathrm{softplus}(\cdot)}\), the <span class="la-term" data-term="sqrtsoftplus">sqrtsoftplus</span> (DeepSeek)</td><td><span class="la-rb qwen"></span> <span class="la-rb ds"></span></td><td>Guarantees a positive rate, hence \(\alpha_t \in (0,1)\). GLM replaced this unbounded path with \(-5\cdot\sigma(\cdot)\), the <span class="la-term" data-term="safe-gate">“safe gate”</span> (<code>gate_lower_bound: -5.0</code>)</td></tr>
+      <tr><td>ReLU</td><td>Sparse indexer scores: \(I = \sum_h w_h\,\mathrm{ReLU}(\mathbf q_h\cdot\mathbf k)\) in GLM's DSA and DeepSeek's lightning indexer; \(I_{ib} = \sum_h \mathrm{ReLU}(\mathbf q_i^h\cdot\bar{\mathbf k}_b)\) in Qwen's QSA, over the mean key \(\bar{\mathbf k}_b\) of each block of 4 tokens and without a per-head weight \(w_h\) (<a data-ch="atencao-esparsa">ch. 13</a>)</td><td><span class="la-rb all"></span></td><td>Cheap and robust in FP8/FP4: negative affinities become 0 and only positive evidence adds up in the ranking</td></tr>
+      <tr><td>GELU</td><td>MLP of Qwen's ViT (<code>hidden_act: gelu_pytorch_tanh</code>); Qwen's merger (LayerNorm → fc1 → GELU → fc2; the config only declares the ViT's activation, so check the code for which GELU the merger uses); DeepSeek's Aligner (<code>F.gelu</code>, exact)</td><td><span class="la-rb qwen"></span> <span class="la-rb ds"></span></td><td>Inherited from vision towers (SigLIP/ViT family). Exact vs. tanh has to match training</td></tr>
+      <tr><td>tanh</td><td>Inside the approximate GELU of Qwen's ViT (hence the Qwen badge); logit softcap: supported by GLM's DFlash2 code, but turned off (<code>final_logit_softcapping</code> absent → 0)</td><td><span class="la-rb qwen"></span> <span class="la-rb glm"></span></td><td>Smooth, symmetric ceiling</td></tr>
+    </tbody>
+  </table></div>
+  <div class="la-callout warn"><b class="t">Pitfall · the activation is part of the checkpoint</b><p>The weights were trained <i>together</i> with a specific activation. Swapping exact GELU for GELU-tanh changes each output by up to ~5×10⁻⁴ (the figure computes it). That looks small, but the error repeats in every neuron of every layer and accumulates. This is the kind of deviation that breaks nothing visibly and only shows up when you measure the divergence between distributions (<span class="la-term" data-term="kld">KLD</span>, <a data-ch="medindo-qualidade">chapter 25</a>). When porting a model, copy <code>hidden_act</code> and the exact variants.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>MLP: stacking folds until any function fits</h2>
+  <p>An <span class="la-term" data-term="mlp">MLP</span> (<i>multilayer perceptron</i>) alternates matrices and activations. The version with a single hidden layer is already powerful:</p>
+  <div class="la-eq">
+    \[ \mathbf y = W_2\, f(W_1\mathbf x + \mathbf b_1) + \mathbf b_2 \]
+    <ul class="la-eq-legend">
+      <li>\(W_1 \in \mathbb R^{h\times n}\): the hidden layer, with \(h\) neurons (the <b>width</b>)</li>
+      <li>\(f\): the activation, applied elementwise</li>
+      <li>\(W_2 \in \mathbb R^{m\times h}\): the output layer, which <b>combines</b> the responses of the \(h\) neurons</li>
+    </ul>
+  </div>
+  <p>The <span class="la-term" data-term="aproximacao-universal">universal approximation theorem</span> (Cybenko, 1989, for sigmoids; Hornik, 1991; Leshno and colleagues, 1993, for any non-polynomial activation) guarantees that such an MLP, with enough neurons, approximates any continuous function on a bounded domain to whatever precision you want. The intuition is constructive and fits in a figure. Each ReLU neuron \(\mathrm{ReLU}(x - k_i)\) is a <b>hinge</b>: zero up to \(k_i\) and a ramp after that. By adding hinges with chosen slopes, you can draw any polyline:</p>
+  <div class="la-eq">
+    \[ g(x) = f(k_0) + \sum_{i=0}^{N-1} c_i\,\mathrm{ReLU}(x - k_i), \qquad c_i = s_i - s_{i-1} \]
+    <ul class="la-eq-legend">
+      <li>\(k_i\): the fold points (here, evenly spaced)</li>
+      <li>\(s_i\): the desired slope on segment \(i\) (with \(s_{-1} = 0\)); \(c_i\) is how much the slope changes at fold \(i\), the output weight of neuron \(i\)</li>
+    </ul>
+  </div>
+  <figure class="la-fig" id="fig-aproximacao" data-title="Adding up hinges">
+    <div class="la-fig-stage" style="height:390px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>The dashed curve is the target and the thick one is the sum of \(N\) neurons. Below, each neuron appears as a thin curve (hinges for ReLU, steps for sigmoid). Increase \(N\) and watch the maximum error drop. Click “▶ build” to add neurons one at a time. The parameter count is \(3N+1\): the weight and bias of each hidden neuron, one output weight per neuron and one output bias.</figcaption>
+  </figure>
+  <p>With sigmoids the reasoning is similar: a very steep sigmoid is a step, and a sum of steps draws a staircase that follows the curve. Notice that, for the same \(N\), hinges win, because they interpolate with straight segments instead of plateaus.</p>
+  <div class="la-callout deep"><b class="t">Deep dive · what the theorem doesn't say</b><p>The theorem guarantees that the weights <i>exist</i>. It doesn't say how to find them or how many neurons are needed, and for complicated functions the required width can grow exponentially with the dimension. In practice, <b>depth</b> is more economical: each layer folds the result of the previous folds, and the number of linear regions of a ReLU network can grow exponentially with the number of layers (Montúfar and colleagues, 2014). That is why LLMs have dozens of layers, not one gigantic hidden layer.</p></div>
+  <p>Every Transformer FFN is an MLP. A useful reading (Geva and colleagues, 2021) is to treat it as a <b>key-value memory</b>: each row of \(W_1\) is a “key” that detects a pattern in the token's vector, the activation decides whether the pattern is present, and the corresponding column of \(W_2\) is the “value” the neuron writes back. In the recipes there are classic MLPs, with two matrices and bias, in the vision towers: the Aligner of DeepSeek-V4-Flash-Vision-Exp is \(9216 \to 4096 \to 4096\) with GELU, and the MLP of each block of Qwen's ViT is \(1152 \to 4304 \to 1152\) with GELU-tanh. In the decoder, the FFNs use a gated variant, SwiGLU, which is the subject of the next section.</p>
+</section>
+
+<section class="la-sec">
+  <h2>Multiplicative gates: how much to let through</h2>
+  <p>So far neurons only <b>add</b> signals. A gate (<span class="la-term" data-term="gating">gating</span>) introduces a <b>multiplication</b> between signals: one branch computes the content \(\mathbf u\), another computes an opening \(\mathbf g\) between 0 and 1, and the output is the elementwise product.</p>
+  <div class="la-eq">
+    \[ \mathbf y = \sigma(W_g\mathbf x) \odot (W_u\mathbf x) \]
+    <ul class="la-eq-legend">
+      <li>\(W_u\mathbf x\): the content, “what I want to say”</li>
+      <li>\(\sigma(W_g\mathbf x) \in (0,1)^m\): how open each faucet is, computed <b>from the data itself</b></li>
+      <li>\(\odot\): elementwise (Hadamard) product. Coordinate \(i\) of the output is \(g_i\cdot u_i\)</li>
+    </ul>
+  </div>
+  <div class="la-callout analogy"><b class="t">Analogy · the mixing desk</b><p>Picture a mixing desk with one fader per channel. The \(\mathbf u\) branch is the music on each channel; the \(\mathbf g\) branch is the position of the faders. The difference from an ordinary desk is that here the music itself moves the faders: each token chooses, for itself, which channels go up and which go down.</p></div>
+  <p>Why multiply, instead of just adding? There are four reasons, and all of them show up in the recipes:</p>
+  <ol class="la-steps">
+    <li><b>Data-dependent decisions.</b> The same layer lets different things through for different tokens, without needing different weights.</li>
+    <li><b>Magnitude under control.</b> With \(\sigma\in(0,1)\) the output is never larger than the content. A gate never amplifies, and that helps numerical stability.</li>
+    <li><b>Second-order interactions.</b> The product of two linear functions of \(\mathbf x\) is quadratic in \(\mathbf x\). A gated layer represents, with few parameters, relations of the “A <i>and</i> B” kind.</li>
+    <li><b>Paths for the gradient.</b> When the gate is open, the signal (and the gradient) goes through almost intact. That is the idea behind the LSTM (1997) and <i>highway networks</i> (2015), and it is a close relative of the residual connection (section 9).</li>
+  </ol>
+  <figure class="la-fig" id="fig-portas" data-title="The faucet: multiplicative gating">
+    <div class="la-fig-stage" style="height:420px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>An 8-dimensional vector enters at the top and splits into content \(\mathbf u = W_u\mathbf x\) and gate \(\mathbf g\). Each faucet opens according to the gate value, and the particles that reach the output \(\mathbf y = \mathbf g\odot\mathbf u\) get stronger or weaker. Change the token to see that the gate depends on the data. Change the type (GLU, SwiGLU, GeGLU) and shift the gate bias to close or open it. Illustrative values.</figcaption>
+  </figure>
+  <h3>The GLU family, and why SwiGLU won</h3>
+  <p>Dauphin and colleagues (2017) called \(\sigma(W_g\mathbf x)\odot W_u\mathbf x\) a <span class="la-term" data-term="glu">GLU</span> (<i>gated linear unit</i>). Shazeer (2020) tried replacing the gate's sigmoid with other activations inside the Transformer FFN: with GELU it became <b>GeGLU</b>, with SiLU it became <b>SwiGLU</b>, and both improved quality over the ReLU FFN. The FFN now has three matrices: <code>gate_proj</code> (\(W_g\)), <code>up_proj</code> (\(W_u\)) and <code>down_proj</code>, which goes back to the model width:</p>
+  <div class="la-eq">
+    \[ \mathrm{FFN}_{\text{SwiGLU}}(\mathbf x) = W_{\text{down}}\big(\mathrm{SiLU}(W_{\text{gate}}\mathbf x)\odot W_{\text{up}}\mathbf x\big) \]
+    <ul class="la-eq-legend">
+      <li>\(\mathrm{SiLU}(z) = z\,\sigma(z)\): the gate branch. Since it isn't bounded to \((0,1)\), SwiGLU is not a pure faucet but a smooth multiplicative interaction: \(z_g\,\sigma(z_g)\,z_u\)</li>
+      <li>this is the <span class="la-term" data-term="swiglu">SwiGLU</span> of every FFN, expert and shared expert in the three models</li>
+    </ul>
+  </div>
+  <p>Since the product \(z_g\cdot z_u\) has no ceiling, GLM and DeepSeek also limit both branches before multiplying (<code>swiglu_limit: 10.0</code>). This <i>clamp</i> and SwiGLU's parameter count are covered in detail in <a data-ch="bloco-transformer">chapter 7</a>.</p>
+  <h3>Qwen3.8 is a model of gates</h3>
+  <p>In Qwen3.8-Flash-Next the gate is an architectural theme, not a detail. The tech report credits it with a good share of the training stability. These are the gates a token meets on its way through the model. Not all of them are in every layer: the first line of each card says where it lives (the figure in section 10 draws the whole route).</p>
+  <div class="la-cards">
+    <div class="la-card"><span class="ic">🚰</span><h4>GDN output</h4><p><i>36 GDN layers.</i> \(W_o[\sigma(W_z\mathbf x)\odot\mathrm{RMSNorm}(\mathbf y)]\), with <code>in_proj_z</code> <code>[6144, 2560]</code>. The config says <code>output_gate_type: sigmoid</code>: according to the tech report, the sigmoid beats the SiLU that the original Gated DeltaNet used (<a data-ch="atencao-linear">ch. 14</a>).</p></div>
+    <div class="la-card"><span class="ic">🎯</span><h4>Attention output</h4><p><i>12 QSA layers (indices 3, 7, …, 47).</i> <code>q_proj</code> is <code>[12288, 2560]</code> = 24 heads × 256 × 2: half is the query, half is a sigmoid gate per head and per dimension, applied before <code>o_proj</code> (<a data-ch="atencao">ch. 6</a>).</p></div>
+    <div class="la-card"><span class="ic">🧑‍🔧</span><h4>Shared expert</h4><p><i>All 48 layers (MoE).</i> \(\sigma(\mathbf g\cdot\mathbf x)\cdot\mathrm{Shared}(\mathbf x)\), with <code>shared_expert_gate</code> <code>[1, 2560]</code>: a single number per token decides how much of the <span class="la-term" data-term="shared-expert-gate">shared expert</span> gets in (<a data-ch="mixture-of-experts">ch. 11</a>).</p></div>
+    <div class="la-card"><span class="ic">🔤</span><h4>N-gram gate</h4><p><i>Only in the layer with index 1 (the 2nd, counting from zero), before the GR read.</i> The vector retrieved from the n-gram table enters each branch with \(g_i = \sigma(\mathrm{sign}(z_i)\sqrt{|z_i|})\), where \(z_i\) compares a key with the branch state (<a data-ch="ngram-mtp">ch. 16</a>).</p></div>
+    <div class="la-card"><span class="ic">🛣️</span><h4>Gated Residual</h4><p><i>Every layer, twice: it reads before the mixer and before the MoE, and writes after each one.</i> Read: \(G = \sigma(W_{\text{up}}\,\mathrm{SiLU}(W_{\text{down}}\cdot))\), with rank 320, one gate per element of the 4 × 2560. Write: \(\mathbf s = 2\sigma(\cdot) \in (0,2)^4\), one scalar per branch (<a data-ch="hiperconexoes">ch. 15</a>).</p></div>
+  </div>
+  <p>The other two models also use gates, just in fewer places. In GLM, KDA ends with \(\mathrm{RMSNorm}(\mathbf o)\odot\sigma(g_b(g_a(\mathbf x)))\), a low-rank gate (128), and the \(\beta\) of the delta rule is a sigmoid. The mHC of GLM and DeepSeek reads the 4 residual streams with \(\sigma(\cdot)\) weights and writes with \(2\sigma(\cdot)\).</p>
+  <div class="la-callout why"><b class="t">Why this matters for inference</b><p>In Qwen's FP8-dense checkpoint, the 591 tensors converted to FP8 had a relative RMSE between 0.0240 and 0.0268 (median 0.0262). The worst case was the <code>block_inject_weight</code> tensors of the Gated Residual write, only slightly above the median, and their impact on GPU was not measured. In other words, these numbers do <b>not</b> show that gates are especially fragile. Even so, the recipe keeps the router, the <code>shared_expert_gate</code>, GDN's <code>in_proj_a/b</code> projections and the norms in BF16. They are small tensors, so quantizing them would save almost nothing, and their output multiplies or selects entire paths. <i>Interpretation</i> (this is the recipe's practice, not a measured result): quantize the big matrices and protect the small gates.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>The computational graph and the chain rule</h2>
+  <p>Training means adjusting the weights to decrease a loss \(L\) (<a data-ch="aprender-com-dados">chapter 1</a>). For that we need the gradient: how much \(L\) changes when each weight changes a tiny bit. With billions of weights, computing that weight by weight would be impossible. What makes training feasible is looking at the network as a <span class="la-term" data-term="grafo-computacional">computational graph</span>: a chain of simple operations (multiply, add, activate), in which each node knows how to compute its own local derivative.</p>
+  <p>The <span class="la-term" data-term="regra-da-cadeia">chain rule</span> says how to put the local derivatives together: if \(L\) depends on \(a\), which depends on \(z\), which depends on \(w\), then</p>
+  <div class="la-eq">
+    \[ \frac{\partial L}{\partial w} = \frac{\partial L}{\partial a}\cdot\frac{\partial a}{\partial z}\cdot\frac{\partial z}{\partial w} \]
+    <ul class="la-eq-legend">
+      <li>each factor is a <b>local</b> derivative, computed by a single node of the graph</li>
+      <li>when a variable feeds several paths, the contributions from each path are <b>added</b></li>
+    </ul>
+  </div>
+  <p>The figure walks through a sigmoid neuron with squared loss, \(L = \tfrac12(\sigma(wx+b) - y)^2\), with \(x = 1.5\), \(w = 0.8\), \(b = -0.5\) and target \(y = 1\). On the way in (<i>forward</i>), values flow from left to right. On the way back (<i>backward</i>), gradients flow from the loss to the weights, and each node multiplies what it receives by its local derivative.</p>
+  <figure class="la-fig" id="fig-backprop" data-title="The graph and the way back">
+    <div class="la-fig-stage" style="height:380px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Step through. In mint, the forward values; in pink, the backward gradients, with each node's local derivative written on the edge. In the last step, the weights take a gradient descent step and the loss drops. Move the sliders to recompute everything. The “finite difference” line checks the analytic gradient against \(\frac{L(w+h)-L(w-h)}{2h}\).</figcaption>
+  </figure>
+  <p>With the default values: \(z = 0.7\), \(a = \sigma(0.7) \approx 0.6682\) and \(L \approx 0.0550\). Going back: \(\partial L/\partial a = a - y \approx -0.3318\); the sigmoid contributes \(a(1-a) \approx 0.2217\), so \(\partial L/\partial z \approx -0.0736\); and since \(z = wx + b\), \(\partial L/\partial w = x\cdot\partial L/\partial z \approx -0.1104\) and \(\partial L/\partial b \approx -0.0736\). A negative gradient means “increase \(w\)”. With step size \(\eta = 1\), \(w\) goes to 0.910, \(b\) to −0.426, and the loss drops to ≈ 0.0395.</p>
+  <h3>Backpropagation in matrices</h3>
+  <p>In a real network, each node is a whole layer and the local derivatives are matrices, the <span class="la-term" data-term="jacobiano">Jacobians</span>. For a layer \(\mathbf z = W\mathbf a_{\text{prev}} + \mathbf b\), \(\mathbf a = f(\mathbf z)\), <span class="la-term" data-term="backpropagation">backpropagation</span> does three computations:</p>
+  <div class="la-eq">
+    \[ \boldsymbol\delta = f'(\mathbf z)\odot\frac{\partial L}{\partial\mathbf a}, \qquad \frac{\partial L}{\partial W} = \boldsymbol\delta\,\mathbf a_{\text{prev}}^{\top}, \qquad \frac{\partial L}{\partial \mathbf a_{\text{prev}}} = W^{\top}\boldsymbol\delta \]
+    <ul class="la-eq-legend">
+      <li>\(\boldsymbol\delta\): the gradient at the pre-activation, the layer's “error signal”</li>
+      <li>\(\boldsymbol\delta\,\mathbf a_{\text{prev}}^{\top}\): an outer product; each weight \(W_{ij}\) gets “error of neuron \(i\)” × “input \(j\)”</li>
+      <li>\(W^\top\boldsymbol\delta\): the error sent back to the previous layer, through the <b>transpose</b> of the same matrix</li>
+    </ul>
+  </div>
+  <p>Watch the three computations happen in a small layer, with 3 neurons and 4 inputs (\(W\) is \(3\times4\)). The first one is elementwise. The second, the <b>outer product</b>, turns a column of 3 numbers and a row of 4 into a \(3\times4\) matrix, the same size as \(W\), because each weight needs its own gradient. The third rotates \(W\) (the transpose swaps rows and columns) and multiplies it by \(\boldsymbol\delta\).</p>
+  <figure class="la-fig" id="fig-backprop-matriz" data-title="Backprop of one layer, in matrices">
+    <div class="la-fig-stage" style="height:360px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>Step through. (1) \(\boldsymbol\delta = f'(\mathbf z)\odot\partial L/\partial\mathbf a\), row by row. (2) \(\partial L/\partial W = \boldsymbol\delta\,\mathbf a_{\text{prev}}^\top\): each cell \((i,j)\) is \(\delta_i\cdot a_j\) and the matrix fills in cell by cell. (3) \(W\) rotates until it becomes \(W^\top\), and each row of \(W^\top\) takes a dot product with \(\boldsymbol\delta\). Switch to ReLU and see that a neuron with \(z &lt; 0\) zeroes its own \(\delta_i\) and, with it, an entire row of \(\partial L/\partial W\). The numbers are illustrative; “↻ randomize” draws new ones.</figcaption>
+  </figure>
+  <p>With a batch of tokens, the columns \(\boldsymbol\delta\) and \(\mathbf a_{\text{prev}}\) become matrices (one column per token), and computations (2) and (3) become ordinary matrix multiplications. The backward pass therefore costs about twice the forward: two multiplications the size of \(W\) for each one in the forward.</p>
+  <p>Backprop is a case of reverse-mode <span class="la-term" data-term="diferenciacao-automatica">automatic differentiation</span>: a single backward pass, which costs on the order of two forward passes, delivers the gradient with respect to <b>all</b> parameters at once. The naive alternative, the <span class="la-term" data-term="diferenca-finita">finite difference</span>, would need at least one extra forward pass per parameter. For the 321,323,031,390 parameters of GLM-5.3-Flash, that would be 321 billion passes for a single training step.</p>
+  <div class="la-callout why"><b class="t">Why this matters, if the recipes only do inference</b><p>Three reasons. <b>(1) Memory:</b> the backward pass needs every layer's activations stored since the forward pass; that is why training costs much more memory than inference. At inference time, engines like vLLM run only the forward pass, with autograd turned off, and each layer discards its input as soon as it produces its output. What persists between tokens is the KV cache or the recurrent state (<a data-ch="prefill-decode-kv">chapter 10</a>). <b>(2) Quantization tools</b> use information derived from training, such as approximations of the loss Hessian (<a data-ch="hadamard-trelica-exl3">chapter 22</a>), and quantization-aware training (<span class="la-term" data-term="qat">QAT</span>) teaches the model to tolerate the error: that is the case with DeepSeek-V4's FP8 KV (<a data-ch="kv-cache-quantizado">chapter 23</a>). <b>(3) Everything the gradient shaped</b> (activation, ε, gates, scales) has to be reproduced faithfully at inference, or else the model being served is a different model.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Depth, width and the parameter count</h2>
+  <p>The <span class="la-term" data-term="largura">width</span> of a network is the number of neurons per layer, and the <span class="la-term" data-term="profundidade">depth</span> is the number of layers. An MLP with widths \(n_0 \to n_1 \to \dots \to n_L\) has</p>
+  <div class="la-eq">
+    \[ P = \sum_{\ell=1}^{L} \big(n_{\ell-1}\,n_\ell + n_\ell\big) \]
+    <ul class="la-eq-legend">
+      <li>\(n_{\ell-1}n_\ell\): the weights of layer \(\ell\)'s matrix</li>
+      <li>\(n_\ell\): the biases (add zero if the layer has no bias)</li>
+    </ul>
+  </div>
+  <p>Do the math for DeepSeek's Aligner, a \(9216 \to 4096 \to 4096\) MLP with bias: \(9216\cdot4096 + 4096 + 4096\cdot4096 + 4096 = 54{,}534{,}144\) parameters, the “≈ 54.5 M” in the inventory. The MLP of one block of Qwen's ViT (\(1152\to4304\to1152\), with bias) comes to 9,921,872, and its 27 blocks add up to 267,890,544 in MLP alone. In SwiGLU without bias there are three matrices, \(3\,d\,d_{ff}\): a GLM or DeepSeek expert (\(4096\to2048\)) has 25,165,824 parameters, a Qwen expert (\(2560\to640\)) has 4,915,200, and the dense FFN in GLM's layers 0–2 (\(4096\to12288\)) has 150,994,944.</p>
+  <p>Now it's time to train a real network. The figure below runs a small MLP in your browser, with forward, backprop and gradient descent (Adam) every frame. The task is to separate points in the plane into two classes.</p>
+  <figure class="la-fig" id="fig-playground" data-title="Lab: an MLP training live">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>The background is the probability the network predicts at each point of the plane (mint = class A, pink = class B). Beside it (below it, on a phone), the network: edges colored by the sign of the weight, with thickness given by its magnitude; underneath, the loss curve. Change width, depth, activation and dataset, and click “↺ reset”. With the “linear” activation the spiral is impossible, no matter how many layers you add: that is section 2 happening right in front of you.</figcaption>
+  </figure>
+  <p>A few experiments are worth trying. On the spiral, a narrow layer (2 neurons) can't handle it; 8 neurons in 2 layers usually solve it. With tanh the boundary is smooth; with ReLU, polygonal, made of straight pieces, as in section 4. Increasing depth increases the possible folds, but it also makes training more delicate. Keep that tension in mind for section 9.</p>
+  <h3>What depth and width cost at inference</h3>
+  <div class="la-compare">
+    <div><h4>Width</h4><p>More neurons per layer means bigger matrices. On a GPU that work is parallel and efficient, but during <span class="la-term" data-term="decode">decode</span> every weight has to be read from memory at every step. The three models are narrow for their size (<code>hidden_size</code> 4096, 2560 and 4096) and hide their capacity in the experts: Qwen has a width of only 2,560 for 125 B parameters.</p></div>
+    <div><h4>Depth</h4><p>Layers are sequential: layer \(\ell+1\) waits for layer \(\ell\) to finish, so depth goes straight into each token's latency (45 layers in GLM, 48 in Qwen, 43 in DeepSeek). With tensor parallelism, each layer also pays for communication between GPUs, so depth also multiplies network latency (<a data-ch="paralelismos">chapter 38</a>).</p></div>
+  </div>
+</section>
+
+<section class="la-sec">
+  <h2>Normalization: LayerNorm and RMSNorm</h2>
+  <p>In a deep network, the scale of the numbers changes from layer to layer and from token to token. A layer that receives inputs with magnitude 0.01 on one token and 100 on the next has to serve both at the same time, and training becomes unstable. Normalization solves this by rescaling each token's vector to a standard magnitude before handing it to the next layer. The two versions that matter are these:</p>
+  <div class="la-eq">
+    \[ \mathrm{LayerNorm}(\mathbf x) = \boldsymbol\gamma\odot\frac{\mathbf x - \mu}{\sqrt{\sigma^2 + \varepsilon}} + \boldsymbol\beta \qquad\qquad \mathrm{RMSNorm}(\mathbf x) = \boldsymbol\gamma\odot\frac{\mathbf x}{\sqrt{\tfrac1d\sum_i x_i^2 + \varepsilon}} \]
+    <ul class="la-eq-legend">
+      <li>\(\mathbf x\in\mathbb R^d\): the vector of <b>one</b> token (normalization is done along the features, token by token)</li>
+      <li>\(\mu = \tfrac1d\sum_i x_i\), \(\sigma^2 = \tfrac1d\sum_i (x_i-\mu)^2\): mean and variance of the vector</li>
+      <li>\(\boldsymbol\gamma\) (gain) and \(\boldsymbol\beta\) (bias): learned vectors of size \(d\), which give the network back the freedom to choose the scale of each feature</li>
+      <li>\(\varepsilon\): the <span class="la-term" data-term="epsilon-da-norma">epsilon</span>, a small number that avoids dividing by zero (in the config: <code>rms_norm_eps</code>)</li>
+    </ul>
+  </div>
+  <p><span class="la-term" data-term="layernorm">LayerNorm</span> (Ba, Kiros and Hinton, 2016) centers and rescales. <span class="la-term" data-term="rmsnorm">RMSNorm</span> (Zhang and Sennrich, 2019) skips the centering and the bias and divides only by the root mean square. It is cheaper (one reduction instead of two) and, in practice, works just as well. The decoders of the three models use RMSNorm; the vision towers vary (Qwen's ViT uses LayerNorm with bias; GLM's and DeepSeek's use RMSNorm).</p>
+  <p>The central property is <span class="la-term" data-term="invariancia-de-escala">scale invariance</span>: for any \(\alpha &gt; 0\), \(\mathrm{RMSNorm}(\alpha\mathbf x) = \mathrm{RMSNorm}(\mathbf x)\), as long as \(\varepsilon\) is negligible next to \(\mathrm{RMS}(\mathbf x)^2\). It doesn't matter whether the previous layer delivered a huge vector or a tiny one: the next layer always receives something with RMS ≈ 1 (times \(\boldsymbol\gamma\)).</p>
+  <figure class="la-fig" id="fig-normas" data-title="LayerNorm, RMSNorm and the role of ε">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>A 16-dimensional vector (top) is normalized step by step down to the output (bottom). Change the <b>input scale</b> from 10⁻⁴ to 10³: the output doesn't budge, until \(\mathrm{RMS}^2\) gets close to ε and the output no longer reaches RMS 1. Change the type: LayerNorm centers first; “RMSNorm (1+w)” stores the gain as a deviation from 1, as in Qwen; “grouped” normalizes each group of 4 separately, like Qwen's 4 branches of 2560. Turn on the outlier to see one giant dimension flatten the others.</figcaption>
+  </figure>
+  <h3>ε is not a detail</h3>
+  <p>ε is added to the <b>mean of the squares</b>, so it takes over when \(\mathrm{RMS}(\mathbf x) \lesssim \sqrt\varepsilon\). With \(\varepsilon = 10^{-5}\) that happens below RMS ≈ 0.0032; with \(10^{-6}\), below 0.001; with \(10^{-20}\), only below \(10^{-10}\). In that region the output no longer goes to RMS 1 and stays at \(\approx \mathbf x/\sqrt\varepsilon\), proportional to the input: the norm stops amplifying tiny noise all the way up to the standard scale. With an input RMS of \(10^{-4}\) and \(\varepsilon = 10^{-5}\), the output has RMS ≈ 0.0316 instead of 1 (still larger than the input, just far from 1). An ε different from the one used in training changes the output precisely on the tokens with small vectors, and does so systematically.</p>
+  <div class="la-inrecipe" data-recipe="glm"><div class="la-inrecipe-h"><span class="la-rb glm"></span><span class="k">Fix in vLLM</span><code>vision: rms_norm_eps 1e-5 → 1e-6</code></div><div class="la-inrecipe-b"><p>GLM-5.3-Flash's text stack uses <code>rms_norm_eps: 1e-5</code>. The checkpoint declares the same value for the vision tower, but the tower was trained with 1e-6. The vLLM code used by the recipe forces <code>self.rms_norm_eps = 1e-6</code> for vision, with a comment saying that serving with 1e-5 “makes RMSNorm drift and produces repetitive/degraded image descriptions”. A single wrong number in the config ruins an entire modality without raising a single error.</p></div></div>
+  <div class="la-inrecipe" data-recipe="ds"><div class="la-inrecipe-h"><span class="la-rb ds"></span><span class="k">Config</span><code>rms_norm_eps: 1e-20</code> (Vision-Exp) · <code>1e-06</code> (0731)</div><div class="la-inrecipe-b"><p>The Vision-Exp checkpoint, the one in the current lane, ships ε = 1e-20 in every RMSNorm of the text trunk and in the mHC <code>rsqrt</code>; 0731 ships 1e-6. The vision tower doesn't follow this field: the ViT's RMSNorm (<code>patches/vision_exp/vision.py</code>) uses the default <code>eps=1e-6</code>. With 1e-20, ε only prevents an exact division by zero. <i>Interpretation</i>: the norm is left with practically no floor. The repository doesn't measure the impact of this difference. Note that 1e-20 exists in FP32 and in BF16, but becomes zero in FP16. <i>Interpretation</i>: that is a good reason for the norm to compute in FP32.</p></div></div>
+  <h3>Implementation: FP32 inside and the “1 + w” gain</h3>
+  <p>The snippet below (simplified from <code>files/ple_layer_patched.py</code> in the Qwen recipe) is the grouped RMSNorm of the N-gram embedding. It packs three implementation decisions you will find in every modern model:</p>
+<pre data-lang="python"><code>class Qwen3_8FlashNextPLEGroupedNorm(nn.Module):
+    def __init__(self, hidden_size, eps, group_size, dtype):
+        super().__init__()
+        self.eps, self.group_size = eps, group_size
+        self.weight = nn.Parameter(torch.zeros(hidden_size, dtype=dtype))  # w starts at ZERO
+
+    def forward(self, hidden_states):
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.float()                              # (1) compute in FP32
+        grouped = hidden_states.unflatten(-1, (-1, self.group_size))       # (2) 10240 → 4 × 2560
+        variance = grouped.square().mean(dim=-1, keepdim=True)
+        normalized = (grouped * torch.rsqrt(variance + self.eps)).flatten(-2)
+        return (normalized * (1.0 + self.weight.float())).to(input_dtype)  # (3) gain = 1 + w</code></pre>
+  <ol class="la-steps">
+    <li><b>FP32 inside.</b> The sum of 2,560 squares in BF16 (relative rounding error ≈ 3.9×10⁻³ per operation) would lose precision, and an ε like 1e-20 would become zero in FP16. The norm upcasts to FP32, computes, and casts back to the original dtype. Compare with the RMSNorm of DeepSeek's ViT (<code>patches/vision_exp/vision.py</code>), which does the same <code>x.float()</code> … <code>.to(dtype)</code>.</li>
+    <li><b>Groups.</b> With <code>group_size</code> = 2560, the vector of 10,240 numbers (the 4 branches of the Gated Residual) is normalized branch by branch, the <span class="la-term" data-term="rmsnorm-agrupada">grouped RMSNorm</span>. <i>Interpretation</i>: if there were a single norm, a large-scale branch would dictate the divisor for the other three. Normalizing per group lets each branch keep its own scale.</li>
+    <li><b>Zero-centered gain.</b> The weight is initialized at 0 and applied as \(1 + w\), the <span class="la-term" data-term="ganho-zero-centrado">zero-centered gain</span>. In DeepSeek, the gain is the weight itself, initialized at 1 (<code>torch.ones</code>). Mathematically the two are equivalent, but here is an <i>interpretation</i>: with weight decay pulling \(w\) toward 0, what gets preserved is a gain of 1 (identity), not a gain of 0 (which would erase the signal).</li>
+  </ol>
+  <div class="la-callout warn"><b class="t">Pitfall · “w” or “1 + w”?</b><p>A loader that applies Qwen's weight as a direct gain, forgetting the “1 +”, multiplies the output of every norm by numbers close to zero, and the model generates garbage. The opposite (adding 1 to a gain that is already the weight itself, as in DeepSeek) doubles the scale. When porting a model, read the norm's <code>forward</code> in the reference code: the tensor name (<code>*.weight</code>) doesn't tell you which convention applies.</p></div>
+  <h3>Where the norms live in the three models</h3>
+  <div class="la-compare">
+    <div data-recipe="glm"><h4>GLM-5.3-Flash</h4><p>RMSNorm before each sublayer (<code>input_layernorm</code>, <code>post_attention_layernorm</code>) and at the end (<code>model.norm</code>); inside MLA, <code>q_a_layernorm</code> [1536] and <code>kv_a_layernorm</code> [512] normalize the latents; the indexer's <code>k_norm</code> is a <b>LayerNorm with bias</b> [128], ε 1e-6; KDA ends with RMSNorm × sigmoid gate; KDA's q and k go through <span class="la-term" data-term="normalizacao-l2">L2 normalization</span>. <b>Drafters:</b> the MTP (layer 45) normalizes the next token's embedding and the target's state with <code>enorm</code> and <code>hnorm</code> [4096] before <code>eh_proj</code>; DFlash2 normalizes the target's features with RMSNorm after <code>fc</code>, has <code>k_norm</code> (QK-Norm) and uses <code>rms_norm_eps</code> 1e-5.</p></div>
+    <div data-recipe="qwen"><h4>Qwen3.8-Flash-Next</h4><p>There is no explicit pre-norm or final norm: the Gated Residual read normalizes each branch (grouped, 1 + w) and the <code>hyper_connection_mixer</code> replaces <code>model.norm</code>. Per-head QK-Norm (<code>q_norm</code>, <code>k_norm</code> [256]) in attention; gated RMSNorm [128] at the GDN output; <code>rms_norm_eps</code> = 1e-6. <b>Drafter:</b> the MTP normalizes its two inputs before joining them, <code>pre_fc_norm_embedding</code> [2560] (the next token's embedding) and <code>pre_fc_norm_hidden</code> [10240] (the 4 branches of the target's state).</p></div>
+    <div data-recipe="ds"><h4>DeepSeek-V4-Flash</h4><p>RMSNorm before attention and before the FFN (<code>attn_norm</code>, <code>ffn_norm</code>), on the query latent (<code>q_norm</code> [1024]) and on the KV (<code>kv_norm</code> [512]); each query head is additionally divided by its own RMS, <b>with no weight</b>. The report says it doesn't need <span class="la-term" data-term="qk-clip">QK-Clip</span> precisely because it normalizes queries and KV. <b>Drafter:</b> DSpark repeats the target's family of norms (<code>q_norm</code>, <code>kv_norm</code>, <code>attn_norm</code>, <code>ffn_norm</code>, plus <code>main_norm</code> at the input and a final norm) and also divides Q by each head's RMS, with no weight.</p></div>
+  </div>
+  <div class="la-callout recipe" data-recipe="qwen"><b class="t"><span class="la-rb qwen"></span> In the recipe · norms don't get quantized</b><p>A gain vector has only \(d\) numbers, and it multiplies everything that passes through it. Quantizing it would save almost nothing and risk a lot. Qwen's FP8-dense converter keeps the norms in BF16, and so does the GLM recipe. In vLLM, the norm is usually <b>fused</b> with the residual add (<code>fused_add_rms_norm</code>): one kernel reads the residual once, adds, normalizes and writes (<a data-ch="kernels">chapter 28</a>).</p></div>
+  <div class="la-callout deep"><b class="t">Deep dive · GatedNorm</b><p>Norm and gate can be combined: \(\mathrm{GatedNorm}(\mathbf u) = \mathrm{RMSNorm}(\mathbf u)\odot\sigma(W_2\,\mathrm{SiLU}(W_1\,\mathrm{RMSNorm}(\mathbf u)))\). That is exactly the Gated Residual read in Qwen. According to the tech report, <span class="la-term" data-term="gatednorm">GatedNorm</span> alone cuts <i>loss spikes</i> from 32.0 to 3.2 per 10,000 steps, in a stress run at 4× the optimal LR, and removes activation outliers. <a data-ch="hiperconexoes">Chapter 15</a> develops this further.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>Residual connections: the gradient's express lane</h2>
+  <p>Go back to the chain rule. In a “plain” network of \(L\) layers, \(\mathbf h_{\ell+1} = F_\ell(\mathbf h_\ell)\), the gradient that reaches the first layer is a product of \(L\) Jacobians:</p>
+  <div class="la-eq">
+    \[ \frac{\partial L}{\partial\mathbf h_0} = J_0^\top J_1^\top\cdots J_{L-1}^\top\,\frac{\partial L}{\partial\mathbf h_L}, \qquad J_\ell = \frac{\partial F_\ell}{\partial\mathbf h_\ell} \]
+    <ul class="la-eq-legend">
+      <li>if each \(J_\ell\) shrinks vectors by a factor of 0.9, after 64 layers what's left is \(0.9^{64}\approx 0.001\): the <span class="la-term" data-term="gradiente-evanescente">vanishing gradient</span></li>
+      <li>if each one stretches them by 1.1, what's left is \(1.1^{64}\approx 445\): the <span class="la-term" data-term="gradiente-explosivo">exploding gradient</span></li>
+    </ul>
+  </div>
+  <p>It's a game of telephone: each layer repeats the message slightly distorted, and after many layers the start of the line receives nothing useful. In 2015, He and colleagues observed that deeper plain networks trained <i>worse</i> than shallower ones (a 56-layer network had a higher training error than a 20-layer one). The solution was the <span class="la-term" data-term="conexao-residual">residual connection</span>: instead of replacing the vector, each layer <b>adds</b> a correction to it.</p>
+  <div class="la-eq">
+    \[ \mathbf h_{\ell+1} = \mathbf h_\ell + F_\ell(\mathbf h_\ell) \quad\Longrightarrow\quad \frac{\partial\mathbf h_{\ell+1}}{\partial\mathbf h_\ell} = I + \frac{\partial F_\ell}{\partial\mathbf h_\ell} \]
+    <ul class="la-eq-legend">
+      <li>\(I\): the identity, a path through which the gradient passes without being multiplied by anything</li>
+      <li>unrolling: \(\mathbf h_L = \mathbf h_0 + \sum_\ell F_\ell(\mathbf h_\ell)\). The output is the input plus the sum of the contributions of every layer</li>
+    </ul>
+  </div>
+  <figure class="la-fig" id="fig-residual" data-title="Telephone game vs express lane">
+    <div class="la-fig-stage" style="height:440px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>A real simulation, with random 24-dimensional matrices computed on this page. At the top, the row of layers: the brightness of each one is the norm of the gradient that reaches it (the pink pulse travels from the loss to the input). At the bottom, on a log scale, the RMS of the activations (mint) and the gradient norm (pink), layer by layer. Compare “plain”, “residual” and “residual + pre-norm”, and play with the depth and the weight gain.</figcaption>
+  </figure>
+  <p>Notice what the simulation shows. It starts with ReLU, gain 1 and 32 layers. In the plain network, the gradient that reaches the first layer is about 5×10⁻⁷ of what left the loss: it died along the way. Raise the gain and it starts to explode. There is a critical gain (around 1.5 in this simulation; in mean-field theory, \(\sqrt2\approx1.41\), the He initialization) at which the norms are nearly conserved, but it is a knife's edge: at 64 layers, a gain of 1.4 leaves the gradient at 2×10⁻³ and a gain of 1.6 multiplies it by 12. With a residual and no normalization, the identity path saves the gradient, but each layer adds its output with no brakes, and activations and gradient grow about 10⁵ times over 32 layers. With <b>residual + pre-norm</b>, \(\mathbf h_{\ell+1} = \mathbf h_\ell + F_\ell(\mathrm{Norm}(\mathbf h_\ell))\), the gradient reaches the input at the same order of magnitude (≈ 1.3×) and the activations grow slowly, from 1 to about 13 over 32 layers: polynomial growth, not exponential. Each sublayer reads a normalized copy and writes a sum. That is the design of every modern LLM, and the vector that travels through the stack has a name: the <span class="la-term" data-term="fluxo-residual">residual stream</span>. <a data-ch="bloco-transformer">Chapter 7</a> treats it as a bus.</p>
+  <p>DeepSeek's ViT (<code>patches/vision_exp/vision.py</code>) shows the pattern in two lines:</p>
+<pre data-lang="python"><code>def forward(self, x, cos, sin):
+    x = x + self.attn(self.norm1(x), cos, sin)   # reads normalized, ADDS into the residual
+    return x + self.mlp(self.norm2(x))           # same for the MLP (SwiGLU)</code></pre>
+  <div class="la-callout recipe" data-recipe="all"><b class="t"><span class="la-rb all"></span> In the recipes · the residual got wide</b><p>The three models widen the residual stream to <b>4 streams</b>. GLM and DeepSeek use mHC (<code>hc_mult: 4</code>, 4 × 4096 = 16,384 numbers per token), with the mixing matrix between streams projected, through 20 Sinkhorn iterations, onto the set of doubly stochastic matrices, whose spectral norm is ≤ 1. That is this section's concern (not letting the signal explode across depth) turned into an architectural constraint. Qwen uses the Gated Residual (4 × 2560 = 10,240). In the tech report's experiment (a 25B-A3B model, 560 B tokens), the loss dropped from 1.617 (classic pre-norm) to 1.596 (static mHC), 1.594 (dynamic mHC) and 1.590 (GR). Details in <a data-ch="hiperconexoes">chapter 15</a>.</p></div>
+  <div class="la-callout why"><b class="t">Why this matters to recipe writers</b><p>The residual stream is where you “listen” to the model. Speculative drafters read hidden states from the target's layers (GLM has to contract the 4 mHC streams down to 4096 with <code>hc_contract</code> before handing them to DFlash2), and abliteration edits what the layers write into it (<a data-ch="abliteracao">chapter 19</a>). And a wide residual costs bandwidth: in Qwen served by vLLM, the Gated Residual weights stay in BF16, replicated on both GPUs, 1.19 GiB read per step, about 13% of the traffic.</p></div>
+</section>
+
+<section class="la-sec">
+  <h2>In the recipes: activations, gates and norms in the config</h2>
+  <p>Now you can read an LLM like a subway map: every residual read, every norm, every gate and every activation has a place and a reason to be there. Two things matter when reading the map. First, the stack is made of repeating layers, but <b>not every layer is the same</b>: the token mixer (the piece that mixes information across positions) alternates between two or three types, and each layer has <b>one</b> of them, never all. Second, some pieces sit <b>outside</b> the layer: the input, the output, the vision tower and the drafters. The figure shows this route for the three models, with the same color code used throughout this chapter.</p>
+  <figure class="la-fig wide" id="fig-mapa" data-title="A token's path through the model">
+    <div class="la-fig-stage" style="height:560px"><canvas></canvas></div>
+    <div class="la-fig-controls"></div>
+    <figcaption>The token (the traveling dot) enters at the top, loops through the “inside each layer” box and exits at the bottom. On each lap, the counter and the strip of little squares show which layer it is in (the animation goes through layers 0 to 3 and the last one). Where the line splits into alternatives (“or”), the token only goes through that layer's branch, and the others are dimmed. Dashed stations only exist in some layers, like Qwen's PLE, which runs only in the layer with index 1, before the GR read. The separate towers (vision and drafters) are not on the text path. The chips are colored by category: mint = activation, amber = gate, lavender = norm. Filter by category to light up just one type. The names and formulas come from the recipes' configs and code.</figcaption>
+  </figure>
+  <div class="la-table-wrap"><table class="la-params">
+    <thead><tr><th>Parameter</th><th>Value</th><th>Recipe</th><th>What it does</th><th>Why it matters</th></tr></thead>
+    <tbody>
+      <tr><td><code>hidden_act</code></td><td><code>silu</code></td><td><span class="la-rb all"></span></td><td>Activation of the SwiGLU gate branch in FFNs and experts</td><td>The weights were trained with it; the vLLM code for GLM and DeepSeek rejects any other</td></tr>
+      <tr><td><code>rms_norm_eps</code></td><td>1e-5 (text); vision forced to 1e-6</td><td><span class="la-rb glm"></span></td><td>ε of every text RMSNorm</td><td>Vision with 1e-5 generates repetitive descriptions; vLLM fixes it</td></tr>
+      <tr><td><code>rms_norm_eps</code></td><td>1e-6</td><td><span class="la-rb qwen"></span></td><td>ε of the RMSNorms, including PLE's grouped ones (key, query, conv)</td><td>With gain 1 + w; PLE details in <a data-ch="ngram-mtp">ch. 16</a></td></tr>
+      <tr><td><code>rms_norm_eps</code></td><td>1e-20 (Vision-Exp) · 1e-6 (0731)</td><td><span class="la-rb ds"></span></td><td>ε of the text-trunk RMSNorms and of the mHC <code>rsqrt</code> (the ViT's RMSNorm uses a fixed 1e-6)</td><td>Switching checkpoints changes ε; impact not measured in the repository</td></tr>
+      <tr><td><code>index_dsa_use_layernorm</code></td><td><code>true</code> (default)</td><td><span class="la-rb glm"></span></td><td>The indexer's <code>k_norm</code> becomes a LayerNorm with bias [128], ε 1e-6</td><td>One of the few places with LayerNorm in the decoder: centering + bias</td></tr>
+      <tr><td><code>output_gate_type</code></td><td><code>sigmoid</code></td><td><span class="la-rb qwen"></span></td><td>Activation of the GDN output gate</td><td>Bounded to (0,1); according to the tech report, better than the original GDN's SiLU</td></tr>
+      <tr><td><code>linear_attn_config.gate_lower_bound</code></td><td>−5.0</td><td><span class="la-rb glm"></span></td><td>KDA decay gate: \(-5\cdot\sigma(\cdot)\in(-5,0)\)</td><td>Replaces the unbounded softplus path with a bounded sigmoid one (<a data-ch="atencao-linear">ch. 14</a>)</td></tr>
+      <tr><td><code>swiglu_limit</code></td><td>10.0</td><td><span class="la-rb glm"></span> <span class="la-rb ds"></span></td><td>Clamps gate (≤ 10) and up (±10) before the product</td><td>The SwiGLU product has no ceiling; details in <a data-ch="bloco-transformer">ch. 7</a></td></tr>
+      <tr><td><code>hidden_act</code> (vision)</td><td><code>gelu_pytorch_tanh</code></td><td><span class="la-rb qwen"></span></td><td>ViT MLP (1152 → 4304 → 1152, with bias)</td><td>tanh approximation of GELU: has to match training</td></tr>
+      <tr><td><code>hc_eps</code></td><td>1e-6</td><td><span class="la-rb glm"></span> <span class="la-rb ds"></span></td><td>ε added to the <code>pre</code> weights (sigmoid) and in the <span class="la-term" data-term="sinkhorn-knopp">Sinkhorn</span> normalizations</td><td><i>Interpretation</i>: avoids read weights that are exactly zero and divisions by zero in Sinkhorn</td></tr>
+    </tbody>
+  </table></div>
+  <h3>Checklist for your new model</h3>
+  <p>When a new model comes out (<a data-ch="receita-do-zero">chapter 46</a> does this with MiMo-V2.6-Flash), read the config and the reference code with this list in hand:</p>
+  <ol class="la-steps">
+    <li><b>Activation.</b> Look for <code>hidden_act</code> (text and vision). <code>gelu</code> and <code>gelu_pytorch_tanh</code> are different functions. MiMo declares <code>silu</code>, and vLLM rejects any other activation in its MoE.</li>
+    <li><b>ε and the field name.</b> The name varies: <code>rms_norm_eps</code> (GLM, Qwen, DeepSeek), <code>layernorm_epsilon</code> (MiMo, 1e-6), <code>norm_eps</code> (DeepSeek's inference config). Also check whether some sub-tower uses a different value, like GLM's vision tower.</li>
+    <li><b>Norm type and convention.</b> LayerNorm or RMSNorm? Does it have a bias? Is the gain \(w\) or \(1 + w\)? Is it grouped? Does it have a weight or not (DeepSeek's per-head query norm has none)?</li>
+    <li><b>Gates.</b> List every \(\sigma(\cdot)\) and every “2·σ”. Check that the engine implements them in the same form, and keep them in high precision when quantizing.</li>
+    <li><b>Measure.</b> Even with everything checked, compare the served model's distribution with the reference (KLD). Deviations in ε, activation and gain convention show up there before they show up in a benchmark.</li>
+  </ol>
+  <p>With neurons, layers, activations, gates, norms and residuals in your toolkit, what's missing is the language to talk about all of this at scale: 4,096-dimensional vectors, batches of tokens, attention heads stacked into 4D tensors, and the FLOP count of each multiplication. That is the subject of the <a data-ch="tensores-algebra">next chapter</a>.</p>
+</section>
